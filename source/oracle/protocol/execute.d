@@ -169,8 +169,7 @@ enum uint lobLocatorSize = 112;
 
 /// Continuation flag of LOB binds and defines.
 enum ulong lobPrefetchFlag = 0x0200_0000;
-/// The largest JSON value fetched (its OSON image comes with the row, like a prefetched LOB).
-enum uint jsonMaxLength = 32 * 1024 * 1024;
+public import oracle.types.oson : jsonMaxLength;
 public import oracle.types.vector : vectorMaxLength;
 
 /++
@@ -220,13 +219,14 @@ void putBindMetadata(ref TtcWriter w, const Parameter b, ubyte fieldVersion) @sa
     w.u8(0); // scale
     w.ub(b.bufferSize);
     w.ub(0); // maximum array elements
-    const lob = b.type == OracleType.clob || b.type == OracleType.blob || b.type == OracleType.vector;
+    const lob = b.type == OracleType.clob || b.type == OracleType.blob || b.type == OracleType.vector
+        || b.type == OracleType.json;
     w.ub(lob ? lobPrefetchFlag : 0); // continuation flags
     w.ub(0); // object type ID
     w.ub(0); // object type version
     w.ub(b.isText ? CharsetId.al32utf8 : 0);
     w.u8(b.isText ? CharsetForm.implicit : CharsetForm.none);
-    w.ub(b.type == OracleType.vector ? vectorMaxLength : 0); // LOB prefetch length
+    w.ub(b.type == OracleType.vector ? vectorMaxLength : b.type == OracleType.json ? jsonMaxLength : 0); // LOB prefetch length
     if (fieldVersion >= TtcFieldVersion.v12_2)
         w.ub(0); // oaccolid
 }
@@ -267,9 +267,9 @@ private void putBindValue(ref TtcWriter w, const ref Parameter p) @safe pure
         w.bytes([1, 0]); // a NULL cursor
     else if (p.type == OracleType.boolean && p.isNull)
         w.bytes([253, 1]); // a NULL BOOLEAN
-    else if (p.type == OracleType.vector && !p.isNull)
+    else if ((p.type == OracleType.vector || p.type == OracleType.json) && !p.isNull)
     {
-        // a value-based locator (QLocator, 40 bytes, version 4, a BLOB value), then the image
+        // a value-based locator (QLocator, 40 bytes, version 4, a BLOB value), then the image (VECTOR, OSON)
         w.ub(40);
         w.u8(40);
         w.u16be(38);

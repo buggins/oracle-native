@@ -72,7 +72,7 @@ private string formatDigits(double v, int digits) @trusted
     return buffer[0 .. n].idup;
 }
 
-private double parseDouble(string s) @trusted
+package double parseDouble(string s) @trusted
 {
     import core.stdc.stdlib : strtod;
     import std.string : toStringz;

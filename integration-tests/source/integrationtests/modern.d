@@ -98,7 +98,9 @@ void testJson()
     conn.exec("INSERT INTO itest_json (id, j) VALUES (100, JSON_OBJECT('d' VALUE DATE '2024-01-31',"
             ~ " 'ts' VALUE TIMESTAMP '2024-01-31 12:00:00.123456', 'tz' VALUE TIMESTAMP '2024-01-31 12:00:00 -08:00',"
             ~ " 'f' VALUE 1.5f, 'bd' VALUE 0.1d, 'r' VALUE HEXTORAW('0A0B'),"
-            ~ " 'ds' VALUE INTERVAL '-1 02:03:04.5' DAY TO SECOND RETURNING JSON))");
+            ~ " 'ds' VALUE INTERVAL '-1 02:03:04.5' DAY TO SECOND, 'ym' VALUE INTERVAL '-1-2' YEAR TO MONTH,"
+            ~ " 'ym0' VALUE INTERVAL '0-0' YEAR TO MONTH, 'bd2' VALUE 1e-5d, 'bd3' VALUE 1e300d, 'bd4' VALUE 100d,"
+            ~ " 'bf' VALUE 3.4e38f RETURNING JSON))");
     conn.exec("INSERT INTO itest_json (id, j, t) VALUES (101, NULL, '{\"x\":1}')");
 
     size_t n;
@@ -129,6 +131,113 @@ void testJson()
 private struct JsonRow
 {
     string j;
+}
+
+/++
+JSON binds: JSON text (`Parameter.json`) and `std.json` values sent as OSON
+images (21c and later) give the documents the server makes of the same text;
+OUT and IN OUT JSON, `RETURNING ... INTO`; older servers get the text.
++/
+void testJsonBinds()
+{
+    import std.array : join, replicate;
+    import std.algorithm.iteration : map;
+    import std.json : JSONValue, parseJSON;
+    import std.range : iota;
+
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    const major = majorVersion(conn);
+    dropTable(conn, "itest_jsonb");
+    if (major < 21)
+    {
+        // JSON text for an IS JSON column
+        conn.exec("CREATE TABLE itest_jsonb (id NUMBER, j CLOB CHECK (j IS JSON))");
+        conn.exec("INSERT INTO itest_jsonb VALUES (1, :1)", Parameter.json(`{"a": [1, 2.50, "x"]}`));
+        conn.exec("INSERT INTO itest_jsonb VALUES (2, :1)", parseJSON(`{"b":true,"a":null}`));
+        enforce(scalar(conn, "SELECT j FROM itest_jsonb WHERE id = 1") == `{"a":[1,2.5,"x"]}`, "text for 18c");
+        enforce(scalar(conn, "SELECT j FROM itest_jsonb WHERE id = 2") == `{"a":null,"b":true}`, "std.json text");
+        dropTable(conn, "itest_jsonb");
+        return;
+    }
+    conn.exec("CREATE TABLE itest_jsonb (id NUMBER, j JSON)");
+    string[] docs = [
+        `{"a":1,"b":[true,false,null,"x"],"c":{"d":-12.5,"e":""}}`,
+        `{"z":1,"a":2,"m":{"y":[],"b":{}}}`,
+        `[1,2.5,-0.001,123456789012345678901234567890,1e100,-0,1.50]`,
+        // rounded to NUMBER's precision, as the server does
+        `[0.99999999999999999999999999999999999999999,12345678901234567890123456789012345678951]`,
+        `"just a string"`, `42`, `null`, `true`, `{}`, `[]`,
+        `{"text":"quotes \" backslash \\ newline \n tab \t unicode Grüße мир 😀 \u00e9\ud83d\ude00 control \u0001"}`,
+        `{"deep":[[[[[[[[[[{"x":[1]}]]]]]]]]]]}`,
+        "{" ~ iota(300).map!(i => `"f` ~ i.to!string ~ `":` ~ i.to!string).join(",") ~ "}",
+        "[" ~ iota(300).map!(i => `{"k` ~ (i % 7).to!string ~ `":` ~ i.to!string ~ `}`).join(",") ~ "]",
+        `{"big":[` ~ iota(20_000).map!(i => `"value ` ~ i.to!string ~ `"`).join(",") ~ `]}`,
+    ];
+    const longName = `{"` ~ "n".replicate(300) ~ `":1,"s":[2]}`;
+    if (major >= 23)
+        docs ~= [longName, `[1e126,1e-131,-1e200]`]; // BINARY_DOUBLE outside NUMBER's range (21c: overflow)
+    else
+        enforce(collectException!ClientException(conn.exec("INSERT INTO itest_jsonb VALUES (0, :1)",
+                Parameter.json(longName))) !is null, "names over 255 bytes refused before 23ai");
+    enforce(collectException!ClientException(Parameter.json(`{"dup":1,"dup":2}`)) !is null, "repeated names");
+    foreach (i, d; docs)
+        conn.exec("INSERT INTO itest_jsonb VALUES (:1, :2)", i, Parameter.json(d)); // re-executed: cached cursor
+    foreach (i, d; docs)
+    {
+        // the server's document of the same text
+        auto lob = conn.createLob(OracleType.clob);
+        lob.writeText(d);
+        const expected = conn.queryValue!string("SELECT JSON_SERIALIZE(JSON(:1) RETURNING CLOB) FROM dual", lob);
+        lob.free();
+        auto r = conn.query("SELECT j, JSON_SERIALIZE(j RETURNING CLOB) FROM itest_jsonb WHERE id = :1", i);
+        const row = r.front;
+        const shown = row.getString(1);
+        const got = row.getString(0);
+        r.close();
+        // the server's parser puts the members of bigger objects in field ID order; images from the
+        // client keep the given order (and the server finds members either way)
+        const same = shown == expected || (shown.length > 1000 && parseJSON(shown) == parseJSON(expected));
+        enforce(same, "document " ~ i.to!string ~ ": " ~ (shown.length > 200 ? shown[0 .. 200] : shown) ~ " vs "
+                ~ (
+                    expected.length > 200 ? expected[0 .. 200] : expected));
+        enforce(got == shown, "document " ~ i.to!string ~ " decoded: " ~ (got.length > 200 ? got[0 .. 200] : got));
+    }
+
+    // std.json values (members in name order)
+    const value = parseJSON(`{"b":[1.5,-2,"s",true,null,0.1,1e300],"a":{"x":12345678901234}}`);
+    conn.exec("INSERT INTO itest_jsonb VALUES (1000, :1)", value);
+    conn.exec("INSERT INTO itest_jsonb VALUES (1001, :1)", Parameter.nullOf!JSONValue());
+    conn.exec("INSERT INTO itest_jsonb VALUES (1002, :1)", Nullable!JSONValue(JSONValue("s")));
+    enforce(scalar(conn, "SELECT JSON_SERIALIZE(j) FROM itest_jsonb WHERE id = 1000")
+            == `{"a":{"x":12345678901234},"b":[1.5,-2,"s",true,null,0.1,1E+300]}`, "std.json value");
+    enforce(conn.query("SELECT j FROM itest_jsonb WHERE id = 1000").front.getJson(0) == value, "read back");
+    enforce(scalar(conn, "SELECT COUNT(*) FROM itest_jsonb WHERE id = 1001 AND j IS NULL") == "1", "SQL NULL");
+    enforce(scalar(conn, "SELECT JSON_SERIALIZE(j) FROM itest_jsonb WHERE id = 1002") == `"s"`, "Nullable");
+    // members found in an object of many members in the given order
+    enforce(scalar(conn, "SELECT JSON_VALUE(j, '$.f257') FROM itest_jsonb WHERE id = 12") == "257", "lookup");
+    enforce(conn.queryValue!string("SELECT JSON_VALUE(:1, '$.a.x') FROM dual", value) == "12345678901234",
+            "JSON_VALUE");
+
+    // RETURNING INTO, PL/SQL OUT, IN and IN OUT
+    auto ret = conn.query("UPDATE itest_jsonb SET j = :1 WHERE id = 1000 RETURNING j INTO :2",
+            Parameter.json(`{"updated":[1,2]}`), Parameter.output!JSONValue());
+    enforce(ret.outputs[0].value.getString() == `{"updated":[1,2]}`, "RETURNING INTO");
+    enforce(ret.outputs[0].value.getJson()["updated"][1].integer == 2, "RETURNING INTO as std.json");
+    auto o = conn.query("BEGIN :1 := JSON_OBJECT('k' VALUE :2 RETURNING JSON); END;", Parameter.output!JSONValue(), 42);
+    enforce(o.outputs[0].value.getString() == `{"k":42}`, "PL/SQL OUT");
+    auto inp = conn.query("DECLARE j JSON := :1; BEGIN :2 := JSON_SERIALIZE(j); END;",
+            Parameter.json(`[1,{"q":"w"}]`), Parameter.output!string());
+    enforce(inp.outputs[0].value.getString() == `[1,{"q":"w"}]`, "PL/SQL IN");
+    inp = conn.query("DECLARE j JSON := :1; BEGIN :2 := JSON_SERIALIZE(j); END;", parseJSON(`{"r":[true]}`),
+            Parameter.output!string()); // again: re-executed
+    enforce(inp.outputs[0].value.getString() == `{"r":[true]}`, "PL/SQL IN, re-executed");
+    auto io = conn.query("DECLARE o JSON_OBJECT_T := JSON_OBJECT_T(:1); BEGIN o.put('n', 7); :1 := o.to_json; END;",
+            Parameter.inOut(parseJSON(`{"a":1}`)));
+    enforce(io.outputs[0].value.getString() == `{"a":1,"n":7}`, "PL/SQL IN OUT: " ~ io.outputs[0].value.getString());
+    conn.rollback();
+    dropTable(conn, "itest_jsonb");
 }
 
 /// VECTOR columns and binds (23ai): every format, sparse vectors, texts as FROM_VECTOR writes them.
