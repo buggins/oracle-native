@@ -4,6 +4,15 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Proxy authentication (#21): `ConnectionOptions.proxyClient` (parameter
+  `proxy_client`), or the user name written `proxy[target]`: the proxy user
+  logs in with its own password to a session of the target user, who must
+  allow it (`ALTER USER target GRANT CONNECT THROUGH proxy`).
+
 ## 0.2.0 — 2026-11-03
 
 ### Added

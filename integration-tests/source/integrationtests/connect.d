@@ -182,3 +182,51 @@ void testTls()
     enforce(scalar(conn, "SELECT 'descriptor' FROM dual") == "descriptor", "TCPS descriptor");
     conn.close();
 }
+
+/++
+Proxy authentication: the test user logs in to a session of `ITEST_PROXIED`
+(created with `ALTER USER itest_proxied GRANT CONNECT THROUGH testuser`);
+skipped without that user.
++/
+void testProxyAuthentication()
+{
+    import std.stdio : writeln;
+    import std.uni : toUpper;
+
+    {
+        auto conn = connectToServer();
+        scope (exit)
+            conn.close();
+        if (conn.queryValue!long("SELECT COUNT(*) FROM all_users WHERE username = 'ITEST_PROXIED'") == 0)
+        {
+            writeln("  (no user ITEST_PROXIED: proxy authentication not tested)");
+            return;
+        }
+    }
+    enum sql = "SELECT SYS_CONTEXT('USERENV', 'SESSION_USER'), SYS_CONTEXT('USERENV', 'PROXY_USER') FROM dual";
+    void check(Connection conn, string how)
+    {
+        scope (exit)
+            conn.close();
+        auto r = conn.query(sql);
+        const row = r.front;
+        enforce(row.getString(0) == "ITEST_PROXIED" && row.getString(1) == userName().toUpper,
+                how ~ ": session user " ~ row.getString(0) ~ ", proxy " ~ row.getString(1));
+        r.close();
+    }
+
+    auto o = serverOptions();
+    o.proxyClient = "itest_proxied";
+    check(new Connection(o), "proxyClient");
+    o = serverOptions("proxy_client=itest_proxied");
+    check(new Connection(o), "proxy_client parameter");
+    o = serverOptions();
+    o.user = userName() ~ "[itest_proxied]";
+    check(new Connection(o), "user[target]");
+
+    // a user that doesn't allow it: refused like a wrong password (ORA-01017)
+    o = serverOptions();
+    o.proxyClient = "system";
+    auto e = collectException!ServerException(new Connection(o));
+    enforce(e !is null && e.code == 1017, "not authorized: " ~ (e is null ? "connected" : e.msg));
+}

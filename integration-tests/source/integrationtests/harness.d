@@ -37,6 +37,7 @@ immutable TestCase[] allTests = [
     TestCase("URL, Easy Connect and descriptor strings", &testConnectionStrings, true),
     TestCase("failover to the next address", &testFailover, true),
     TestCase("failed login and unknown service", &testLoginErrors, true),
+    TestCase("proxy authentication", &testProxyAuthentication, true),
     TestCase("small SDU and long statements", &testSdu, true),
     TestCase("receive timeout closes the connection", &testReceiveTimeout, true),
     TestCase("TLS (TCPS)", &testTls, true),

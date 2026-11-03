@@ -181,13 +181,13 @@ Phase2Keys deriveKeys(const KeyValue[] phase1, scope const(char)[] password,
     return k;
 }
 
-/// The phase 2 message.
-ubyte[] buildPhase2(string user, const Phase2Keys keys, string driverName, string timeZone, ubyte sequence,
-        ubyte fieldVersion) @safe pure
+/// The phase 2 message; `proxyClient`: the user of a proxy session (empty: none).
+ubyte[] buildPhase2(string user, string proxyClient, const Phase2Keys keys, string driverName, string timeZone,
+        ubyte sequence, ubyte fieldVersion) @safe pure
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.authPhase2, sequence, fieldVersion);
-    const pairs = keys.speedyKey.length ? 7 : 6;
+    const pairs = (keys.speedyKey.length ? 7 : 6) + (proxyClient.length ? 1 : 0);
     w.u8(user.length ? 1 : 0);
     w.ub(user.length);
     w.ub(AuthMode.logon | AuthMode.withPassword);
@@ -197,6 +197,8 @@ ubyte[] buildPhase2(string user, const Phase2Keys keys, string driverName, strin
     w.u8(1);
     if (user.length)
         w.clr(cast(const(ubyte)[]) user);
+    if (proxyClient.length)
+        keyValue(w, "PROXY_CLIENT_NAME", proxyClient);
     keyValue(w, "AUTH_SESSKEY", keys.sessionKey, 1);
     if (keys.speedyKey.length)
         keyValue(w, "AUTH_PBKDF2_SPEEDY_KEY", keys.speedyKey);
