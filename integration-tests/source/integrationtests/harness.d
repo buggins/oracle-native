@@ -38,6 +38,7 @@ immutable TestCase[] allTests = [
     TestCase("failover to the next address", &testFailover, true),
     TestCase("failed login and unknown service", &testLoginErrors, true),
     TestCase("proxy authentication", &testProxyAuthentication, true),
+    TestCase("tnsnames.ora aliases", &testTnsAliases, true),
     TestCase("small SDU and long statements", &testSdu, true),
     TestCase("receive timeout closes the connection", &testReceiveTimeout, true),
     TestCase("TLS (TCPS)", &testTls, true),

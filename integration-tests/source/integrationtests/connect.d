@@ -230,3 +230,46 @@ void testProxyAuthentication()
     auto e = collectException!ServerException(new Connection(o));
     enforce(e !is null && e.code == 1017, "not authorized: " ~ (e is null ? "connected" : e.msg));
 }
+
+/// Connect aliases from a `tnsnames.ora` (a descriptor and an Easy Connect entry; `config_dir` and `TNS_ADMIN`).
+void testTnsAliases()
+{
+    import std.conv : to;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import dbwire.client.hosts : parseHostPort;
+
+    const hp = parseHostPort(environment.get("ORACLE_HOST", ""));
+    const port = hp.port ? hp.port : 1521;
+    const dir = buildPath(tempDir, "oracle-native-itest-tns");
+    mkdirRecurse(dir);
+    scope (exit)
+        rmdirRecurse(dir);
+    write(buildPath(dir, "tnsnames.ora"), "# test aliases\nITEST_DESC, itest_desc.example =\n  (DESCRIPTION =\n"
+            ~ "    (ADDRESS = (PROTOCOL = TCP)(HOST = " ~ hp.host ~ ")(PORT = " ~ port.to!string ~ "))\n"
+            ~ "    (CONNECT_DATA = (SERVICE_NAME = " ~ serviceName() ~ ")))\n"
+            ~ "itest_ez = " ~ hp.host ~ ":" ~ port.to!string ~ "/" ~ serviceName() ~ "\n");
+    foreach (alias_; ["ITEST_DESC", "itest_desc.example", "itest_ez"])
+    {
+        auto conn = new Connection(alias_ ~ "?config_dir=" ~ dir, userName(), password());
+        scope (exit)
+            conn.close();
+        enforce(conn.queryValue!long("SELECT 1 FROM dual") == 1, alias_);
+    }
+    auto e = collectException!ClientException(new Connection("itest_nosuch?config_dir=" ~ dir, userName(), password()));
+    enforce(e !is null, "an unknown alias");
+
+    const saved = environment.get("TNS_ADMIN", null);
+    environment["TNS_ADMIN"] = dir;
+    scope (exit)
+    {
+        if (saved is null)
+            environment.remove("TNS_ADMIN");
+        else
+            environment["TNS_ADMIN"] = saved;
+    }
+    auto conn = new Connection("itest_ez", userName(), password());
+    scope (exit)
+        conn.close();
+    enforce(conn.queryValue!long("SELECT 1 FROM dual") == 1, "TNS_ADMIN");
+}

@@ -141,22 +141,57 @@ struct ConnectionOptions
     +/
     Duration receiveTimeout;
 
+    /++
+    The directory with `tnsnames.ora`, for connect aliases (`parse("SALES")`);
+    empty: `$TNS_ADMIN`, else `$ORACLE_HOME/network/admin`.
+    +/
+    string configDir;
+
     /// I/O backend selection.
     IoMode ioMode = IoMode.auto_;
     /// Custom transport factory; overrides the backend's connect logic when set.
     TransportFactory transportFactory;
 
     /++
-    Parses any of the three connection string forms: a URL (`oracle://`), a
-    connect descriptor (starting with an opening parenthesis), or Easy Connect.
+    Parses any of the connection string forms: a URL (`oracle://`), a
+    connect descriptor (starting with an opening parenthesis), a connect
+    alias from `tnsnames.ora` (a name such as `SALES`, optionally followed by
+    parameters: `SALES?config_dir=/etc/oracle&fetch_size=500`; see
+    `oracle.tnsnames` for where the file is looked for), or Easy Connect. A
+    name is taken as a host name when no `tnsnames.ora` is found.
 
-    Throws: `ClientException` if the string is malformed.
+    Throws: `ClientException` if the string is malformed, or if a
+    `tnsnames.ora` is found without the alias.
     +/
     static ConnectionOptions parse(string text) @safe
     {
-        import std.string : startsWith, strip;
+        import std.algorithm.searching : findSplit;
+        import std.string : strip;
+        import oracle.tnsnames : findConfigDir, isAliasName, readTnsNames;
 
         const s = text.strip;
+        auto q = s.findSplit("?");
+        if (isAliasName(q[0]))
+        {
+            const params = q[1].length ? parseQuery(q[2], "connect alias") : null;
+            const dir = findConfigDir(params.get("config_dir", null));
+            if (dir !is null)
+            {
+                auto o = parseDirect(readTnsNames(dir).lookup(q[0]));
+                o.applyParams(params);
+                o.configDir = dir;
+                return o;
+            }
+        }
+        return parseDirect(s);
+    }
+
+    /// `parse` without aliases.
+    private static ConnectionOptions parseDirect(string s) @safe
+    {
+        import std.string : startsWith, strip;
+
+        s = s.strip;
         if (s.startsWith("oracle://"))
             return fromDsn(s);
         if (s.startsWith("("))
@@ -353,17 +388,26 @@ struct ConnectionOptions
     `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
-    `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`).
+    `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`),
+    `config_dir` (where `tnsnames.ora` is).
     `pool_*` keys are for the pool (`PoolOptions.fromParams`) and ignored here.
 
     Throws: `ClientException` for unknown keys or invalid values.
     +/
     static ConnectionOptions fromParams(const string[string] params) @safe
     {
+        ConnectionOptions o;
+        o.applyParams(params);
+        return o;
+    }
+
+    /// Sets the options named in `params` (as `fromParams` reads them), keeping the others.
+    void applyParams(const string[string] params) @safe
+    {
         import std.conv : ConvException, to;
         import std.string : toLower;
 
-        ConnectionOptions o;
+        alias o = this;
         foreach (key, value; params)
         {
             import std.algorithm.searching : startsWith;
@@ -491,11 +535,13 @@ struct ConnectionOptions
             case "io_mode":
                 o.ioMode = parseEnumValue!IoMode(key, value);
                 break;
+            case "config_dir":
+                o.configDir = value;
+                break;
             default:
                 throw new ClientException("Unknown connection parameter '" ~ key ~ "'");
             }
         }
-        return o;
     }
 
     /// The port to connect to: `port`, or the default for the protocol when 0.
@@ -760,4 +806,29 @@ private string toText(T)(T v) @safe pure
     o = ConnectionOptions.parse("oracle://plain:pw@db/SALES");
     o.loginUsers(login, client);
     assert(login == "plain" && client is null);
+}
+
+/// Connect aliases from `tnsnames.ora`.
+@safe unittest
+{
+    import std.exception : assertThrown;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+
+    const dir = buildPath(tempDir, "oracle-native-alias-test");
+    (() @trusted {
+        mkdirRecurse(dir);
+        write(buildPath(dir, "tnsnames.ora"), "sales = (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=db1)(PORT=1522))"
+            ~ "(CONNECT_DATA=(SERVICE_NAME=SALES)))\nhr = db2/HR?fetch_size=50\n");
+    })();
+    scope (exit)
+        (() @trusted => rmdirRecurse(dir))();
+    auto o = ConnectionOptions.parse("SALES?config_dir=" ~ dir ~ "&fetch_size=7");
+    assert(o.hosts == [HostPort("db1", 1522)] && o.serviceName == "SALES" && o.fetchSize == 7 && o.configDir == dir);
+    o = ConnectionOptions.parse("hr?config_dir=" ~ dir);
+    assert(o.hosts == [HostPort("db2", 0)] && o.serviceName == "HR" && o.fetchSize == 50);
+    assertThrown!ClientException(ConnectionOptions.parse("nosuch?config_dir=" ~ dir));
+    // without a tnsnames.ora, a name is a host
+    o = ConnectionOptions.parse("dbhost?config_dir=" ~ buildPath(dir, "none"));
+    assert(o.hosts == [HostPort("dbhost", 0)]);
 }
