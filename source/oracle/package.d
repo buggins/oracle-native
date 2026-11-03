@@ -13,6 +13,13 @@ Authors:   Vadim Lopatin
 +/
 module oracle;
 
+public import oracle.connection : Connection;
+public import oracle.exception;
+public import oracle.result : QueryResult, Row;
+public import oracle.settings : ConnectionOptions, HostPort, HostSelection;
+public import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
+public import dbwire.io.backend : IoMode;
+
 /// Library version.
 enum uint oracleVersionMajor = 0;
 /// ditto

@@ -86,9 +86,18 @@ jobs:
         run: |
           docker exec ${{ job.services.oracle.id }} bash -c \
             "echo 'SELECT banner FROM v\$version;' | sqlplus -s testuser/Test_password123@${{ matrix.service }}"
-      - name: Build
-        run: dub build
-      # Integration tests (thread and fiber runners) come with O1
+      - name: TLS proxy (TCPS stand-in)
+        run: sh integration-tests/tls/start-proxy.sh 127.0.0.1:1521 2484
+      - name: Integration tests (threads)
+        env:
+          ORACLE_TLS_HOST: localhost:2484
+          ORACLE_TLS_CA: ${{ github.workspace }}/integration-tests/tls/ca.pem
+        run: dub run :integration-tests-phobos
+      - name: Integration tests (vibe.d fibers)
+        env:
+          ORACLE_TLS_HOST: localhost:2484
+          ORACLE_TLS_CA: ${{ github.workspace }}/integration-tests/tls/ca.pem
+        run: dub run :integration-tests-vibe
 
   lint:
     runs-on: ubuntu-latest
