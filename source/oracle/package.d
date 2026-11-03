@@ -1,0 +1,56 @@
+/++
+Native Oracle Database client library for D.
+
+oracle-native talks to Oracle Database over the Oracle Net (TNS) and TTC
+protocols and works both with blocking Phobos sockets (ordinary threads) and
+with vibe-core sockets (vibe.d fibers), through [dbwire](https://github.com/buggins/dbwire).
+
+This is an unofficial project, not affiliated with Oracle.
+
+Copyright: Copyright © 2026, Vadim Lopatin
+License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
+Authors:   Vadim Lopatin
++/
+module oracle;
+
+/// Library version.
+enum uint oracleVersionMajor = 0;
+/// ditto
+enum uint oracleVersionMinor = 0;
+/// ditto
+enum uint oracleVersionPatch = 0;
+
+/// Library version as a string, e.g. `"0.1.0"`.
+enum string oracleVersion = versionString(oracleVersionMajor, oracleVersionMinor, oracleVersionPatch);
+
+/// Driver name reported to the server at login.
+enum string oracleClientName = "oracle-native";
+
+version (Have_vibe_core)
+    private enum bool hasVibeCore = true;
+else
+    private enum bool hasVibeCore = false;
+
+/++
+True when vibe-core support is compiled in.
+
+dub defines `Have_vibe_core` when vibe-core is anywhere in the application's
+dependency graph. oracle-native then supports fiber mode in addition to the
+always-available thread mode.
++/
+enum bool oracleHasVibe = hasVibeCore;
+
+private string versionString(uint major, uint minor, uint patch) pure @safe
+{
+    import std.conv : to;
+
+    return major.to!string ~ "." ~ minor.to!string ~ "." ~ patch.to!string;
+}
+
+///
+@safe unittest
+{
+    import std.algorithm.searching : count;
+
+    assert(oracleVersion.count('.') == 2 && oracleClientName == "oracle-native");
+}
