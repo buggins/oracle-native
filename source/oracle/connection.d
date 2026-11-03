@@ -36,6 +36,7 @@ import oracle.lob : Lob, LobOperation, LobRequest, LobResponse, buildLobOperatio
 import oracle.mapping : RowRange, columnNames, fieldParameters, fieldPositions, quoteIdentifier, readStruct, readValue;
 import oracle.result : BatchResult, QueryResult;
 import oracle.settings : ConnectionOptions, HostPort, sameDistinguishedName;
+import oracle.pipeline : Pipeline, PipelineOp, PipelineOpKind, PipelineResult;
 import oracle.params : BindDirection, Parameter, Placeholders, findPlaceholders, maxBindBytes, parameters,
     rewritePlaceholders;
 import oracle.statement : StatementKind, classify;
@@ -201,6 +202,16 @@ final class Connection : Poolable
     @property ubyte fieldVersion() const @safe pure nothrow
     {
         return negotiatedFieldVersion;
+    }
+
+    /++
+    Whether the server takes several calls without waiting for each response
+    (pipelining, 23ai: it ends every response with an END_OF_RESPONSE
+    message). `Pipeline.run` runs the calls one by one otherwise.
+    +/
+    @property bool supportsPipelining() const @safe pure nothrow
+    {
+        return tns !is null && tns.endOfResponse;
     }
 
     /// Whether the session has uncommitted changes (as of the last call).
@@ -663,13 +674,245 @@ final class Connection : Poolable
     /// Runs one statement; see `query`.
     private QueryResult run(string sql, const(Parameter)[] params) @safe
     {
+        checkReady();
+        Prepared p;
+        p = prepare(sql, params, false);
+        auto stmt = p.stmt;
+        auto result = p.result;
+        auto binds = p.binds;
+        auto send = p.send;
+        guarded({
+            state = State.busy;
+            scope (failure)
+                if (state == State.busy)
+                    state = State.ready;
+            auto e = executeStatement(stmt, result, binds, send);
+            if (e.number != 0 && e.number != noMoreRows)
+            {
+                if (!result.keepCursor)
+                    closeCursorLater(e.cursorId);
+                throwIfError(e);
+            }
+            finishExecution(result, e);
+        });
+        if (result.allFetched)
+            result.release(); // every row is here: the connection is free
+        return result;
+    }
+
+    /// After a statement ran: its LOB defines, row count, and what is fetched. Call inside `guarded`.
+    private void finishExecution(QueryResult result, ref ErrorInfo e) @safe
+    {
+        if (result.isQuery && (e.number == 0 || e.number == noMoreRows) && needsDefine(result.columnInfo))
+            e = define(result);
+        result.rowCount = result.isQuery ? 0 : e.rowCount;
+        foreach (c; result.outputCursors)
+            if (c !is null && c.columnInfo.length == 0)
+                c.allFetched = true; // a NULL cursor
+        result.allFetched = e.number == noMoreRows || !result.isQuery;
+        if (!databaseZoneKnown)
+            foreach (ref c; result.columnInfo)
+                if (c.type == OracleType.timestampLtz)
+                {
+                    loadDatabaseZone();
+                    break;
+                }
+    }
+
+    /// A new pipeline on this connection (see `oracle.pipeline`).
+    Pipeline pipeline() @safe
+    {
+        return new Pipeline(this);
+    }
+
+    /// Runs the operations of a pipeline; see `Pipeline.run`.
+    package PipelineResult[] runPipeline(const(PipelineOp)[] ops, bool continueOnError) @safe
+    {
+        checkReady();
+        auto results = new PipelineResult[ops.length];
+        if (ops.length == 0)
+            return results;
+        foreach (i, ref op; ops)
+            results[i].sql = op.sql;
+        if (!supportsPipelining)
+        {
+            foreach (i, ref op; ops)
+            {
+                try
+                {
+                    if (op.kind == PipelineOpKind.commit)
+                    {
+                        commit();
+                        continue;
+                    }
+                    auto r = run(op.sql, op.params);
+                    readAllRows(r);
+                    results[i].rowCount = r.rowCount;
+                    results[i].result = r;
+                }
+                catch (ServerException e)
+                {
+                    if (!continueOnError)
+                        throw e;
+                    results[i].error = e;
+                }
+            }
+            return results;
+        }
+
+        auto prepared = new Prepared[ops.length];
+        foreach (i, ref op; ops)
+            if (op.kind != PipelineOpKind.commit)
+                prepared[i] = prepare(op.sql, op.params, true);
+        ServerException firstError;
+        guarded({
+            state = State.busy;
+            scope (failure)
+                if (state == State.busy)
+                    state = State.ready;
+            // the requests: the first one begins the pipeline (with the pending piggybacks)
+            const mode = continueOnError ? PipelineMode.continueOnError : PipelineMode.abortOnError;
+            auto requests = new ubyte[][ops.length];
+            foreach (i, ref op; ops)
+            {
+                TtcWriter w;
+                if (i == 0)
+                {
+                    putBeginPipeline(w, mode, nextSequence(), negotiatedFieldVersion);
+                    if (cursorsToClose.length)
+                    {
+                        putCloseCursors(w, cursorsToClose, nextSequence(), negotiatedFieldVersion);
+                        cursorsToClose = null;
+                    }
+                    if (endToEnd.changed)
+                    {
+                        putEndToEnd(w, endToEnd, nextSequence(), negotiatedFieldVersion);
+                        endToEnd.changed = 0;
+                    }
+                }
+                if (op.kind == PipelineOpKind.commit)
+                    w.bytes(buildBareCall(FunctionCode.commit, nextSequence(), negotiatedFieldVersion));
+                else
+                {
+                    const commit = options.autoCommit && prepared[i].stmt.kind != StatementKind.query;
+                    const r = parseRequest(prepared[i].stmt, prepared[i].binds, prepared[i].send, commit);
+                    w.bytes(buildExecute(r, nextSequence(), negotiatedFieldVersion));
+                }
+                requests[i] = w.data;
+            }
+            const end = buildEndPipeline(nextSequence(), negotiatedFieldVersion);
+            {
+                writeLock.lock();
+                scope (exit)
+                    writeLock.unlock();
+                foreach (i, request; requests)
+                    tns.sendData(request, i == 0 ? DataFlags.beginPipeline : 0, DataFlags.endOfRequest);
+                tns.sendData(end);
+            }
+            // the responses, one per request, then the end's
+            tns.inPipeline = true;
+            scope (exit)
+                tns.inPipeline = false;
+            foreach (i, ref op; ops)
+            {
+                auto result = prepared[i].result;
+                const e = readResponse(result);
+                if (e.number != 0 && e.number != noMoreRows)
+                {
+                    closeCursorLater(e.cursorId);
+                    auto error = new ServerException(e.number, e.message, e.position);
+                    results[i].error = error;
+                    if (firstError is null)
+                        firstError = error;
+                    continue;
+                }
+                if (result is null)
+                    continue;
+                result.cursorId = e.cursorId;
+                result.rowCount = result.isQuery ? 0 : e.rowCount;
+                result.allFetched = e.number == noMoreRows || !result.isQuery;
+                results[i].rowCount = result.rowCount;
+                results[i].result = result;
+            }
+            throwIfError(readResponse(null));
+            tns.inPipeline = false;
+            // what the pipeline couldn't do: LOB defines, the database time zone
+            foreach (ref r; results)
+                if (r.result !is null)
+                {
+                    ErrorInfo e;
+                    e.number = r.result.allFetched && r.result.isQuery ? noMoreRows : 0;
+                    e.rowCount = r.rowCount;
+                    finishExecution(r.result, e);
+                    if (e.number != 0 && e.number != noMoreRows)
+                        throwIfError(e);
+                }
+        });
+        // the remaining rows of the queries, one after the other
+        foreach (ref r; results)
+            if (r.result !is null)
+            {
+                if (firstError !is null && !continueOnError)
+                {
+                    r.result.close();
+                    continue;
+                }
+                readAllRows(r.result);
+            }
+        if (state == State.busy)
+            state = State.ready;
+        if (firstError !is null && !continueOnError)
+            throw firstError;
+        return results;
+    }
+
+    /// Reads the remaining rows of a query result into it, which frees the connection.
+    private void readAllRows(QueryResult r) @safe
+    {
+        if (!r.isQuery || r.allFetched)
+        {
+            r.release();
+            return;
+        }
+        state = State.busy;
+        auto rows = r.batch;
+        while (!r.allFetched)
+        {
+            r.batch = null;
+            fetchMore(r);
+            rows ~= r.batch;
+        }
+        r.batch = rows;
+        r.release();
+    }
+
+    /// A statement ready to run: its cache entry (or a new one), binds, and result.
+    private static struct Prepared
+    {
+        CachedStatement stmt;
+        QueryResult result;
+        Parameter[] binds;
+        bool[] send;
+    }
+
+    /// Prepares `sql` with `params`; `fresh`: a new statement, not from the cache.
+    private Prepared prepare(string sql, const(Parameter)[] params, bool fresh) @safe
+    {
         import std.algorithm.searching : canFind;
 
-        checkReady();
         size_t questionMarks;
         const text = rewritePlaceholders(sql, questionMarks);
         const kind = classify(text);
-        auto stmt = statementFor(text, kind);
+        CachedStatement stmt;
+        if (fresh)
+        {
+            stmt = new CachedStatement;
+            stmt.sql = text;
+            stmt.kind = kind;
+            stmt.placeholders = findPlaceholders(text);
+        }
+        else
+            stmt = statementFor(text, kind);
         string[] names;
         auto binds = arrangeBinds(stmt.placeholders, kind, params, names);
         auto result = new QueryResult(this);
@@ -690,36 +933,7 @@ final class Connection : Poolable
                         ? cast(uint) maxBindBytes : binds[i].bufferSize;
                 }
         result.binds = binds;
-        guarded({
-            state = State.busy;
-            scope (failure)
-                if (state == State.busy)
-                    state = State.ready;
-            auto e = executeStatement(stmt, result, binds, send);
-            if (e.number != 0 && e.number != noMoreRows)
-            {
-                if (!result.keepCursor)
-                    closeCursorLater(e.cursorId);
-                throwIfError(e);
-            }
-            if (result.isQuery && (e.number == 0 || e.number == noMoreRows) && needsDefine(result.columnInfo))
-                e = define(result);
-            result.rowCount = result.isQuery ? 0 : e.rowCount;
-            foreach (c; result.outputCursors)
-                if (c !is null && c.columnInfo.length == 0)
-                    c.allFetched = true; // a NULL cursor
-            result.allFetched = e.number == noMoreRows || !result.isQuery;
-            if (!databaseZoneKnown)
-                foreach (ref c; result.columnInfo)
-                    if (c.type == OracleType.timestampLtz)
-                    {
-                        loadDatabaseZone();
-                        break;
-                    }
-        });
-        if (result.allFetched)
-            result.release(); // every row is here: the connection is free
-        return result;
+        return Prepared(stmt, result, binds, send);
     }
 
     /++
@@ -753,6 +967,26 @@ final class Connection : Poolable
         }
         else if (stmt.cursorId)
             uncache(stmt); // other bind types: parse it again
+        const r = parseRequest(stmt, binds, send, commit);
+        call(seq => buildExecute(r, seq, negotiatedFieldVersion));
+        auto e = readResponse(result);
+        result.cursorId = e.cursorId;
+        if (cacheable && e.cursorId && (e.number == 0 || e.number == noMoreRows))
+        {
+            stmt.binds = binds.dup;
+            stmt.columns = result.columnInfo.dup;
+            stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
+            cache(stmt, e.cursorId);
+            result.keepCursor = true;
+            result.statement = stmt;
+        }
+        return e;
+    }
+
+    /// The EXECUTE that parses and runs `stmt` with `binds` (fetching the first rows of a query).
+    private ExecuteRequest parseRequest(CachedStatement stmt, Parameter[] binds, bool[] send, bool commit) @safe
+    {
+        const kind = stmt.kind;
         ExecuteRequest r;
         r.sql = stmt.sql;
         r.options = ExecuteOption.parse | ExecuteOption.execute;
@@ -783,19 +1017,7 @@ final class Connection : Poolable
             if (commit)
                 r.options |= ExecuteOption.commit;
         }
-        call(seq => buildExecute(r, seq, negotiatedFieldVersion));
-        auto e = readResponse(result);
-        result.cursorId = e.cursorId;
-        if (cacheable && e.cursorId && (e.number == 0 || e.number == noMoreRows))
-        {
-            stmt.binds = binds.dup;
-            stmt.columns = result.columnInfo.dup;
-            stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
-            cache(stmt, e.cursorId);
-            result.keepCursor = true;
-            result.statement = stmt;
-        }
-        return e;
+        return r;
     }
 
     /// Whether a query's columns need a define: LOBs not defined yet.
@@ -1307,9 +1529,19 @@ final class Connection : Poolable
         }
     }
 
-    /// After the last message of a response: nothing may follow (a mistake in a message layout shows here).
-    private void checkResponseEnd() @safe
+    /++
+    After the last message of a response (ERROR or STATUS): the END_OF_RESPONSE
+    message when the server sends them (and `functionCall`), then nothing may
+    follow (a mistake in a message layout shows here).
+    +/
+    private void checkResponseEnd(bool functionCall = true) @safe
     {
+        if (functionCall && tns.endOfResponse)
+        {
+            const type = reader.u8();
+            if (type != MessageType.endOfResponse)
+                throw new ProtocolException("Expected the end of the response, not message type " ~ toText(type));
+        }
         if (reader.reader.buffered != 0 || tns.unread != 0)
             throw new ProtocolException("The server's response continues after its end");
     }
@@ -1470,11 +1702,11 @@ final class Connection : Poolable
         {
             transport = open(endpoint);
             tns = new TnsStream(transport);
-            tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.withAcceptFlags, connectFlags));
+            tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.endOfResponse, connectFlags));
             auto p = tns.readPacket();
             while (p.type == PacketType.resend)
             {
-                tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.withAcceptFlags, connectFlags));
+                tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.endOfResponse, connectFlags));
                 p = tns.readPacket();
             }
             if (p.type == PacketType.accept)
@@ -1489,6 +1721,9 @@ final class Connection : Poolable
                             ~ " not supported; use TLS (TCPS) instead");
                 tns.largeLengths = true;
                 tns.sdu = a.sdu < 512 ? 512 : a.sdu > maxSdu ? maxSdu : a.sdu;
+                // 23ai ends every response with END_OF_RESPONSE when offered (needed for pipelining)
+                tns.endOfResponse = a.tnsVersion >= TnsVersion.endOfResponse
+                    && (a.flags2 & AcceptFlags2.hasEndOfResponse) != 0;
                 break;
             }
             if (p.type == PacketType.refuse)
@@ -1524,9 +1759,9 @@ final class Connection : Poolable
             throw new ConnectionException("The server's TTC field version " ~ toText(
                     serverFieldVersion)
                     ~ " is too old (Oracle Database 12.1 or later is needed)");
-        tns.sendData(buildDataTypesMessage());
+        tns.sendData(buildDataTypesMessage(tns.endOfResponse));
         readDataTypesResponse(reader);
-        checkResponseEnd();
+        checkResponseEnd(false); // negotiation messages have no END_OF_RESPONSE
 
         // O5LOGON
         import std.algorithm.searching : all;

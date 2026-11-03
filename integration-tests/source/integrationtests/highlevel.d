@@ -181,3 +181,65 @@ void testInsertMany()
     enforce(conn.queryValue!long("SELECT COUNT(*) FROM itest_items") == 2501, "auto-commit");
     dropTable(conn, "itest_items");
 }
+
+/++
+Pipelines: statements, PL/SQL OUT values, queries (more rows than a fetch, a
+CLOB column), commits, and both error modes; pipelined on 23ai, one by one
+on older servers, with the same results.
++/
+void testPipelines()
+{
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    dropTable(conn, "itest_pipe");
+    conn.exec("CREATE TABLE itest_pipe (id NUMBER PRIMARY KEY, txt VARCHAR2(20), doc CLOB)");
+    scope (exit)
+        dropTable(conn, "itest_pipe");
+    auto r = conn.pipeline()
+        .exec("INSERT INTO itest_pipe VALUES (:1, :2, :3)", 1, "one", "first document")
+        .exec("INSERT INTO itest_pipe VALUES (:1, :2, :3)", 2, "two", "second document")
+        .exec("UPDATE itest_pipe SET txt = txt || '!'")
+        .exec("BEGIN :o := :i * 2; END;", Parameter.output!long, 21)
+        .query("SELECT LEVEL FROM dual CONNECT BY LEVEL <= 1000")
+        .query("SELECT id, txt, doc FROM itest_pipe ORDER BY id")
+        .commit()
+        .run();
+    enforce(r.length == 7 && r[0].ok && r[0].rowCount == 1 && r[2].rowCount == 2, "row counts");
+    enforce(r[3].result.output(0).getLong() == 42, "PL/SQL OUT value");
+    long n, sum;
+    foreach (row; r[4].result)
+    {
+        n++;
+        sum += row.getLong(0);
+    }
+    enforce(n == 1000 && sum == 500_500, "all rows of a long query");
+    string[] docs;
+    foreach (row; r[5].result)
+        docs ~= row.getString(1) ~ " " ~ row.getString(2);
+    enforce(docs == ["one! first document", "two! second document"], "CLOB query");
+    enforce(r[6].result is null && r[6].ok, "commit");
+    enforce(!conn.isBusy && !conn.inTransaction, "free and committed");
+
+    // every operation runs; the errors are in the results
+    auto c = conn.pipeline()
+        .exec("INSERT INTO itest_pipe (id) VALUES (1)")
+        .exec("INSERT INTO itest_pipe (id) VALUES (3)")
+        .query("SELECT COUNT(*) FROM itest_pipe")
+        .run(true);
+    enforce(!c[0].ok && c[0].error.code == 1 && c[0].result is null, "the failed operation");
+    enforce(c[1].ok && c[1].rowCount == 1 && c[2].result.front.getLong(0) == 3, "the later operations ran");
+    conn.rollback();
+
+    // the first error stops the pipeline
+    auto e = collectException!ServerException(conn.pipeline()
+            .exec("INSERT INTO itest_pipe (id) VALUES (1)")
+            .exec("INSERT INTO itest_pipe (id) VALUES (4)")
+            .query("SELECT 1 FROM dual")
+            .run());
+    enforce(e !is null && e.code == 1, "abort on error");
+    enforce(!conn.isBusy && conn.queryValue!long("SELECT COUNT(*) FROM itest_pipe") == 2,
+            "the later operations didn't run");
+    conn.rollback();
+    enforce(conn.pipeline().run().length == 0, "an empty pipeline");
+}

@@ -25,6 +25,8 @@ enum FunctionCode : ubyte
     lobOp = 96, /// LOB operation
     closeCursors = 105, /// close cursors (piggyback)
     setEndToEnd = 135, /// set end-to-end attributes (piggyback)
+    pipelineBegin = 199, /// a pipeline begins (piggyback)
+    pipelineEnd = 200, /// the pipeline ends
     authPhase2 = 115, /// authentication, phase 2
     authPhase1 = 118, /// authentication, phase 1
     ping = 147, /// ping
@@ -358,4 +360,33 @@ void putEndToEnd(ref TtcWriter w, const ref EndToEnd e, ubyte sequence, ubyte fi
     ])
         if ((e.changed & (1 << a)) && e.values[a].length)
             w.clr(cast(const(ubyte)[]) e.values[a]);
+}
+
+/// How a pipeline goes on after a failed call.
+enum PipelineMode : ubyte
+{
+    continueOnError = 1, /// the later calls run
+    abortOnError = 2, /// the later calls fail too
+}
+
+/// The piggyback that begins a pipeline (before its first call).
+void putBeginPipeline(ref TtcWriter w, PipelineMode mode, ubyte sequence, ubyte fieldVersion) @safe pure
+{
+    w.u8(MessageType.piggyback);
+    w.u8(FunctionCode.pipelineBegin);
+    w.u8(sequence);
+    if (fieldVersion >= TtcFieldVersion.v23_1_ext1)
+        w.ub(0); // token number
+    w.ub(0); // error set ID
+    w.u8(0); // error set mode
+    w.u8(mode);
+}
+
+/// The call that ends a pipeline (after its last call).
+ubyte[] buildEndPipeline(ubyte sequence, ubyte fieldVersion) @safe pure
+{
+    TtcWriter w;
+    functionHeader(w, FunctionCode.pipelineEnd, sequence, fieldVersion);
+    w.ub(0); // ID (unused)
+    return w.data;
 }

@@ -47,6 +47,8 @@ Features:
 - `oracle://` URLs, Easy Connect strings, connect descriptors and
   `tnsnames.ora` aliases; failover
   over several addresses;
+- pipelines (23ai: several statements in one round trip; one by one on
+  older servers);
 - bind variables (`:1`, `:name`, or `?`), a statement cache, array DML with
   batch errors, `RETURNING INTO`, PL/SQL with OUT parameters, REF cursors,
   implicit results, cancellation, transactions (explicit, or auto-commit);
@@ -60,7 +62,7 @@ Features:
 - a connection pool for threads and vibe.d fibers, and struct mapping; a
   [ddbc](https://github.com/buggins/ddbc) driver (configuration `ORACLE`).
 
-Later: pipelining, DRCP
+Later: DRCP
 and a [hibernated](https://github.com/buggins/hibernated) dialect.
 Native Network Encryption (Oracle's own encryption, an alternative to TLS) is
 not supported: servers that require it are refused with a clear error.
@@ -113,6 +115,23 @@ temporary CLOB for long documents): the server parses it.
 Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
 another thread or task) stops a running call with ORA-01013.
+
+## Pipelines
+
+```d
+auto results = conn.pipeline()
+    .exec("INSERT INTO notes VALUES (:1, :2)", 3, "third")
+    .exec("UPDATE counters SET n = n + 1 WHERE id = :1", 7)
+    .query("SELECT id, text FROM notes ORDER BY id")
+    .commit()
+    .run();                       // run(true): go on after errors, which are in the results
+foreach (row; results[2].result)
+    writeln(row.getLong(0), " ", row.getString(1));
+```
+
+On 23ai the statements go to the server together and their responses are read
+afterwards (`conn.supportsPipelining`); older servers run them one by one. A
+query's rows are all read before `run` returns.
 
 ## Structs
 
