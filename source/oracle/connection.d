@@ -35,7 +35,7 @@ import oracle.protocol.ttc : TtcReader, TtcWriter;
 import oracle.lob : Lob, LobOperation, LobRequest, LobResponse, buildLobOperation;
 import oracle.mapping : RowRange, columnNames, fieldParameters, fieldPositions, quoteIdentifier, readStruct, readValue;
 import oracle.result : BatchResult, QueryResult;
-import oracle.settings : ConnectionOptions, HostPort, sameDistinguishedName;
+import oracle.settings : ConnectionOptions, HostPort, Purity, sameDistinguishedName;
 import oracle.pipeline : Pipeline, PipelineOp, PipelineOpKind, PipelineResult;
 import oracle.params : BindDirection, Parameter, Placeholders, findPlaceholders, maxBindBytes, parameters,
     rewritePlaceholders;
@@ -85,6 +85,7 @@ final class Connection : Poolable
     private IoLock writeLock; // writes from cancel() and the calls
     private shared bool cancelPending; // an INTERRUPT was sent and its ORA-01013 not yet read
     private uint lastCallStatus;
+    private bool sessionReleased; // DRCP: the session went back to the server's pool; the next call attaches one
     package Rebindable!(immutable TimeZone) sessionZone; // the session time zone, for WITH LOCAL TIME ZONE values
     package Rebindable!(immutable TimeZone) databaseZone; // DBTIMEZONE: WITH LOCAL TIME ZONE values come in it
     private bool databaseZoneKnown;
@@ -161,7 +162,7 @@ final class Connection : Poolable
         return format("%d.%d.%d.%d.%d", v >> 24, (v >> 20) & 0x0F, (v >> 12) & 0xFF, (v >> 8) & 0x0F, v & 0x0F);
     }
 
-    /// The session's ID and serial number (`V$SESSION.SID`, `SERIAL#`).
+    /// The session's ID and serial number (`V$SESSION.SID`, `SERIAL#`); with DRCP, of the session attached last.
     @property uint sessionId() const @safe pure
     {
         return sessionNumber("AUTH_SESSION_ID");
@@ -518,7 +519,40 @@ final class Connection : Poolable
         bareCall(FunctionCode.ping);
     }
 
-    /// Logs off and closes the connection. Calling it again does nothing.
+    /++
+    DRCP: hands the session back to the server's pool (after rolling back an
+    open transaction), keeping its state for the connection class; the next
+    call attaches a session again, the same one or another of the class (a
+    `ConnectionPool` does this when a connection is returned). Does nothing
+    without DRCP or when the session is released already.
+
+    Throws: `ClientException` if the connection is closed or busy;
+    `ServerException` if the rollback fails.
+    +/
+    void releaseSession() @safe
+    {
+        checkReady();
+        if (!options.usesDrcp || sessionReleased)
+            return;
+        guarded({
+            if (inTransaction)
+            {
+                call(seq => buildBareCall(FunctionCode.rollback, seq, negotiatedFieldVersion));
+                throwIfError(readResponse(null));
+            }
+            call(seq => buildSessionRelease(SessionReleaseMode.keep, seq, negotiatedFieldVersion)); // no response
+            sessionReleased = true;
+            lastCallStatus = 0;
+        });
+    }
+
+    /// DRCP: whether the session is released (`releaseSession`) and not attached again yet.
+    @property bool isSessionReleased() const @safe pure nothrow
+    {
+        return sessionReleased;
+    }
+
+    /// Logs off and closes the connection (DRCP: ends the session). Calling it again does nothing.
     void close() @safe nothrow
     {
         if (state == State.closed)
@@ -529,8 +563,13 @@ final class Connection : Poolable
         {
             if (wasReady)
             {
-                call(seq => buildBareCall(FunctionCode.logoff, seq, negotiatedFieldVersion));
-                readResponse(null);
+                if (!options.usesDrcp)
+                {
+                    call(seq => buildBareCall(FunctionCode.logoff, seq, negotiatedFieldVersion));
+                    readResponse(null);
+                }
+                else if (!sessionReleased) // DRCP: the session is ended, the pooled server process stays
+                    call(seq => buildSessionRelease(SessionReleaseMode.deauthenticate, seq, negotiatedFieldVersion));
                 tns.sendEof();
             }
         }
@@ -556,9 +595,11 @@ final class Connection : Poolable
     /// The cache entry for `sql` (a new, uncached one if it isn't there or is in use).
     private CachedStatement statementFor(string sql, StatementKind kind) @safe
     {
-        if (auto cached = sql in statements)
-            if (!cached.inUse)
-                return *cached;
+        // after a DRCP release the next session may be another one, without the cached cursors
+        if (!sessionReleased)
+            if (auto cached = sql in statements)
+                if (!cached.inUse)
+                    return *cached;
         auto s = new CachedStatement;
         s.sql = sql;
         s.kind = kind;
@@ -566,13 +607,26 @@ final class Connection : Poolable
         return s;
     }
 
-    /// Keeps `s` (whose cursor is `cursorId`) in the cache, evicting the least recently used entry.
-    private void cache(CachedStatement s, uint cursorId) @safe
+    /++
+    Keeps `s` (whose cursor is `cursorId`) in the cache, evicting the least
+    recently used entry, or replacing an idle entry for the same SQL. Returns
+    false if it isn't kept (the cache is full of statements in use, or the
+    entry for its SQL is in use): its cursor is then closed when its result is done.
+    +/
+    private bool cache(CachedStatement s, uint cursorId) @safe
     {
         s.cursorId = cursorId;
         s.lastUse = ++useCounter;
-        if (s.sql in statements)
-            return;
+        if (auto old = s.sql in statements)
+        {
+            if (*old is s)
+                return true;
+            if (old.inUse)
+                return false;
+            closeCursorLater(old.cursorId);
+            statements[s.sql] = s;
+            return true;
+        }
         if (statements.length >= options.statementCacheSize)
         {
             CachedStatement oldest;
@@ -580,11 +634,12 @@ final class Connection : Poolable
                 if (!c.inUse && (oldest is null || c.lastUse < oldest.lastUse))
                     oldest = c;
             if (oldest is null)
-                return;
+                return false;
             closeCursorLater(oldest.cursorId);
             statements.remove(oldest.sql);
         }
         statements[s.sql] = s;
+        return true;
     }
 
     /// Forgets a cached statement and closes its cursor.
@@ -779,7 +834,7 @@ final class Connection : Poolable
                 if (i == 0)
                 {
                     putBeginPipeline(w, mode, nextSequence(), negotiatedFieldVersion);
-                    if (cursorsToClose.length)
+                    if (cursorsToClose.length && !sessionReleased)
                     {
                         putCloseCursors(w, cursorsToClose, nextSequence(), negotiatedFieldVersion);
                         cursorsToClose = null;
@@ -976,9 +1031,13 @@ final class Connection : Poolable
             stmt.binds = binds.dup;
             stmt.columns = result.columnInfo.dup;
             stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
-            cache(stmt, e.cursorId);
-            result.keepCursor = true;
-            result.statement = stmt;
+            if (cache(stmt, e.cursorId))
+            {
+                result.keepCursor = true;
+                result.statement = stmt;
+            }
+            else
+                stmt.inUse = false;
         }
         return e;
     }
@@ -1101,7 +1160,7 @@ final class Connection : Poolable
                     skipWarning(reader);
                     break;
                 case MessageType.serverSidePiggyback:
-                    skipServerPiggyback(reader);
+                    serverPiggyback();
                     break;
                 case MessageType.status:
                     reader.ub4();
@@ -1223,7 +1282,8 @@ final class Connection : Poolable
             if (cacheable && e.cursorId && (e.number == 0 || (e.number == 24_381 && batchErrors)))
             {
                 stmt.binds = binds;
-                cache(stmt, e.cursorId);
+                if (!cache(stmt, e.cursorId))
+                    closeCursorLater(e.cursorId);
             }
             else if (e.cursorId != stmt.cursorId)
                 closeCursorLater(e.cursorId);
@@ -1342,7 +1402,7 @@ final class Connection : Poolable
         if (atomicLoad(cancelPending))
             finishCancel(); // a cancel that came after the last call ended
         TtcWriter w;
-        if (cursorsToClose.length)
+        if (cursorsToClose.length && !sessionReleased) // released: the cursors may belong to another session
         {
             putCloseCursors(w, cursorsToClose, nextSequence(), negotiatedFieldVersion);
             cursorsToClose = null;
@@ -1391,7 +1451,7 @@ final class Connection : Poolable
             if (type == MessageType.parameter)
                 readReturnParameters(reader, false);
             else if (type == MessageType.serverSidePiggyback)
-                skipServerPiggyback(reader);
+                serverPiggyback();
             else if (type == MessageType.warning)
                 skipWarning(reader);
             else
@@ -1462,7 +1522,7 @@ final class Connection : Poolable
                 skipWarning(reader);
                 break;
             case MessageType.serverSidePiggyback:
-                skipServerPiggyback(reader);
+                serverPiggyback();
                 break;
             case MessageType.status:
                 ErrorInfo e;
@@ -1621,6 +1681,39 @@ final class Connection : Poolable
             throw new ClientException("The connection is busy: read or close the previous query result first");
     }
 
+    /++
+    Reads a server-side piggyback. A session return comes with the first call
+    after a DRCP release: if the server attached another session, the cached
+    cursors (of the old one) are gone.
+    +/
+    private void serverPiggyback() @safe
+    {
+        import std.conv : to;
+
+        const ret = readServerPiggyback(reader);
+        if (!ret.present)
+            return;
+        if (ret.changed && sessionReleased)
+        {
+            statements = null;
+            cursorsToClose = null;
+        }
+        sessionReleased = false;
+        setSessionValue("AUTH_SESSION_ID", ret.sessionId.to!string);
+        setSessionValue("AUTH_SERIAL_NUM", ret.serialNumber.to!string);
+    }
+
+    private void setSessionValue(string key, string value) @safe pure nothrow
+    {
+        foreach (ref kv; sessionValues)
+            if (kv.key == key)
+            {
+                kv.value = value;
+                return;
+            }
+        sessionValues ~= KeyValue(key, value);
+    }
+
     private string sessionValue(string key) const @safe pure nothrow
     {
         foreach (kv; sessionValues)
@@ -1691,6 +1784,7 @@ final class Connection : Poolable
         lastSequence = 0;
         cursorsToClose = null;
         statements = null;
+        sessionReleased = false;
         const program = options.program.length ? options.program : programName();
         const machine = options.machine.length ? options.machine : machineName();
         const osUser = options.osUser.length ? options.osUser : userName();
@@ -1781,8 +1875,11 @@ final class Connection : Poolable
         call(seq => buildPhase1(login, details, seq, negotiatedFieldVersion));
         const phase1 = readAuthResponse();
         const keys = deriveKeys(phase1, options.password, (size_t n) @safe => randomBytes(n));
+        // DRCP: the connection class, and the purity (a single connection gets a fresh session by default)
+        const drcp = options.usesDrcp;
+        const ubyte purity = !drcp ? 0 : options.purity == Purity.self ? 2 : 1;
         call(seq => buildPhase2(login, proxyClient, keys, oracleClientName, options.sessionTimeZone, seq,
-                negotiatedFieldVersion));
+                negotiatedFieldVersion, drcp ? options.connectionClass : null, purity));
         sessionValues = readAuthResponse();
         checkServerResponse(sessionValues, keys);
 
@@ -1810,7 +1907,7 @@ final class Connection : Poolable
                 skipWarning(reader);
                 break;
             case MessageType.serverSidePiggyback:
-                skipServerPiggyback(reader);
+                serverPiggyback();
                 break;
             case MessageType.error:
                 const e = readErrorInfo(reader, serverFieldVersion);

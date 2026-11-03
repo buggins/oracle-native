@@ -78,6 +78,7 @@ immutable TestCase[] allTests = [
     TestCase("long binds: CLOB, BLOB, LONG, LONG RAW", &testLongBinds, true),
     TestCase("BFILE", &testBfile, true),
     TestCase("connection pool", &testPool, true),
+    TestCase("DRCP", &testDrcp, true),
     TestCase("struct mapping", &testStructMapping, true),
     TestCase("inserting many structs", &testInsertMany, true),
     TestCase("pipelines", &testPipelines, true),

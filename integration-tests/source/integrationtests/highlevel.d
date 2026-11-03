@@ -14,6 +14,102 @@ import std.uuid : UUID;
 import oracle;
 import integrationtests.server;
 
+/++
+DRCP (Database Resident Connection Pooling): single connections and a pool
+with `server=pooled`; sessions released and attached again, the same or
+another one (cached cursors dropped then), rollback on release. Needs
+`ORACLE_DRCP=1` (the database pool started with
+`DBMS_CONNECTION_POOL.START_POOL`); skipped otherwise.
++/
+void testDrcp()
+{
+    import std.process : environment;
+    import std.stdio : writeln;
+
+    if (environment.get("ORACLE_DRCP", "").length == 0)
+    {
+        writeln("  (ORACLE_DRCP not set: DRCP not tested)");
+        return;
+    }
+    enum sidQuery = "SELECT SYS_CONTEXT('USERENV', 'SID') FROM dual WHERE 1 = :1";
+    void checkSid(Connection c, string how)
+    {
+        const sid = c.queryValue!string(sidQuery, 1);
+        enforce(sid == c.sessionId.to!string, how ~ ": SID " ~ sid ~ ", sessionId " ~ c.sessionId.to!string);
+    }
+
+    // a single connection: a fresh session, ended on close (no logoff)
+    foreach (_; 0 .. 2)
+    {
+        auto c = connectToServer("server=pooled");
+        enforce(c.queryValue!long("SELECT 42 FROM dual") == 42, "single connection");
+        checkSid(c, "single connection");
+        c.close();
+    }
+
+    // two connections of one class: a released session can go to the other one
+    {
+        auto a = connectToServer("server=pooled&pool_connection_class=itest&pool_purity=self");
+        auto b = connectToServer("server=pooled&pool_connection_class=itest&pool_purity=self");
+        scope (exit)
+        {
+            a.close();
+            b.close();
+        }
+        checkSid(a, "a");
+        checkSid(a, "a, cached cursor");
+        a.releaseSession();
+        enforce(a.isSessionReleased, "released");
+        b.releaseSession();
+        checkSid(b, "b takes a session"); // possibly a's
+        checkSid(a, "a attached again"); // another session: its cached cursors are gone
+        enforce(!a.isSessionReleased, "attached");
+        checkSid(a, "a, cursor cached again");
+        foreach (_; 0 .. 20)
+        {
+            a.releaseSession();
+            checkSid(a, "a, released and attached again");
+        }
+        // an open transaction is rolled back on release
+        dropTable(a, "itest_drcp");
+        a.exec("CREATE TABLE itest_drcp (v NUMBER)");
+        a.exec("INSERT INTO itest_drcp VALUES (1)");
+        a.releaseSession();
+        enforce(!a.inTransaction && a.queryValue!long("SELECT COUNT(*) FROM itest_drcp") == 0, "rolled back");
+        dropTable(a, "itest_drcp");
+        a.releaseSession();
+        a.releaseSession(); // released already: nothing
+    }
+
+    // a pool: sessions go back to the database's pool when connections are returned
+    auto pool = new ConnectionPool(serverDsn("server=pooled&pool_max=2"));
+    scope (exit)
+        pool.close();
+    foreach (i; 0 .. 5)
+    {
+        auto c = pool.lockConnection();
+        enforce(i == 0 || c.isSessionReleased, "returned connections release their session");
+        checkSid(c, "pooled connection");
+        if (i == 0)
+            c.exec("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM'");
+    }
+    {
+        auto a = pool.lockConnection();
+        auto b = pool.lockConnection();
+        checkSid(a, "pooled a");
+        checkSid(b, "pooled b");
+        enforce(a.sessionId != b.sessionId, "two sessions");
+    }
+
+    // without DRCP, releasing does nothing
+    auto plain = connectToServer();
+    scope (exit)
+        plain.close();
+    plain.releaseSession();
+    enforce(!plain.isSessionReleased, "not DRCP");
+    checkSid(plain, "dedicated server");
+}
+
 /// The pool: reuse, uncommitted changes rolled back, busy connections dropped, limits, closing.
 void testPool()
 {

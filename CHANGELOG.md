@@ -32,6 +32,22 @@ All notable changes to oracle-native are documented here. The format follows
   one on older servers, with the same `PipelineResult`s (row counts, OUT
   values, all rows of queries, errors with `run(true)`). The client now
   offers TNS 319 and uses END_OF_RESPONSE when the server offers it.
+- DRCP, Database Resident Connection Pooling (#23): `serverType` `pooled`
+  (`:pooled`, `server=pooled`, `(SERVER=POOLED)`) with a connection class
+  (`connectionClass`, `pool_connection_class`, `POOL_CONNECTION_CLASS`) and
+  purity (`purity`, `pool_purity`, `POOL_PURITY`). A `ConnectionPool` hands
+  the session back to the database's pool when a connection is returned
+  (`Connection.releaseSession`), with a connection class of its own and
+  purity `self`; closing a DRCP connection ends its session without a logoff.
+
+### Fixed
+
+- The session-return server piggyback was read with the wrong layout (it
+  comes with DRCP). `Connection.sessionId` and `serialNumber` follow the
+  session the server attaches.
+- A statement parsed again while its SQL was cached and in use (an open
+  result of the same SQL) kept its cursor open on the server after its result
+  was done; it is closed now.
 
 ## 0.2.0 — 2026-11-03
 

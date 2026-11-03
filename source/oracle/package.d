@@ -21,7 +21,7 @@ public import oracle.params : BindDirection, Parameter;
 public import oracle.pipeline : Pipeline, PipelineResult;
 public import oracle.pool : ConnectionPool, PoolOptions, PooledConnection;
 public import oracle.result : BatchError, BatchResult, Output, QueryResult, Row;
-public import oracle.settings : ConnectionOptions, HostPort, HostSelection;
+public import oracle.settings : ConnectionOptions, HostPort, HostSelection, Purity;
 public import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
 public import oracle.types.vector : Vector, VectorFormat;
 public import oracle.value : Value;

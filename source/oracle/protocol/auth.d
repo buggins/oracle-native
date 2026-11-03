@@ -181,13 +181,18 @@ Phase2Keys deriveKeys(const KeyValue[] phase1, scope const(char)[] password,
     return k;
 }
 
-/// The phase 2 message; `proxyClient`: the user of a proxy session (empty: none).
+/++
+The phase 2 message; `proxyClient`: the user of a proxy session (empty:
+none); `connectionClass` and `purity` (1 new, 2 self; 0: not sent): DRCP.
++/
 ubyte[] buildPhase2(string user, string proxyClient, const Phase2Keys keys, string driverName, string timeZone,
-        ubyte sequence, ubyte fieldVersion) @safe pure
+        ubyte sequence, ubyte fieldVersion, string connectionClass = null, ubyte purity = 0) @safe pure
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.authPhase2, sequence, fieldVersion);
-    const pairs = (keys.speedyKey.length ? 7 : 6) + (proxyClient.length ? 1 : 0);
+    const pairs = (keys.speedyKey.length ? 7 : 6) + (proxyClient.length ? 1 : 0) + (connectionClass.length ? 1 : 0)
+        + (
+                purity ? 1 : 0);
     w.u8(user.length ? 1 : 0);
     w.ub(user.length);
     w.ub(AuthMode.logon | AuthMode.withPassword);
@@ -207,6 +212,10 @@ ubyte[] buildPhase2(string user, string proxyClient, const Phase2Keys keys, stri
     keyValue(w, "SESSION_CLIENT_DRIVER_NAME", driverName);
     keyValue(w, "SESSION_CLIENT_VERSION", "0");
     keyValue(w, "AUTH_ALTER_SESSION", "ALTER SESSION SET TIME_ZONE='" ~ timeZone ~ "'\0", 1);
+    if (connectionClass.length)
+        keyValue(w, "AUTH_KPPL_CONN_CLASS", connectionClass);
+    if (purity)
+        keyValue(w, "AUTH_KPPL_PURITY", purity == 1 ? "1" : "2", 1);
     return w.data;
 }
 

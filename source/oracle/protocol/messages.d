@@ -30,6 +30,7 @@ enum FunctionCode : ubyte
     authPhase2 = 115, /// authentication, phase 2
     authPhase1 = 118, /// authentication, phase 1
     ping = 147, /// ping
+    sessionRelease = 163, /// release a DRCP session (one-way: no response)
 }
 
 /// Writes the header of a function call: message type, function code, sequence number.
@@ -221,9 +222,23 @@ void skipWarning(ref TtcReader r) @safe
         r.clr();
 }
 
-/// Reads a server-side piggyback message (after its type byte) and drops it.
-void skipServerPiggyback(ref TtcReader r) @safe
+/// What a server-side piggyback said about the session (DRCP).
+struct SessionReturn
 {
+    /// Whether the piggyback was a session return (the first call after a DRCP session release).
+    bool present;
+    /// Whether the server attached a different session: the cursors of the old one are gone.
+    bool changed;
+    /// The attached session's ID and serial number.
+    uint sessionId;
+    /// ditto
+    ushort serialNumber;
+}
+
+/// Reads a server-side piggyback message (after its type byte); returns what it said about the session.
+SessionReturn readServerPiggyback(ref TtcReader r) @safe
+{
+    SessionReturn ret;
     const opcode = r.u8();
     switch (opcode)
     {
@@ -240,12 +255,26 @@ void skipServerPiggyback(ref TtcReader r) @safe
         r.ub2();
         r.u8();
         break;
-    case 4: // session return
-        r.ub4();
-        r.ub4();
+    case 4: // session return: key/value pairs, the session flags, ID and serial number
         r.ub2();
-        r.ub2();
-        r.ub8(); // reserved [?]
+        r.u8();
+        const elements = r.ub2();
+        if (elements)
+        {
+            r.u8();
+            foreach (_; 0 .. elements)
+            {
+                if (r.ub2())
+                    r.clr(); // key
+                if (r.ub2())
+                    r.clr(); // value
+                r.ub2(); // flags
+            }
+        }
+        ret.present = true;
+        ret.changed = (r.ub4() & sessionChanged) != 0;
+        ret.sessionId = r.ub4();
+        ret.serialNumber = r.ub2();
         break;
     case 5: // sync: key/value pairs
         r.ub2();
@@ -276,7 +305,11 @@ void skipServerPiggyback(ref TtcReader r) @safe
     default:
         throw new ProtocolException("Unknown server piggyback " ~ toText(opcode));
     }
+    return ret;
 }
+
+/// Session flag of a session return: another session was attached.
+private enum uint sessionChanged = 4;
 
 private string toText(T)(T v) @safe pure
 {
@@ -389,4 +422,68 @@ ubyte[] buildEndPipeline(ubyte sequence, ubyte fieldVersion) @safe pure
     functionHeader(w, FunctionCode.pipelineEnd, sequence, fieldVersion);
     w.ub(0); // ID (unused)
     return w.data;
+}
+
+/// How a DRCP session is released.
+enum SessionReleaseMode : uint
+{
+    keep = 0, /// back to the server's pool, keeping its state, for this connection class
+    deauthenticate = 2, /// the session is ended (the connection is about to close)
+}
+
+/++
+The one-way call that hands the DRCP session back to the server's pool. The
+server doesn't answer it; the next call attaches a session again.
++/
+ubyte[] buildSessionRelease(SessionReleaseMode mode, ubyte sequence, ubyte fieldVersion) @safe pure
+{
+    TtcWriter w;
+    w.u8(MessageType.oneWayFunction);
+    w.u8(FunctionCode.sessionRelease);
+    w.u8(sequence);
+    if (fieldVersion >= TtcFieldVersion.v23_1_ext1)
+        w.ub(0); // token number
+    w.u8(0); // tag (none)
+    w.u8(0); // tag length
+    w.ub(mode);
+    return w.data;
+}
+
+///
+@safe unittest
+{
+    assert(buildSessionRelease(SessionReleaseMode.keep, 5, TtcFieldVersion.v19_1_ext1) == [
+        26, 163, 5, 0, 0, 0
+    ]);
+    assert(buildSessionRelease(SessionReleaseMode.deauthenticate, 6, TtcFieldVersion.v23_1_ext1) == [
+        26, 163, 6, 0,
+        0, 0, 1, 2
+    ]);
+}
+
+@safe unittest
+{
+    // a session return with one key/value pair, flags "changed", session 77, serial 9
+    TtcWriter w;
+    w.u8(4);
+    w.ub(1);
+    w.u8(0);
+    w.ub(1);
+    w.u8(0);
+    w.ub(1);
+    w.clr(cast(const(ubyte)[]) "K");
+    w.ub(1);
+    w.clr(cast(const(ubyte)[]) "V");
+    w.ub(0);
+    w.ub(4);
+    w.ub(77);
+    w.ub(9);
+    import dbwire.io.buffer : BufferedReader;
+    import dbwire.io.mock : MockTransport;
+
+    auto t = new MockTransport;
+    t.feed(w.data);
+    auto r = TtcReader(new BufferedReader(t));
+    const ret = readServerPiggyback(r);
+    assert(ret.present && ret.changed && ret.sessionId == 77 && ret.serialNumber == 9);
 }
