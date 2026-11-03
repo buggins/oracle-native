@@ -10,6 +10,7 @@ import std.stdio : stderr, writefln;
 
 import integrationtests.basic;
 import integrationtests.binds;
+import integrationtests.lobs;
 import integrationtests.connect;
 import integrationtests.server : serverConfigured;
 import integrationtests.types;
@@ -61,6 +62,11 @@ immutable TestCase[] allTests = [
     TestCase("OUT, IN OUT and RETURNING INTO", &testOutputs, true),
     TestCase("implicit results and REF cursors", &integrationtests.binds.testCursors, true),
     TestCase("statement cache", &testStatementCache, true),
+    TestCase("LOB contents as values", &testLobValues, true),
+    TestCase("LOB locators: read, write, trim", &testLobLocators, true),
+    TestCase("temporary LOBs", &testTemporaryLobs, true),
+    TestCase("long binds: CLOB, BLOB, LONG, LONG RAW", &testLongBinds, true),
+    TestCase("BFILE", &testBfile, true),
 ];
 
 /// Runner identity, for reports.

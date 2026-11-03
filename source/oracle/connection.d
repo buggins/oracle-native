@@ -31,6 +31,7 @@ import oracle.protocol.messages;
 import oracle.protocol.negotiate;
 import oracle.protocol.tns;
 import oracle.protocol.ttc : TtcReader, TtcWriter;
+import oracle.lob : Lob, LobOperation, LobRequest, LobResponse, buildLobOperation;
 import oracle.result : BatchResult, QueryResult;
 import oracle.settings : ConnectionOptions, HostPort;
 import oracle.params : BindDirection, Parameter, Placeholders, findPlaceholders, maxBindBytes, parameters,
@@ -512,6 +513,8 @@ final class Connection
                     closeCursorLater(e.cursorId);
                 throwIfError(e);
             }
+            if (result.isQuery && (e.number == 0 || e.number == noMoreRows) && needsDefine(result.columnInfo))
+                e = define(result);
             result.rowCount = result.isQuery ? 0 : e.rowCount;
             foreach (c; result.outputCursors)
                 if (c !is null && c.columnInfo.length == 0)
@@ -604,6 +607,131 @@ final class Connection
             result.statement = stmt;
         }
         return e;
+    }
+
+    /// Whether a query's columns need a define: LOBs not defined yet.
+    private static bool needsDefine(const(ColumnInfo)[] columns) @safe pure nothrow
+    {
+        foreach (ref c; columns)
+            if (c.isLob && c.fetchType == 0)
+                return true;
+        return false;
+    }
+
+    /++
+    Defines the columns of a query with LOB columns (CLOB and NCLOB as LONG,
+    BLOB as LONG RAW: their contents come with the rows; or as locators with
+    `lobLocators`; BFILE always as locators) and fetches the first rows: the
+    server sends no rows for such queries until they are defined.
+    +/
+    private ErrorInfo define(QueryResult result) @safe
+    {
+        foreach (ref c; result.columnInfo)
+        {
+            if (c.type == OracleType.clob)
+                c.fetchType = options.lobLocators ? OracleType.clob : OracleType.long_;
+            else if (c.type == OracleType.blob)
+                c.fetchType = options.lobLocators ? OracleType.blob : OracleType.longRaw;
+            else if (c.type == OracleType.bfile)
+                c.fetchType = OracleType.bfile;
+        }
+        ExecuteRequest r;
+        r.cursorId = result.cursorId;
+        r.options = ExecuteOption.define | ExecuteOption.notPlsql;
+        r.executions = options.fetchSize;
+        r.prefetchRows = options.fetchSize;
+        r.isQuery = true;
+        r.defines = result.columnInfo;
+        call(seq => buildExecute(r, seq, negotiatedFieldVersion));
+        auto e = readResponse(result);
+        if (result.statement !is null)
+        {
+            result.statement.columns = result.columnInfo.dup;
+            result.statement.inUse = e.number != noMoreRows;
+        }
+        return e;
+    }
+
+    /++
+    Runs a LOB operation (see `oracle.lob`). Allowed while a query result is
+    open: LOBs are read while their rows are.
+    +/
+    package LobResponse lobOperation(const ref LobRequest q) @safe
+    {
+        if (state == State.closed)
+            throw new ClientException("The connection is closed");
+        LobResponse response;
+        guarded({
+            const wasReady = state == State.ready;
+            state = State.busy;
+            scope (exit)
+                if (wasReady && state == State.busy)
+                    state = State.ready;
+            call(seq => buildLobOperation(q, seq, negotiatedFieldVersion));
+            for (;;)
+            {
+                const type = reader.u8();
+                switch (type)
+                {
+                case MessageType.lobData:
+                    response.data ~= reader.clr(options.maxValueLength);
+                    break;
+                case MessageType.parameter:
+                    // the locator, then echoes of what was sent: the character set, the amount, the NULL-LOB flag
+                    response.locator = reader.bytes(q.locator.length);
+                    if (q.charset)
+                        reader.ub2();
+                    if (q.withAmount)
+                        response.amount = reader.ub8();
+                    if (q.nullLobPointer)
+                        response.flag = reader.u8() != 0;
+                    break;
+                case MessageType.warning:
+                    skipWarning(reader);
+                    break;
+                case MessageType.serverSidePiggyback:
+                    skipServerPiggyback(reader);
+                    break;
+                case MessageType.status:
+                    reader.ub4();
+                    checkResponseEnd();
+                    return;
+                case MessageType.error:
+                    const e = readErrorInfo(reader, serverFieldVersion);
+                    checkResponseEnd();
+                    throwIfError(e);
+                    return;
+                default:
+                    throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " in a LOB response");
+                }
+            }
+        });
+        return response;
+    }
+
+    /++
+    Creates a temporary LOB (`OracleType.clob` or `OracleType.blob`; an
+    NCLOB with `national`), to write and then bind as a parameter. Free it
+    with `Lob.free` when done (the server frees it at the session's end).
+
+    Throws: `ClientException` for other types; `ServerException` for server errors.
+    +/
+    Lob createLob(OracleType type, bool national = false) @safe
+    {
+        if (type != OracleType.clob && type != OracleType.blob)
+            throw new ClientException("Temporary LOBs are CLOBs or BLOBs");
+        checkReady();
+        const form = type == OracleType.blob ? CharsetForm.none : national ? CharsetForm.nchar : CharsetForm.implicit;
+        LobRequest q;
+        q.operation = LobOperation.createTemporary;
+        q.locator = new ubyte[40];
+        q.destinationLength = 10; // duration: the session
+        q.sourceOffset = form == CharsetForm.none ? 1 : form;
+        q.destinationOffset = type;
+        q.charset = CharsetId.al32utf8;
+        q.nullLobPointer = true;
+        const r = lobOperation(q);
+        return new Lob(this, type, form, r.locator);
     }
 
     /// Array DML; see `execMany`.

@@ -8,9 +8,9 @@ build time.
 > **Status: under development.** Nothing is released yet; the plan is tracked
 > in the [roadmap issue](https://github.com/buggins/oracle-native/issues/10).
 > It connects (TCP or TLS, password logins), runs statements with bind
-> variables, reads the common column types (below), and does array DML, PL/SQL
-> OUT parameters, `RETURNING INTO`, implicit results, REF cursors and cancel;
-> LOBs and the connection pool come in the next milestones.
+> variables, reads the common column types (below) and LOBs, and does array
+> DML, PL/SQL OUT parameters, `RETURNING INTO`, implicit results, REF cursors
+> and cancel; the connection pool and struct mapping come next.
 
 ```d
 import oracle;
@@ -99,6 +99,29 @@ Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
 another thread or task) stops a running call with ORA-01013.
 
+## LOBs
+
+CLOB, NCLOB and BLOB columns come with their contents (`getString`,
+`getBytes`); strings and bytes of any length bind to CLOB, BLOB, LONG and
+LONG RAW columns. For values too big to hold at once, fetch locators
+(`lob_locators=true`) and use `Lob`:
+
+```d
+foreach (row; conn.query("SELECT doc FROM documents WHERE id = :1", 1)) // with lob_locators=true
+{
+    auto doc = row.getLob(0);
+    for (ulong at = 1; at <= doc.length; at += 1_000_000)
+        process(doc.readText(at, 1_000_000));
+}
+auto tmp = conn.createLob(OracleType.clob);   // a temporary LOB, written in pieces, then bound
+tmp.writeText("part one");
+tmp.writeText(", part two", 9);
+conn.exec("INSERT INTO documents VALUES (2, :1)", tmp);
+tmp.free();
+```
+
+BFILE columns are always locators (`getLob(i).read()`).
+
 ## Reading values
 
 `Row` getters convert a column to D types (`getLong`, `getInt`, `getBool`,
@@ -121,6 +144,8 @@ another thread or task) stops a running call with ORA-01013.
 | `INTERVAL YEAR TO MONTH` | `MonthInterval` | |
 | `INTERVAL DAY TO SECOND` | `Duration` | nanoseconds with `getNanoseconds` |
 | `ROWID`, `UROWID` | `string` | |
+| `CLOB`, `NCLOB` / `BLOB` | `string` / `ubyte[]` | contents; locators: `getLob` |
+| `BFILE` | `Lob` | read-only |
 
 `getString` writes dates, timestamps and intervals as the server does
 (`2026-11-03 10:20:30.123456`, `+02-03`, `+03 04:05:06.789000`). Time zone

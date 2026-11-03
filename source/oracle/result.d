@@ -15,6 +15,7 @@ import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 import dbwire.types.interval : MonthInterval;
 import oracle.connection : CachedStatement, Connection;
+import oracle.lob : Lob;
 import oracle.params : BindDirection, Parameter;
 public import oracle.protocol.messages : BatchError;
 import oracle.exception : ClientException;
@@ -91,7 +92,11 @@ final class QueryResult
             const column = Connection.bindColumn(b, o.name);
             if (i < outputData.length)
                 foreach (bytes; outputData[i])
-                    o.values ~= Value(column, bytes, conn.sessionZone, conn.databaseZone);
+                {
+                    auto v = Value(column, bytes, conn.sessionZone, conn.databaseZone);
+                    v.connection = conn;
+                    o.values ~= v;
+                }
             if (i < outputCursors.length)
                 o.cursor = outputCursors[i];
             result ~= o;
@@ -180,7 +185,7 @@ final class QueryResult
     {
         if (empty)
             throw new ClientException("No more rows");
-        return Row(batch[index], columnInfo, conn.sessionZone, conn.databaseZone);
+        return Row(batch[index], columnInfo, conn.sessionZone, conn.databaseZone, conn);
     }
 
     /// Moves to the next row.
@@ -265,7 +270,7 @@ struct Output
     QueryResult cursor;
 
     /// The first value (a NULL `Value` if there is none).
-    @property Value value() const @safe
+    @property Value value() @safe
     {
         return values.length ? values[0] : Value.init;
     }
@@ -292,6 +297,7 @@ struct Row
     private const(ColumnInfo)[] columnInfo;
     private Rebindable!(immutable TimeZone) sessionZone;
     private Rebindable!(immutable TimeZone) databaseZone;
+    private Connection connection;
 
     /// Number of columns.
     @property size_t length() const @safe pure nothrow
@@ -314,7 +320,9 @@ struct Row
     {
         if (i >= values.length)
             throw new ClientException("Column index " ~ toText(i) ~ " out of range");
-        return Value(columnInfo[i], values[i], sessionZone, databaseZone);
+        auto v = Value(columnInfo[i], values[i], sessionZone, databaseZone);
+        v.connection = (() @trusted => cast(Connection) connection)(); // a reference kept for LOB reads
+        return v;
     }
 
     /// Whether column `i` is NULL (empty strings are NULL in Oracle).
@@ -411,6 +419,12 @@ struct Row
     Variant getVariant(size_t i) const @safe
     {
         return this[i].getVariant();
+    }
+
+    /// ditto
+    Lob getLob(size_t i) const @safe
+    {
+        return this[i].getLob();
     }
 }
 
