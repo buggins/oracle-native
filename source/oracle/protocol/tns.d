@@ -34,6 +34,7 @@ enum DataFlags : ushort
 {
     eof = 0x0040, /// the session ends
     endOfRequest = 0x0800, /// the request ends (pipelining)
+    beginPipeline = 0x1000, /// a pipeline begins
     endOfResponse = 0x2000, /// the response ends (23ai)
 }
 
@@ -280,6 +281,8 @@ final class TnsStream : Transport
     bool largeLengths;
     /// Whether the server marks the end of each response (23ai).
     bool endOfResponse;
+    /// Whether a pipeline's responses are read: MARKER packets are skipped (no reset handshake).
+    bool inPipeline;
 
     private immutable(ubyte)[] payload; // the unread part of the current DATA packet
     private bool responseEnded; // a packet with END_OF_RESPONSE was read completely
@@ -314,7 +317,7 @@ final class TnsStream : Transport
     }
 
     /// Sends `data` (a TTC request) in DATA packets of at most `sdu` bytes.
-    void sendData(scope const(ubyte)[] data, ushort flags = 0) @safe
+    void sendData(scope const(ubyte)[] data, ushort flags = 0, ushort lastPacketFlags = 0) @safe
     {
         const room = sdu - dataHeaderSize;
         do
@@ -323,8 +326,9 @@ final class TnsStream : Transport
             ubyte[] p = new ubyte[dataHeaderSize + n];
             putLength(p);
             p[4] = PacketType.data;
-            p[8] = cast(ubyte)(flags >> 8);
-            p[9] = cast(ubyte) flags;
+            const f = n == data.length ? flags | lastPacketFlags : flags;
+            p[8] = cast(ubyte)(f >> 8);
+            p[9] = cast(ubyte) f;
             p[dataHeaderSize .. $] = data[0 .. n];
             transport.write(p);
             data = data[n .. $];
@@ -431,7 +435,8 @@ final class TnsStream : Transport
                     return;
                 break;
             case PacketType.marker:
-                reset(p.bytes.length >= 11 ? p.bytes[10] : 0);
+                if (!inPipeline) // in a pipeline the error follows without the reset handshake
+                    reset(p.bytes.length >= 11 ? p.bytes[10] : 0);
                 break;
             case PacketType.control:
                 control(p.bytes);

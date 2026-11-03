@@ -145,8 +145,12 @@ enum Cap : size_t
     vectorFeatures = 52, /// VECTOR features
 }
 
-/// The client's compile-time capabilities.
-immutable(ubyte)[] clientCompileCaps() @safe pure nothrow
+/++
+The client's compile-time capabilities; `endOfResponse`: the server offered
+END_OF_RESPONSE (TNS 319) in its ACCEPT, so the client asks for it, and for
+pipelining.
++/
+immutable(ubyte)[] clientCompileCaps(bool endOfResponse = false) @safe pure nothrow
 {
     auto c = new ubyte[55];
     c[Cap.sqlVersion] = 6;
@@ -170,6 +174,11 @@ immutable(ubyte)[] clientCompileCaps() @safe pure nothrow
     c[Cap.lob2] = 0x01 | 0x04;
     c[Cap.oci1] = 0x10; // session state propagation: end-to-end attributes apply; ERROR and STATUS carry a sequence number
     c[Cap.ttc5] = 0x08; // VECTOR
+    if (endOfResponse)
+    {
+        c[Cap.ttc4] |= 0x20; // END_OF_RESPONSE
+        c[Cap.ttc5] |= 0x04 | 0x10; // pipelining, breaks in pipelines
+    }
     c[Cap.vectorFeatures] = 0x01 | 0x02; // BINARY and sparse vectors
     return (() @trusted => cast(immutable(ubyte)[]) c)();
 }
@@ -284,14 +293,14 @@ private immutable Conversion[] conversions = [
 ];
 
 /// The data-type message: character sets (AL32UTF8 for both), capabilities, data types.
-ubyte[] buildDataTypesMessage() @safe pure
+ubyte[] buildDataTypesMessage(bool endOfResponse = false) @safe pure
 {
     TtcWriter w;
     w.u8(MessageType.dataTypes);
     w.u16le(CharsetId.al32utf8);
     w.u16le(CharsetId.al32utf8);
     w.u8(0x01 | 0x02); // multibyte, conversion lengths
-    w.clr(clientCompileCaps());
+    w.clr(clientCompileCaps(endOfResponse));
     w.clr(clientRuntimeCaps());
     void entry(ushort type, ushort to, ushort representation)
     {

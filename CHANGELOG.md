@@ -26,6 +26,12 @@ All notable changes to oracle-native are documented here. The format follows
   `SSL_SERVER_CERT_DN`) checks the server certificate's subject instead of
   the host name; `ssl_server_dn_match=off` / `SSL_SERVER_DN_MATCH=off` checks
   only the certificate chain. Needs dbwire 0.6.
+- Pipelines (#20): `conn.pipeline().exec(...).query(...).commit().run()`
+  sends the statements together and reads their responses afterwards on 23ai
+  (one round trip; `Connection.supportsPipelining`), and runs them one by
+  one on older servers, with the same `PipelineResult`s (row counts, OUT
+  values, all rows of queries, errors with `run(true)`). The client now
+  offers TNS 319 and uses END_OF_RESPONSE when the server offers it.
 
 ## 0.2.0 — 2026-11-03
 

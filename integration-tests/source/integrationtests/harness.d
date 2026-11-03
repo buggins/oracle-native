@@ -80,6 +80,7 @@ immutable TestCase[] allTests = [
     TestCase("connection pool", &testPool, true),
     TestCase("struct mapping", &testStructMapping, true),
     TestCase("inserting many structs", &testInsertMany, true),
+    TestCase("pipelines", &testPipelines, true),
 ];
 
 /// Runner identity, for reports.
