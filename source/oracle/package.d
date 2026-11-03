@@ -15,7 +15,10 @@ module oracle;
 
 public import oracle.connection : Connection;
 public import oracle.exception;
+public import oracle.lob : Lob;
+public import oracle.mapping : RowRange, column, ignore, readValue;
 public import oracle.params : BindDirection, Parameter;
+public import oracle.pool : ConnectionPool, PoolOptions, PooledConnection;
 public import oracle.result : BatchError, BatchResult, Output, QueryResult, Row;
 public import oracle.settings : ConnectionOptions, HostPort, HostSelection;
 public import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;

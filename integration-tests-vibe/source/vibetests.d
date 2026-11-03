@@ -14,7 +14,42 @@ import integrationtests.server : connectToServer, scalar;
 immutable TestCase[] vibeTests = [
     TestCase("fiber: statements run concurrently", &testConcurrentStatements, true),
     TestCase("fiber: cancel from another task", &testCancelFromTask, true),
+    TestCase("fiber: a pool shared by tasks", &testPoolTasks, true),
 ];
+
+/// Six tasks share a pool of three connections: six half-second calls take about one second.
+void testPoolTasks()
+{
+    import integrationtests.server : serverOptions;
+
+    auto pool = new ConnectionPool(serverOptions(), PoolOptions(3));
+    scope (exit)
+        pool.close();
+    string[6] results;
+    void work(size_t i) nothrow
+    {
+        try
+        {
+            auto conn = pool.lockConnection();
+            conn.exec("BEGIN DBMS_SESSION.SLEEP(0.5); END;");
+            results[i] = scalar(conn, "SELECT 'ok' FROM dual");
+        }
+        catch (Exception e)
+            results[i] = e.msg;
+    }
+
+    const start = MonoTime.currTime;
+    typeof(runTask(&work, cast(size_t) 0))[] tasks;
+    foreach (i; 0 .. 6)
+        tasks ~= runTask(&work, cast(size_t) i);
+    foreach (t; tasks)
+        t.join();
+    const elapsed = MonoTime.currTime - start;
+    foreach (r; results)
+        enforce(r == "ok", "a task failed: " ~ r);
+    enforce(elapsed < 2500.msecs, "the pool didn't run three calls at a time");
+    enforce(pool.activeConnections == 0 && pool.idleConnections <= 3, "at most three connections");
+}
 
 /// `Connection.cancel` from another task stops a call that waits on the server.
 void testCancelFromTask()

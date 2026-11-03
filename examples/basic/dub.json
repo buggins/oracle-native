@@ -1,0 +1,9 @@
+{
+    "name": "example-basic",
+    "description": "oracle-native example: connect, bind variables, structs, PL/SQL, LOBs, transactions",
+    "license": "BSL-1.0",
+    "targetType": "executable",
+    "dependencies": {
+        "oracle-native": { "path": "../../" }
+    }
+}

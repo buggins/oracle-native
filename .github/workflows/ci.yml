@@ -102,6 +102,10 @@ jobs:
           ORACLE_TLS_HOST: 127.0.0.1:2484
           ORACLE_TLS_CA: ${{ github.workspace }}/integration-tests/tls/ca.pem
         run: dub run :integration-tests-vibe
+      - name: Integration tests (vibe-core 1.x)
+        run: dub run :integration-tests-vibe1
+      - name: Examples build
+        run: dub build :example-basic && dub build :example-vibe
 
   lint:
     runs-on: ubuntu-latest
