@@ -7,7 +7,7 @@ D types and the Oracle types they are sent as:
 
 $(TABLE
 $(TR $(TH D type) $(TH Oracle type))
-$(TR $(TD `bool`) $(TD `NUMBER` 1 or 0))
+$(TR $(TD `bool`) $(TD `BOOLEAN` (23ai); `NUMBER` 1 or 0 for older servers))
 $(TR $(TD integers) $(TD `NUMBER`))
 $(TR $(TD `float`) $(TD `BINARY_FLOAT`))
 $(TR $(TD `double`, `real`) $(TD `BINARY_DOUBLE`))
@@ -19,6 +19,7 @@ $(TR $(TD `Date`, `DateTime`) $(TD `DATE`))
 $(TR $(TD `SysTime`) $(TD `TIMESTAMP WITH TIME ZONE` with the time's UTC offset, to 100 ns))
 $(TR $(TD `Duration`) $(TD `INTERVAL DAY TO SECOND`))
 $(TR $(TD `MonthInterval`) $(TD `INTERVAL YEAR TO MONTH`))
+$(TR $(TD `Vector`, `float[]`, `double[]`) $(TD `VECTOR` (23ai; for older servers its text)))
 $(TR $(TD `Nullable!T`) $(TD NULL of T's type, or T's value))
 $(TR $(TD `typeof(null)`) $(TD NULL `VARCHAR2`))
 $(TR $(TD `Variant`) $(TD by its content; empty: NULL `VARCHAR2`))
@@ -44,6 +45,7 @@ import dbwire.types.interval : MonthInterval;
 import oracle.exception : ClientException;
 import oracle.lob : Lob;
 import oracle.types.typeinfo : CharsetForm, OracleType;
+import oracle.types.vector : Vector, vectorMaxLength;
 
 /// The largest VARCHAR2 and RAW bind value, in bytes.
 enum size_t maxBindBytes = 32_767;
@@ -191,10 +193,46 @@ private uint outputSize(OracleType t, uint inputSize) @safe pure nothrow
     }
 }
 
+/++
+A VECTOR parameter as its text, for servers without native VECTOR binds (TTC
+field version below 23.4); other parameters as they are.
++/
+package Parameter asTextVector(Parameter p) @safe
+{
+    import oracle.types.vector : decodeVector;
+
+    if (p.type != OracleType.vector)
+        return p;
+    p.type = OracleType.varchar;
+    if (!p.isNull)
+        p.data = cast(immutable(ubyte)[]) decodeVector(p.data).toString();
+    p.bufferSize = p.isNull ? 4 : cast(uint) p.data.length;
+    return p;
+}
+
+/++
+A BOOLEAN parameter as the NUMBER 1 or 0, for servers before 23ai (TTC field
+version below 23.1); other parameters as they are.
++/
+package Parameter asNumberBoolean(Parameter p) @safe
+{
+    import oracle.types.encode : encodeNumber;
+
+    if (p.type != OracleType.boolean)
+        return p;
+    p.type = OracleType.number;
+    p.bufferSize = 22;
+    if (!p.isNull)
+        p.data = encodeNumber(p.data.length && p.data[$ - 1] != 0 ? 1L : 0L);
+    return p;
+}
+
 /// The type of parameters of D type `T`.
 private Parameter typeOf(T)() @safe
 {
-    static if (is(T == bool) || isIntegral!T || is(T == Decimal))
+    static if (is(T == bool))
+        return typed(OracleType.boolean, 4); // NUMBER for servers before 23ai (`asNumberBoolean`)
+    else static if (isIntegral!T || is(T == Decimal))
         return typed(OracleType.number, 22);
     else static if (is(T == float))
         return typed(OracleType.binaryFloat, 4);
@@ -214,6 +252,8 @@ private Parameter typeOf(T)() @safe
         return typed(OracleType.intervalYm, 5);
     else static if (is(T : Lob))
         return typed(OracleType.blob, 112);
+    else static if (is(T == Vector) || is(T : const(float)[]) || is(T : const(double)[]))
+        return typed(OracleType.vector, vectorMaxLength);
     else
         static assert(false, "Unsupported parameter type " ~ T.stringof);
 }
@@ -222,11 +262,12 @@ private Parameter make(T)(T value)
 {
     import std.conv : to;
     import oracle.types.encode;
+    import oracle.types.vector : encodeVector;
 
     alias U = Unqual!T;
     auto p = typeOf!U();
     static if (is(U == bool))
-        p.data = encodeNumber(value ? 1L : 0L);
+        p.data = value ? [1, 1] : [0];
     else static if (is(U == ulong))
         p.data = encodeUnsignedNumber(value);
     else static if (isIntegral!U)
@@ -267,6 +308,13 @@ private Parameter make(T)(T value)
         p.data = encodeIntervalDs(value);
     else static if (is(U == MonthInterval))
         p.data = encodeIntervalYm(value);
+    else static if (is(U == Vector))
+        p.data = encodeVector(value);
+    else static if (is(U : const(float)[]) || is(U : const(double)[]))
+    {
+        if (value.length)
+            p.data = encodeVector(Vector.of(value));
+    }
     else static if (is(U : Lob))
     {
         if (value is null)
@@ -290,7 +338,7 @@ private Parameter ofVariant(Variant value) @trusted // Variant.get is @system
         return Parameter.nullOf!string();
     static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
             Decimal, string, wstring, dstring, char, ubyte[], immutable(ubyte)[], const(ubyte)[], UUID, Date,
-            DateTime, SysTime, Duration, MonthInterval, Parameter, Lob))
+            DateTime, SysTime, Duration, MonthInterval, Parameter, Lob, Vector, float[], double[]))
         if (value.type == typeid(T))
             return Parameter.of(value.get!T);
     throw new ClientException("Unsupported Variant parameter type " ~ value.type.toString);

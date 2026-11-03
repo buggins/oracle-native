@@ -22,6 +22,8 @@ import oracle.exception : ClientException;
 import oracle.connection : Connection;
 import oracle.lob : Lob;
 import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
+import oracle.types.vector : Vector;
+import std.json : JSONValue;
 
 /// A column value: its metadata and its bytes in the wire form (`null` for NULL).
 struct Value
@@ -58,7 +60,10 @@ struct Value
          of TIMESTAMP WITH TIME ZONE values. The local time of a region comes
          from the system's time zone database; for regions it doesn't know
          (all on Windows) the text is the UTC time followed by `UTC`;)
-    $(LI intervals as SQL writes them: `+02-03`, `+03 04:05:06.789000`.)
+    $(LI intervals as SQL writes them: `+02-03`, `+03 04:05:06.789000`;)
+    $(LI JSON as `JSON_SERIALIZE` writes it (`{"a":1}`; dates and timestamps
+         as ISO 8601 strings, RAW as hexadecimal); VECTOR as `FROM_VECTOR`
+         writes it (`[1.5E+000,2.0E+000]`, see `Vector.toString`).)
     )
     `null` for NULL.
 
@@ -70,7 +75,9 @@ struct Value
         import oracle.types.floats : decodeBinaryFloat, floatText;
         import oracle.types.number : decodeNumber;
         import oracle.types.rowid : rowidText, urowidText;
+        import oracle.types.oson : isOson, osonToText;
         import oracle.types.temporal;
+        import oracle.types.vector : decodeVector;
 
         if (isNull)
             return null;
@@ -91,8 +98,14 @@ struct Value
         case OracleType.clob:
             return column.wireType == OracleType.clob ? getLob().readText() : text();
         case OracleType.blob:
+            const blob = getBytes();
+            return column.isOson && isOson(blob) ? osonToText(blob) : hex(blob); // JSON in a BLOB (older clients)
         case OracleType.bfile:
             return hex(getBytes());
+        case OracleType.json:
+            return osonToText(bytes);
+        case OracleType.vector:
+            return decodeVector(bytes).toString();
         case OracleType.rowid:
             return rowidText(bytes);
         case OracleType.urowid:
@@ -473,13 +486,52 @@ struct Value
     }
 
     /++
+    The value of a JSON column as a `std.json` value (numbers become `long`,
+    `ulong` or `double`; dates and RAW stay strings: use `getString` for the
+    exact text). `JSONValue(null)` for NULL.
+
+    Throws: `ClientException` for other types.
+    +/
+    JSONValue getJson() const @safe
+    {
+        import std.json : JSONException, parseJSON;
+
+        if (isNull)
+            return JSONValue(null);
+        if (column.type != OracleType.json && !column.isJson)
+            throw unsupported("JSON");
+        const text = getString();
+        try
+            return parseJSON(text);
+        catch (JSONException e)
+            throw new ClientException("Column " ~ column.name ~ " is not valid JSON: " ~ e.msg);
+    }
+
+    /++
+    The value of a VECTOR column (`Vector.init` for NULL).
+
+    Throws: `ClientException` for other types.
+    +/
+    Vector getVector() const @safe
+    {
+        import oracle.types.vector : decodeVector;
+
+        if (isNull)
+            return Vector.init;
+        if (column.type != OracleType.vector)
+            throw unsupported("Vector");
+        return decodeVector(bytes);
+    }
+
+    /++
     As a `Variant` of the type's natural D type; an empty `Variant` for NULL:
     $(UL
     $(LI NUMBER: `long` for whole-number columns of up to 18 digits
          (`NUMBER(p)`, p ≤ 18), else `Decimal`; BINARY_FLOAT `float`, BINARY_DOUBLE `double`;)
     $(LI character types, CLOB, NCLOB, ROWID, UROWID: `string`; RAW, LONG RAW, BLOB: `ubyte[]`; BFILE: `Lob`;)
     $(LI DATE: `DateTime`; TIMESTAMP (all kinds): `SysTime` (see `getSysTime`);)
-    $(LI INTERVAL YEAR TO MONTH: `MonthInterval`; DAY TO SECOND: `Duration`; BOOLEAN: `bool`.)
+    $(LI INTERVAL YEAR TO MONTH: `MonthInterval`; DAY TO SECOND: `Duration`; BOOLEAN: `bool`;)
+    $(LI JSON: its text (`string`); VECTOR: `Vector`.)
     )
 
     Throws: `ClientException` for types that are not supported yet.
@@ -525,6 +577,10 @@ struct Value
             return makeVariant(getDuration());
         case OracleType.boolean:
             return makeVariant(getBool());
+        case OracleType.json:
+            return makeVariant(getString());
+        case OracleType.vector:
+            return makeVariant(getVector());
         default:
             throw unsupported("Variant");
         }

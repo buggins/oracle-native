@@ -78,6 +78,7 @@ final class Connection : Poolable
     private HostPort connectedHost;
     private KeyValue[] sessionValues;
     private uint[] cursorsToClose; // closed with the next call
+    private EndToEnd endToEnd; // end-to-end attributes, changes sent with the next call
     private CachedStatement[string] statements; // the statement cache, by SQL text
     private ulong useCounter; // for the least recently used statement
     private IoLock writeLock; // writes from cancel() and the calls
@@ -206,6 +207,79 @@ final class Connection : Poolable
     @property bool inTransaction() const @safe pure nothrow
     {
         return (lastCallStatus & 0x02) != 0;
+    }
+
+    /++
+    End-to-end attributes of the session, shown in `V$SESSION` and by
+    `SYS_CONTEXT('USERENV', ...)` for monitoring and tracing: the client
+    identifier (`CLIENT_IDENTIFIER`), module (`MODULE`), action (`ACTION`),
+    client information (`CLIENT_INFO`) and database operation (`DBOP`). A
+    change is sent with the next call (no round trip of its own); null or
+    empty clears the attribute.
+    +/
+    @property string clientIdentifier() const @safe pure nothrow
+    {
+        return endToEnd.values[EndToEndAttribute.clientIdentifier];
+    }
+
+    /// ditto
+    @property void clientIdentifier(string value) @safe pure nothrow
+    {
+        setEndToEnd(EndToEndAttribute.clientIdentifier, value);
+    }
+
+    /// ditto
+    @property string moduleName() const @safe pure nothrow
+    {
+        return endToEnd.values[EndToEndAttribute.module_];
+    }
+
+    /// ditto
+    @property void moduleName(string value) @safe pure nothrow
+    {
+        setEndToEnd(EndToEndAttribute.module_, value);
+    }
+
+    /// ditto
+    @property string action() const @safe pure nothrow
+    {
+        return endToEnd.values[EndToEndAttribute.action];
+    }
+
+    /// ditto
+    @property void action(string value) @safe pure nothrow
+    {
+        setEndToEnd(EndToEndAttribute.action, value);
+    }
+
+    /// ditto
+    @property string clientInfo() const @safe pure nothrow
+    {
+        return endToEnd.values[EndToEndAttribute.clientInfo];
+    }
+
+    /// ditto
+    @property void clientInfo(string value) @safe pure nothrow
+    {
+        setEndToEnd(EndToEndAttribute.clientInfo, value);
+    }
+
+    /// ditto
+    @property string dbOp() const @safe pure nothrow
+    {
+        return endToEnd.values[EndToEndAttribute.dbOp];
+    }
+
+    /// ditto
+    @property void dbOp(string value) @safe pure nothrow
+    {
+        setEndToEnd(EndToEndAttribute.dbOp, value);
+    }
+
+    private void setEndToEnd(EndToEndAttribute a, string value) @safe pure nothrow
+    {
+        endToEnd.values[a] = value.length ? value : null;
+        endToEnd.changed |= 1 << a;
     }
 
     /++
@@ -516,9 +590,11 @@ final class Connection : Poolable
     occurrence of a placeholder in SQL, each distinct one in PL/SQL), from
     positional or named parameters.
     +/
-    private static Parameter[] arrangeBinds(const ref Placeholders ph, StatementKind kind,
+    private Parameter[] arrangeBinds(const ref Placeholders ph, StatementKind kind,
             const(Parameter)[] params, out string[] names) @safe
     {
+        import oracle.params : asNumberBoolean, asTextVector;
+
         import std.algorithm.searching : countUntil;
         import std.conv : to;
         import std.uni : toUpper;
@@ -556,8 +632,16 @@ final class Connection : Poolable
         }
         names = (kind == StatementKind.plsql ? ph.names : ph.occurrences).dup;
         auto binds = new Parameter[names.length];
+        const nativeBoolean = negotiatedFieldVersion >= TtcFieldVersion.v23_1;
+        const nativeVector = negotiatedFieldVersion >= TtcFieldVersion.v23_4;
         foreach (i, n; names)
+        {
             binds[i] = byName[ph.names.countUntil(n)];
+            if (!nativeBoolean)
+                binds[i] = asNumberBoolean(binds[i]);
+            if (!nativeVector)
+                binds[i] = asTextVector(binds[i]);
+        }
         return binds;
     }
 
@@ -718,7 +802,7 @@ final class Connection : Poolable
     private static bool needsDefine(const(ColumnInfo)[] columns) @safe pure nothrow
     {
         foreach (ref c; columns)
-            if (c.isLob && c.fetchType == 0)
+            if ((c.isLob || c.type == OracleType.json || c.type == OracleType.vector) && c.fetchType == 0)
                 return true;
         return false;
     }
@@ -737,8 +821,8 @@ final class Connection : Poolable
                 c.fetchType = options.lobLocators ? OracleType.clob : OracleType.long_;
             else if (c.type == OracleType.blob)
                 c.fetchType = options.lobLocators ? OracleType.blob : OracleType.longRaw;
-            else if (c.type == OracleType.bfile)
-                c.fetchType = OracleType.bfile;
+            else if (c.type == OracleType.bfile || c.type == OracleType.json || c.type == OracleType.vector)
+                c.fetchType = c.type; // BFILE: locators; JSON, VECTOR: their images
         }
         ExecuteRequest r;
         r.cursorId = result.cursorId;
@@ -799,6 +883,7 @@ final class Connection : Poolable
                     break;
                 case MessageType.status:
                     reader.ub4();
+                    reader.ub2(); // end-to-end sequence number
                     checkResponseEnd();
                     return;
                 case MessageType.error:
@@ -1040,6 +1125,11 @@ final class Connection : Poolable
             putCloseCursors(w, cursorsToClose, nextSequence(), negotiatedFieldVersion);
             cursorsToClose = null;
         }
+        if (endToEnd.changed)
+        {
+            putEndToEnd(w, endToEnd, nextSequence(), negotiatedFieldVersion);
+            endToEnd.changed = 0;
+        }
         w.bytes(build(nextSequence()));
         writeLock.lock();
         scope (exit)
@@ -1073,6 +1163,7 @@ final class Connection : Poolable
             {
                 ErrorInfo e;
                 e.callStatus = reader.ub4();
+                reader.ub2(); // end-to-end sequence number
                 continue;
             }
             if (type == MessageType.parameter)
@@ -1154,6 +1245,7 @@ final class Connection : Poolable
             case MessageType.status:
                 ErrorInfo e;
                 e.callStatus = reader.ub4();
+                reader.ub2(); // end-to-end sequence number
                 lastCallStatus = e.callStatus;
                 checkResponseEnd();
                 return atomicLoad(cancelPending) ? finishCancel(e, true) : e;

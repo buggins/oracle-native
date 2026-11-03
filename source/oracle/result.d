@@ -20,6 +20,8 @@ import oracle.params : BindDirection, Parameter;
 public import oracle.protocol.messages : BatchError;
 import oracle.exception : ClientException;
 import oracle.types.typeinfo : ColumnInfo, OracleType;
+import oracle.types.vector : Vector;
+import std.json : JSONValue;
 import oracle.value : Value;
 
 /++
@@ -425,6 +427,18 @@ struct Row
     Lob getLob(size_t i) const @safe
     {
         return this[i].getLob();
+    }
+
+    /// ditto
+    JSONValue getJson(size_t i) const @safe
+    {
+        return this[i].getJson();
+    }
+
+    /// ditto
+    Vector getVector(size_t i) const @safe
+    {
+        return this[i].getVector();
     }
 }
 

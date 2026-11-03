@@ -169,6 +169,9 @@ enum uint lobLocatorSize = 112;
 
 /// Continuation flag of LOB binds and defines.
 enum ulong lobPrefetchFlag = 0x0200_0000;
+/// The largest JSON value fetched (its OSON image comes with the row, like a prefetched LOB).
+enum uint jsonMaxLength = 32 * 1024 * 1024;
+public import oracle.types.vector : vectorMaxLength;
 
 /++
 The define of one column: its wire type (`ColumnInfo.wireType`), with LOBs
@@ -180,23 +183,28 @@ void putDefineMetadata(ref TtcWriter w, const ColumnInfo c, ubyte fieldVersion) 
 
     const t = c.wireType;
     const text = t == OracleType.varchar || t == OracleType.char_ || t == OracleType.long_ || t == OracleType.clob;
+    // JSON and VECTOR images come with the rows, like LOB data prefetched with the locator
+    const prefetch = t == OracleType.json ? jsonMaxLength : t == OracleType.vector ? vectorMaxLength : 0;
     uint size = c.bufferSize;
     if (t == OracleType.long_ || t == OracleType.longRaw)
         size = 0x7FFF_FFFF;
     else if (t == OracleType.clob || t == OracleType.blob)
         size = lobLocatorSize;
+    else if (prefetch)
+        size = prefetch;
+    const prefetched = t == OracleType.clob || t == OracleType.blob || prefetch != 0;
     w.u8(t);
     w.u8(0x01); // use indicators
     w.u8(0); // precision
     w.u8(0); // scale
     w.ub(size);
     w.ub(0); // maximum array elements
-    w.ub(t == OracleType.clob || t == OracleType.blob ? lobPrefetchFlag : 0);
+    w.ub(prefetched ? lobPrefetchFlag : 0);
     w.ub(0); // object type ID
     w.ub(0); // object type version
     w.ub(text ? CharsetId.al32utf8 : 0);
     w.u8(text ? (c.charsetForm ? c.charsetForm : CharsetForm.implicit) : CharsetForm.none);
-    w.ub(0); // LOB prefetch length
+    w.ub(prefetch); // LOB prefetch length
     if (fieldVersion >= TtcFieldVersion.v12_2)
         w.ub(0); // oaccolid
 }
@@ -212,13 +220,13 @@ void putBindMetadata(ref TtcWriter w, const Parameter b, ubyte fieldVersion) @sa
     w.u8(0); // scale
     w.ub(b.bufferSize);
     w.ub(0); // maximum array elements
-    const lob = b.type == OracleType.clob || b.type == OracleType.blob;
+    const lob = b.type == OracleType.clob || b.type == OracleType.blob || b.type == OracleType.vector;
     w.ub(lob ? lobPrefetchFlag : 0); // continuation flags
     w.ub(0); // object type ID
     w.ub(0); // object type version
     w.ub(b.isText ? CharsetId.al32utf8 : 0);
     w.u8(b.isText ? CharsetForm.implicit : CharsetForm.none);
-    w.ub(0); // LOB prefetch length
+    w.ub(b.type == OracleType.vector ? vectorMaxLength : 0); // LOB prefetch length
     if (fieldVersion >= TtcFieldVersion.v12_2)
         w.ub(0); // oaccolid
 }
@@ -257,6 +265,24 @@ private void putBindValue(ref TtcWriter w, const ref Parameter p) @safe pure
 {
     if (p.type == OracleType.cursor)
         w.bytes([1, 0]); // a NULL cursor
+    else if (p.type == OracleType.boolean && p.isNull)
+        w.bytes([253, 1]); // a NULL BOOLEAN
+    else if (p.type == OracleType.vector && !p.isNull)
+    {
+        // a value-based locator (QLocator, 40 bytes, version 4, a BLOB value), then the image
+        w.ub(40);
+        w.u8(40);
+        w.u16be(38);
+        w.u16be(4);
+        w.u8(0x20 | 0x01 | 0x40); // value based, BLOB, abstract
+        w.u8(0x08); // initialized
+        w.u16be(0);
+        w.u16be(1);
+        w.u32be(0);
+        w.u32be(cast(uint) p.data.length);
+        w.bytes(new ubyte[2 + 2 + 2 + 8 + 8]);
+        w.clr(p.data);
+    }
     else if (p.type == OracleType.clob || p.type == OracleType.blob || p.type == OracleType.bfile)
         w.bytesWithLength(p.isNull ? null : p.data); // a locator
     else
@@ -355,9 +381,22 @@ ColumnInfo[] readDescribeBody(ref TtcReader r, ubyte fieldVersion) @safe
         c.typeSchema = r.textWithLength();
         c.typeName = r.textWithLength();
         r.ub2(); // column position
-        r.ub4(); // UDS flags
+        const udsFlags = r.ub4();
+        c.isJson = (udsFlags & 0x100) != 0;
+        c.isOson = (udsFlags & 0x800) != 0;
         if (fieldVersion >= TtcFieldVersion.v23_1)
-            throw new ClientException("TTC field version 23.1 describe fields are not supported");
+        {
+            c.domainSchema = r.textWithLength();
+            c.domainName = r.textWithLength();
+        }
+        if (fieldVersion >= TtcFieldVersion.v23_1_ext3)
+            c.annotations = readAnnotations(r);
+        if (fieldVersion >= TtcFieldVersion.v23_4)
+        {
+            c.vectorDimensions = r.ub4();
+            c.vectorFormat = r.u8();
+            c.vectorFlags = r.u8();
+        }
     }
     r.bytesWithLength(); // current date
     r.ub4(); // DCB flags
@@ -366,6 +405,27 @@ ColumnInfo[] readDescribeBody(ref TtcReader r, ubyte fieldVersion) @safe
     r.ub4();
     r.clr();
     return columns;
+}
+
+/// Reads the annotations of a column (field version 23.1 extension 3).
+private immutable(string[2])[] readAnnotations(ref TtcReader r) @safe
+{
+    if (r.ub4() == 0)
+        return null;
+    r.u8();
+    const count = r.ub4();
+    if (count > 10_000)
+        throw new ProtocolException("Invalid annotation count " ~ toText(count));
+    r.u8();
+    auto result = new string[2][count];
+    foreach (ref a; result)
+    {
+        a[0] = r.textWithLength();
+        a[1] = r.textWithLength();
+        r.ub4(); // flags
+    }
+    r.ub4(); // flags
+    return result.idup;
 }
 
 /++
@@ -427,7 +487,7 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
     // a column with no size (e.g. a NULL literal) is always NULL and sends nothing
     const type = c.wireType;
     if (c.bufferSize == 0 && type != OracleType.long_ && type != OracleType.longRaw && type != OracleType.urowid
-            && !c.isLob)
+            && !c.isLob && type != OracleType.json && type != OracleType.vector)
         return null;
     switch (type)
     {
@@ -471,6 +531,16 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
         if (r.ub4() == 0)
             return null;
         return r.clr();
+    case OracleType.json:
+    case OracleType.vector:
+        // like a LOB with its data prefetched: length, size, chunk size, the image, the locator (unused)
+        if (r.ub4() == 0)
+            return null;
+        r.ub8();
+        r.ub4();
+        const image = r.clr(maxLength);
+        r.clr();
+        return image;
     case OracleType.rowid:
         // a length byte (0/255: NULL), then block address, partition, a byte, block, slot
         const length = r.u8();
@@ -727,7 +797,7 @@ private string toText(T)(T v) @safe pure
     auto t = new MockTransport;
     t.feed(w.data);
     auto r = TtcReader(new BufferedReader(t));
-    const e = readErrorInfo(r, TtcFieldVersion.v20_1);
+    const e = readErrorInfo(r, TtcFieldVersion.v20_1, false);
     assert(e.number == 24_381 && e.rowCount == 2 && e.batchErrors.length == 1);
     assert(e.batchErrors[0].offset == 1 && e.batchErrors[0].code == 1);
     assert(e.batchErrors[0].message == "ORA-00001: unique");

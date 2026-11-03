@@ -11,6 +11,7 @@ import std.stdio : stderr, writefln;
 import integrationtests.basic;
 import integrationtests.binds;
 import integrationtests.lobs;
+import integrationtests.modern;
 import integrationtests.connect;
 import integrationtests.highlevel;
 import integrationtests.server : serverConfigured;
@@ -55,6 +56,11 @@ immutable TestCase[] allTests = [
     TestCase("INTERVAL YEAR TO MONTH and DAY TO SECOND", &testIntervals, true),
     TestCase("RAW, LONG, LONG RAW, ROWID, UROWID", &testBinaryLongAndRowids, true),
     TestCase("booleans", &testBooleans, true),
+    TestCase("native BOOLEAN binds", &testNativeBooleans, true),
+    TestCase("JSON", &testJson, true),
+    TestCase("VECTOR", &testVectors, true),
+    TestCase("column domains and annotations", &testColumnMetadata, true),
+    TestCase("end-to-end attributes", &testEndToEnd, true),
     TestCase("NULL through every getter", &testNullGetters, true),
     TestCase("binds of every D type, re-executed", &testBindTypes, true),
     TestCase("placeholders: named, ?, repeated, Variant", &testPlaceholders, true),
