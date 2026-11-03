@@ -4,13 +4,9 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
-### Changed
-
-- Results whose rows have all arrived release the connection at once.
-- Getters return the type's default value for NULL instead of throwing (as
-  in mssql-native and ddbc).
+First release.
 
 ### Added
 
