@@ -39,31 +39,53 @@ double decodeBinaryFloat(scope const(ubyte)[] b) @safe pure
 The shortest decimal text that reads back as the same value (as a `float`
 when `single`): `0.1`, `-2.25`, `1e+300`; `Nan`, `Inf` and `-Inf` as Oracle
 writes them.
+
+Formats and reads back with the C library (`snprintf`, `strtod`), which
+rounds correctly on every platform (Phobos's parser doesn't where `real` is
+64 bits, such as macOS on ARM and Windows with LDC).
 +/
 string floatText(double v, bool single) @safe
 {
-    import std.conv : ConvException, to;
-    import std.format : format;
     import std.math : isInfinity, isNaN;
 
     if (isNaN(v))
         return "Nan";
     if (isInfinity(v))
         return v < 0 ? "-Inf" : "Inf";
+    string s;
     foreach (digits; 1 .. 18)
     {
-        const s = format("%.*g", digits, v);
-        try
-        {
-            if (single ? s.to!float == cast(float) v : s.to!double == v)
-                return s;
-        }
-        catch (ConvException)
-        {
-            // rounded beyond the largest value (e.g. 2e+308): needs more digits
-        }
+        s = formatDigits(v, digits);
+        if (single ? parseFloat(s) == cast(float) v : parseDouble(s) == v)
+            break;
     }
-    return format("%.17g", v);
+    return s;
+}
+
+/// `v` with `digits` significant digits (`%.*g`).
+private string formatDigits(double v, int digits) @trusted
+{
+    import core.stdc.stdio : snprintf;
+
+    char[40] buffer;
+    const n = snprintf(buffer.ptr, buffer.length, "%.*g", digits, v); // fits: at most 17 digits and an exponent
+    return buffer[0 .. n].idup;
+}
+
+private double parseDouble(string s) @trusted
+{
+    import core.stdc.stdlib : strtod;
+    import std.string : toStringz;
+
+    return strtod(s.toStringz, null); // reads the NUL-terminated copy
+}
+
+private float parseFloat(string s) @trusted
+{
+    import core.stdc.stdlib : strtof;
+    import std.string : toStringz;
+
+    return strtof(s.toStringz, null); // reads the NUL-terminated copy
 }
 
 ///
@@ -79,8 +101,6 @@ string floatText(double v, bool single) @safe
     assert(floatText(0.1, false) == "0.1" && floatText(cast(float) 0.1f, true) == "0.1");
     assert(floatText(-2.25, false) == "-2.25" && floatText(1e300, false) == "1e+300");
     assert(floatText(-double.infinity, false) == "-Inf");
-    // the largest values read back exactly (older Phobos versions need one more digit than newer ones)
-    import std.conv : to;
-
-    assert(floatText(double.max, false).to!double == double.max && floatText(float.max, true).to!float == float.max);
+    assert(floatText(double.max, false) == "1.7976931348623157e+308" && floatText(float.max, true) == "3.4028235e+38");
+    assert(floatText(double.min_normal * double.epsilon, false) == "5e-324"); // the smallest subnormal
 }
