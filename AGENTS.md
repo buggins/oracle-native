@@ -52,7 +52,7 @@ dub run :integration-tests-phobos                          # integration tests, 
 dub run :integration-tests-vibe                            # the same tests in vibe.d tasks
 ORACLE_HOST=localhost:11521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 dub run :integration-tests-phobos
 sh integration-tests/tls/start-proxy.sh 127.0.0.1:11521 12484   # TLS proxy as a TCPS stand-in, then add:
-ORACLE_TLS_HOST=localhost:12484 ORACLE_TLS_CA=$PWD/integration-tests/tls/ca.pem
+ORACLE_TLS_HOST=127.0.0.1:12484 ORACLE_TLS_CA=$PWD/integration-tests/tls/ca.pem
 ```
 
 Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). Server tests use `connectToServer()` and `scalar()` from `integrationtests.server`.
