@@ -322,6 +322,7 @@ struct ConnectionOptions
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
     `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`).
+    `pool_*` keys are for the pool (`PoolOptions.fromParams`) and ignored here.
 
     Throws: `ClientException` for unknown keys or invalid values.
     +/
@@ -333,6 +334,10 @@ struct ConnectionOptions
         ConnectionOptions o;
         foreach (key, value; params)
         {
+            import std.algorithm.searching : startsWith;
+
+            if (key.toLower.startsWith("pool_"))
+                continue; // for the pool (PoolOptions.fromParams)
             switch (key.toLower)
             {
             case "host":

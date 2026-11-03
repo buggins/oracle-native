@@ -12,6 +12,7 @@ import integrationtests.basic;
 import integrationtests.binds;
 import integrationtests.lobs;
 import integrationtests.connect;
+import integrationtests.highlevel;
 import integrationtests.server : serverConfigured;
 import integrationtests.types;
 
@@ -67,6 +68,9 @@ immutable TestCase[] allTests = [
     TestCase("temporary LOBs", &testTemporaryLobs, true),
     TestCase("long binds: CLOB, BLOB, LONG, LONG RAW", &testLongBinds, true),
     TestCase("BFILE", &testBfile, true),
+    TestCase("connection pool", &testPool, true),
+    TestCase("struct mapping", &testStructMapping, true),
+    TestCase("inserting many structs", &testInsertMany, true),
 ];
 
 /// Runner identity, for reports.

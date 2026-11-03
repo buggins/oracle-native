@@ -20,6 +20,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.connection;
 
 import dbwire.client.hosts : connectFirst, orderHosts;
+import dbwire.client.pool : Poolable;
 import dbwire.io.backend : IoBackend, backendFor;
 import dbwire.io.buffer : BufferedReader;
 import dbwire.io.transport : Transport;
@@ -32,6 +33,7 @@ import oracle.protocol.negotiate;
 import oracle.protocol.tns;
 import oracle.protocol.ttc : TtcReader, TtcWriter;
 import oracle.lob : Lob, LobOperation, LobRequest, LobResponse, buildLobOperation;
+import oracle.mapping : RowRange, columnNames, fieldParameters, fieldPositions, quoteIdentifier, readStruct, readValue;
 import oracle.result : BatchResult, QueryResult;
 import oracle.settings : ConnectionOptions, HostPort;
 import oracle.params : BindDirection, Parameter, Placeholders, findPlaceholders, maxBindBytes, parameters,
@@ -54,7 +56,7 @@ rows are read or it is closed. The connection is not thread-safe. Call
 Transactions are explicit: changes are committed by `commit` (or by DDL
 statements), unless `ConnectionOptions.autoCommit` is set.
 +/
-final class Connection
+final class Connection : Poolable
 {
     package enum State
     {
@@ -245,6 +247,109 @@ final class Connection
     QueryResult query(Args...)(string sql, Args args) if (Args.length > 0)
     {
         return run(sql, parameters(args));
+    }
+
+    /++
+    Runs a query (with arguments as in `exec`, if any) and returns its rows as
+    structs of type `T` (see `oracle.mapping`): an input range that holds the
+    connection until all rows are read or it is closed.
+
+    Throws: `ClientException` if a field has no column; as `query`.
+    +/
+    RowRange!T query(T, Args...)(string sql, Args args) if (is(T == struct))
+    {
+        return RowRange!T(runArgs(sql, args));
+    }
+
+    /++
+    The first row of a query as a `T` (see `query!T`); the other rows are discarded.
+
+    Throws: `ClientException` if there is no row or a field has no column; as `query`.
+    +/
+    T queryRow(T, Args...)(string sql, Args args) if (is(T == struct))
+    {
+        auto result = runArgs(sql, args);
+        scope (exit)
+            result.close();
+        const positions = fieldPositions!T(result);
+        if (result.empty)
+            throw new ClientException("The query returned no rows");
+        return readStruct!T(result, positions);
+    }
+
+    /++
+    The first column of the first row of a query, as a `T` (any field type of
+    `oracle.mapping`; `Nullable!T` to tell NULL apart), e.g.
+    `queryValue!long("SELECT COUNT(*) FROM t")`.
+
+    Throws: `ClientException` if there is no row, or the value can't be converted; as `query`.
+    +/
+    T queryValue(T, Args...)(string sql, Args args)
+    {
+        auto result = runArgs(sql, args);
+        scope (exit)
+            result.close();
+        if (result.empty || result.columns.length == 0)
+            throw new ClientException("The query returned no value");
+        return readValue!T(result.front[0]);
+    }
+
+    /++
+    Inserts structs as rows of `table`: one column per mapped field (see
+    `oracle.mapping`), with array DML, 1000 rows per round trip. The rows
+    are part of the current transaction (commit them; with `autoCommit`, each
+    round trip commits).
+
+    `table` is used as given (e.g. `orders` or `sales.orders`).
+
+    Returns: the number of rows inserted.
+    Throws: `ServerException` if the server refuses a row (the rows of the
+    round trips before are inserted); `ClientException` for a value that
+    can't be sent.
+    +/
+    ulong insert(R)(string table, R rows) if (isInputRange!R && is(ElementType!R == struct))
+    {
+        import std.array : join;
+        import std.conv : to;
+
+        alias E = ElementType!R;
+        enum columns = columnNames!E;
+        static assert(columns.length > 0, E.stringof ~ " has no mapped fields");
+        string[] quoted, placeholders;
+        foreach (i, c; columns)
+        {
+            quoted ~= quoteIdentifier(c);
+            placeholders ~= ":" ~ (i + 1).to!string;
+        }
+        const sql = "INSERT INTO " ~ table ~ " (" ~ quoted.join(", ") ~ ") VALUES (" ~ placeholders.join(", ") ~ ")";
+        const(Parameter[])[] batch;
+        ulong inserted;
+        foreach (ref row; rows)
+        {
+            batch ~= fieldParameters(row);
+            if (batch.length == 1000)
+            {
+                inserted += execMany(sql, batch).rowCount;
+                batch = null;
+            }
+        }
+        if (batch.length)
+            inserted += execMany(sql, batch).rowCount;
+        return inserted;
+    }
+
+    /// ditto
+    ulong insert(T)(string table, T row) if (is(T == struct) && !isInputRange!T)
+    {
+        return insert(table, (&row)[0 .. 1]);
+    }
+
+    private QueryResult runArgs(Args...)(string sql, Args args)
+    {
+        static if (Args.length)
+            return run(sql, parameters(args));
+        else
+            return run(sql, null);
     }
 
     /++

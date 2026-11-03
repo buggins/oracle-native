@@ -5,12 +5,8 @@ protocols over TCP, written in pure D, for ordinary threads (blocking sockets)
 and vibe.d fibers. No Oracle Instant Client, no OCI, no ODBC, no C libraries at
 build time.
 
-> **Status: under development.** Nothing is released yet; the plan is tracked
-> in the [roadmap issue](https://github.com/buggins/oracle-native/issues/10).
-> It connects (TCP or TLS, password logins), runs statements with bind
-> variables, reads the common column types (below) and LOBs, and does array
-> DML, PL/SQL OUT parameters, `RETURNING INTO`, implicit results, REF cursors
-> and cancel; the connection pool and struct mapping come next.
+> **Status: preparing 0.1.0**, the first release; the plan is tracked in the
+> [roadmap issue](https://github.com/buggins/oracle-native/issues/10).
 
 ```d
 import oracle;
@@ -30,25 +26,25 @@ void main()
 }
 ```
 
-Planned for the first release (0.1.0):
+Features:
 
-- Oracle Database 12.1 and newer (tested on 23ai Free, 21c XE and 18c XE),
-  Oracle Cloud (Autonomous Database) over TLS;
-- password logins (11g and 12c verifiers), TLS with certificate verification
-  and wallets in PEM form;
-- Easy Connect strings, TNS descriptors, `tnsnames.ora` aliases and
-  `oracle://` URLs; failover over several addresses;
-- queries and bind variables (`:1`, `:name`, or `?`), a statement cache, array
-  DML, `RETURNING INTO`, PL/SQL with OUT parameters, REF cursors, implicit
-  results, cancellation, transactions;
+- Oracle Database 12.1 and newer, tested on 23ai Free, 21c XE and 18c XE;
+- password logins (11g and 12c verifiers), TLS (TCPS) with certificate and
+  host name verification;
+- `oracle://` URLs, Easy Connect strings and connect descriptors; failover
+  over several addresses;
+- bind variables (`:1`, `:name`, or `?`), a statement cache, array DML with
+  batch errors, `RETURNING INTO`, PL/SQL with OUT parameters, REF cursors,
+  implicit results, cancellation, transactions (explicit, or auto-commit);
 - the common types, read and sent exactly: `NUMBER` (as exact decimals),
-  `BINARY_FLOAT`/`BINARY_DOUBLE`, `VARCHAR2`/`CHAR`/`NVARCHAR2`/`NCHAR`, `RAW`,
-  `DATE`, `TIMESTAMP` (with its nanoseconds, time zones and local time zone),
-  `INTERVAL`s, `ROWID`, LOBs (`CLOB`, `NCLOB`, `BLOB`, `BFILE`), `BOOLEAN`
-  (23ai);
-- a connection pool and struct mapping.
+  `BINARY_FLOAT`/`BINARY_DOUBLE`, `VARCHAR2`/`CHAR`/`NVARCHAR2`/`NCHAR`,
+  `RAW`, `DATE`, `TIMESTAMP` (with its nanoseconds, time zone offsets and
+  regions, local time zone), `INTERVAL`s, `ROWID`/`UROWID`, `LONG`, LOBs
+  (`CLOB`, `NCLOB`, `BLOB`, `BFILE`);
+- a connection pool for threads and vibe.d fibers, and struct mapping.
 
-Later: `JSON` (OSON) and `VECTOR`, a [ddbc](https://github.com/buggins/ddbc)
+Later: `JSON` (OSON), `VECTOR`, native `BOOLEAN` (23ai; read as numbers for
+now), `tnsnames.ora` aliases and wallets, a [ddbc](https://github.com/buggins/ddbc)
 driver and a [hibernated](https://github.com/buggins/hibernated) dialect.
 Native Network Encryption (Oracle's own encryption, an alternative to TLS) is
 not supported: servers that require it are refused with a clear error.
@@ -72,7 +68,7 @@ dub test                                   # unit tests, no server needed
 docker run -d --name oracle-free -p 1521:1521 -e ORACLE_PASSWORD=Oracle_test123 \
     -e APP_USER=testuser -e APP_USER_PASSWORD=Test_password123 gvenzl/oracle-free:23-slim-faststart
 ORACLE_HOST=localhost:1521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 \
-    dub run :integration-tests-phobos      # or :integration-tests-vibe for vibe.d fibers
+    dub run :integration-tests-phobos      # or :integration-tests-vibe (vibe-core 2.x), :integration-tests-vibe1 (1.x)
 ```
 
 ## Bind variables
@@ -98,6 +94,42 @@ ZONE`; `Duration`, `MonthInterval` → intervals; `null` and `Nullable` → NULL
 Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
 another thread or task) stops a running call with ORA-01013.
+
+## Structs
+
+```d
+struct Order
+{
+    int id;
+    @column("customer_name") string customer;
+    Decimal amount;
+    Nullable!DateTime shipped;
+    @ignore string note;
+}
+
+conn.insert("orders", orders);                       // array DML, 1000 rows per round trip
+conn.commit();
+foreach (o; conn.query!Order("SELECT * FROM orders WHERE amount > :1", 5))
+    writeln(o.customer, " ", o.amount);
+auto total = conn.queryValue!long("SELECT COUNT(*) FROM orders");
+```
+
+## Connection pool and vibe.d
+
+```d
+auto pool = new ConnectionPool("oracle://app:secret@db/FREEPDB1?pool_max=8");
+{
+    auto conn = pool.lockConnection();   // waits while all 8 are in use
+    conn.exec("UPDATE stats SET hits = hits + 1");
+    conn.commit();
+}                                        // back to the pool
+```
+
+The same code runs in threads (blocking sockets) and in vibe.d tasks, where
+waiting for the server suspends only the task: the I/O mode follows the
+caller (`ConnectionOptions.ioMode`). A connection handed out again has the
+previous user's uncommitted changes rolled back. See `examples/` (`dub run
+:example-basic`, `dub run :example-vibe`).
 
 ## LOBs
 

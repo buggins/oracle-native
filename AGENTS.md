@@ -50,6 +50,7 @@ dub run dfmt@0.15.2 -- --inplace $(git ls-files '*.d')     # format (CI fails if
 dub build -b docs                                          # docs into /docs/ (git-ignored)
 dub run :integration-tests-phobos                          # integration tests, threads
 dub run :integration-tests-vibe                            # the same tests in vibe.d tasks
+dub run :integration-tests-vibe1                           # ... with vibe-core 1.x
 ORACLE_HOST=localhost:11521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 dub run :integration-tests-phobos
 sh integration-tests/tls/start-proxy.sh 127.0.0.1:11521 12484   # TLS proxy as a TCPS stand-in, then add:
 ORACLE_TLS_HOST=127.0.0.1:12484 ORACLE_TLS_CA=$PWD/integration-tests/tls/ca.pem
@@ -84,6 +85,7 @@ source/oracle/
   value.d              Value: one column value and its getters (Row delegates to it)
   params.d             Parameter (D values → bind types and wire values), placeholders, ? rewriting
   lob.d                Lob (locator operations: length, read, write, trim, temporary LOBs, BFILE), LOB_OP messages
+  pool.d, mapping.d    ConnectionPool (dbwire PoolCore), struct mapping (as in mssql-native)
   types/               typeinfo.d (OracleType, ColumnInfo), number.d (NUMBER), floats.d (BINARY_FLOAT/DOUBLE),
                        encode.d (D values → NUMBER, BINARY_*, DATE, TIMESTAMP*, INTERVALs for binds),
                        temporal.d (DATE, TIMESTAMP*, INTERVALs), rowid.d (ROWID, UROWID),
@@ -91,7 +93,9 @@ source/oracle/
 tools/                 tzregions.d: regenerates the time zone region table from a server
 integration-tests/     shared harness (dub subpackage `:integration-tests`); tls/ has the test CA, server certificate
                        and the TLS proxy script
-integration-tests-phobos/, integration-tests-vibe/   runners
+integration-tests-phobos/, integration-tests-vibe/, integration-tests-vibe1/   runners (vibe1: vibe-core 1.22.6,
+                       sharing the vibe runner's sources)
+examples/basic, examples/vibe   dub subpackages :example-basic, :example-vibe (ORACLE_CONNECTION, ORACLE_USER, ORACLE_PASSWORD)
 ```
 
 ## Protocol behaviour learned from real servers

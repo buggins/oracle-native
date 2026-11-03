@@ -14,6 +14,12 @@ All notable changes to oracle-native are documented here. The format follows
 
 ### Added
 
+- High-level API (#6): `ConnectionPool` / `PooledConnection` for threads and
+  vibe.d fibers (dbwire's pool core; `pool_*` connection string parameters;
+  uncommitted changes rolled back when a connection is handed out again),
+  struct mapping (`query!T`, `queryRow!T`, `queryValue!T`, `insert` with
+  array DML; `@column`, `@ignore`), fiber-mode tests against vibe-core 1.x
+  and 2.x, examples (`:example-basic`, `:example-vibe`).
 - LOBs and long data (#5): CLOB, NCLOB and BLOB columns fetched with their
   contents (as LONG / LONG RAW) or, with the `lob_locators` option, as
   locators; `Lob` (length, read and readText at offsets, write and

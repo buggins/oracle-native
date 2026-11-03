@@ -7,13 +7,50 @@ import std.exception : enforce;
 import oracle;
 import integrationtests.harness : TestCase;
 import integrationtests.server : connectToServer, scalar;
-import oracle : ServerException;
+import oracle : ConnectionPool, PoolOptions, ServerException;
 
 /// Tests registered by the thread runner.
 immutable TestCase[] threadTests = [
     TestCase("thread: one connection per thread", &testThreads, true),
     TestCase("thread: cancel from another thread", &testCancelFromThread, true),
+    TestCase("thread: a pool shared by threads", &testPoolThreads, true),
 ];
+
+/// Eight threads share a pool of three connections; each waits for a free one.
+void testPoolThreads()
+{
+    import core.atomic : atomicOp;
+    import integrationtests.server : serverOptions;
+
+    auto pool = new ConnectionPool(serverOptions(), PoolOptions(3));
+    scope (exit)
+        pool.close();
+    shared int done;
+    shared int failed;
+    Thread[] threads;
+    foreach (i; 0 .. 8)
+    {
+        threads ~= new Thread({
+            try
+            {
+                foreach (k; 0 .. 5)
+                {
+                    auto conn = pool.lockConnection();
+                    if (conn.queryValue!int("SELECT :1 + :2 FROM dual", k, 1) != k + 1)
+                        atomicOp!"+="(failed, 1);
+                }
+                atomicOp!"+="(done, 1);
+            }
+            catch (Exception)
+                atomicOp!"+="(failed, 1);
+        });
+        threads[$ - 1].start();
+    }
+    foreach (t; threads)
+        t.join();
+    enforce(done == 8 && failed == 0, "threads failed");
+    enforce(pool.idleConnections <= 3 && pool.activeConnections == 0, "at most three connections");
+}
 
 /++
 `Connection.cancel` from another thread stops a call; the connection stays
