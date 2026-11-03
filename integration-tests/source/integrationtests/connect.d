@@ -138,6 +138,7 @@ verification. Needs `ORACLE_TLS_HOST` and `ORACLE_TLS_CA`; skipped otherwise.
 void testTls()
 {
     import std.stdio : writeln;
+    import std.string : indexOf;
 
     const host = environment.get("ORACLE_TLS_HOST", "");
     const ca = environment.get("ORACLE_TLS_CA", "");
@@ -181,6 +182,82 @@ void testTls()
     conn = new Connection(d);
     enforce(scalar(conn, "SELECT 'descriptor' FROM dual") == "descriptor", "TCPS descriptor");
     conn.close();
+
+    // the expected certificate subject instead of the host name; the chain is still verified
+    auto dn = o;
+    dn.tls.serverName = "wrong.example";
+    dn.serverCertDn = "cn=localhost";
+    conn = new Connection(dn);
+    conn.close();
+    dn.serverCertDn = "CN=localhost,O=Other";
+    auto e = collectException!ConnectionException(new Connection(dn));
+    enforce(e !is null && e.msg.indexOf("SSL_SERVER_CERT_DN") >= 0, "wrong subject refused");
+    auto off = o;
+    off.tls.serverName = "wrong.example";
+    off.tls.skipNameCheck = true; // ssl_server_dn_match=off
+    conn = new Connection(off);
+    conn.close();
+    auto dnDescriptor = ConnectionOptions.fromDescriptor(
+            descriptor[0 .. $ - 1]
+            ~ "(SECURITY=(SSL_SERVER_CERT_DN=\"CN=localhost\")))");
+    dnDescriptor.user = userName();
+    dnDescriptor.password = password();
+    dnDescriptor.tls.caFile = ca;
+    conn = new Connection(dnDescriptor);
+    conn.close();
+
+    // a wallet with the CA only (trusted certificates)
+    import std.file : copy, mkdirRecurse, rmdirRecurse, tempDir;
+    import std.path : buildPath;
+
+    const walletDir = buildPath(tempDir, "oracle-native-itest-wallet");
+    mkdirRecurse(walletDir);
+    scope (exit)
+        rmdirRecurse(walletDir);
+    copy(ca, buildPath(walletDir, "ewallet.pem"));
+    auto wallet = o;
+    wallet.tls.caFile = null;
+    wallet.walletLocation = walletDir;
+    conn = new Connection(wallet);
+    enforce(scalar(conn, "SELECT 'wallet' FROM dual") == "wallet", "CA from a wallet");
+    conn.close();
+}
+
+/++
+Mutual TLS with a PEM wallet (`integration-tests/tls/wallet`: the client
+certificate, its encrypted key and the CA) through a proxy that requires
+client certificates: `ORACLE_TLS_CLIENT_HOST` (and `ORACLE_TLS_CA`); skipped
+without them.
++/
+void testMutualTls()
+{
+    import std.path : buildPath, dirName;
+    import std.stdio : writeln;
+
+    const host = environment.get("ORACLE_TLS_CLIENT_HOST", "");
+    const ca = environment.get("ORACLE_TLS_CA", "");
+    if (host.length == 0 || ca.length == 0)
+    {
+        writeln("  (ORACLE_TLS_CLIENT_HOST / ORACLE_TLS_CA not set: mutual TLS not tested)");
+        return;
+    }
+    auto o = ConnectionOptions.fromEasyConnect("tcps://" ~ host ~ "/" ~ serviceName());
+    o.user = userName();
+    o.password = password();
+    o.walletLocation = buildPath(dirName(ca), "wallet");
+    o.walletPassword = "Wallet_pw123";
+    auto conn = new Connection(o);
+    enforce(scalar(conn, "SELECT 'mutual' FROM dual") == "mutual", "query with a client certificate");
+    conn.close();
+
+    auto noCertificate = o;
+    noCertificate.walletLocation = null;
+    noCertificate.tls.caFile = ca;
+    enforce(collectException!ConnectionException(new Connection(noCertificate)) !is null,
+            "refused without a client certificate");
+    auto wrongPassword = o;
+    wrongPassword.walletPassword = "wrong";
+    enforce(collectException!ClientException(new Connection(wrongPassword)) !is null, "a wrong wallet password");
 }
 
 /++

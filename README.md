@@ -41,7 +41,8 @@ Features:
 
 - Oracle Database 12.1 and newer, tested on 23ai Free, 21c XE and 18c XE;
 - password logins (11g and 12c verifiers), proxy authentication
-  (`app_user[end_user]` or `proxy_client=end_user`), TLS (TCPS) with
+  (`app_user[end_user]` or `proxy_client=end_user`), TLS (TCPS) with wallets
+  (`ewallet.pem`, mutual TLS), `SSL_SERVER_CERT_DN`, and
   certificate and host name verification;
 - `oracle://` URLs, Easy Connect strings, connect descriptors and
   `tnsnames.ora` aliases; failover
@@ -59,7 +60,7 @@ Features:
 - a connection pool for threads and vibe.d fibers, and struct mapping; a
   [ddbc](https://github.com/buggins/ddbc) driver (configuration `ORACLE`).
 
-Later: wallets, pipelining, DRCP
+Later: pipelining, DRCP
 and a [hibernated](https://github.com/buggins/hibernated) dialect.
 Native Network Encryption (Oracle's own encryption, an alternative to TLS) is
 not supported: servers that require it are refused with a clear error.

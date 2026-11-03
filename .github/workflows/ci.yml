@@ -94,16 +94,20 @@ jobs:
         run: |
           docker exec ${{ job.services.oracle.id }} bash -c \
             "printf \"create user itest_proxied identified by \\\"Proxied_pw123\\\";\\ngrant create session to itest_proxied;\\nalter user itest_proxied grant connect through testuser;\\n\" | sqlplus -s system/Oracle_test123@${{ matrix.service }}"
-      - name: TLS proxy (TCPS stand-in)
-        run: sh integration-tests/tls/start-proxy.sh 127.0.0.1:1521 2484
+      - name: TLS proxies (TCPS stand-ins; the second requires client certificates)
+        run: |
+          sh integration-tests/tls/start-proxy.sh 127.0.0.1:1521 2484
+          sh integration-tests/tls/start-proxy.sh 127.0.0.1:1521 2485 oracle-native-tls-client client
       - name: Integration tests (threads)
         env:
           ORACLE_TLS_HOST: 127.0.0.1:2484
+          ORACLE_TLS_CLIENT_HOST: 127.0.0.1:2485
           ORACLE_TLS_CA: ${{ github.workspace }}/integration-tests/tls/ca.pem
         run: dub run :integration-tests-phobos
       - name: Integration tests (vibe.d fibers)
         env:
           ORACLE_TLS_HOST: 127.0.0.1:2484
+          ORACLE_TLS_CLIENT_HOST: 127.0.0.1:2485
           ORACLE_TLS_CA: ${{ github.workspace }}/integration-tests/tls/ca.pem
         run: dub run :integration-tests-vibe
       - name: Integration tests (vibe-core 1.x)

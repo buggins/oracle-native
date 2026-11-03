@@ -93,6 +93,61 @@ struct ConnectionOptions
     bool secure;
     /// More TLS settings: trusted CAs, the name to verify, client certificates (mTLS).
     TlsOptions tls;
+    /++
+    The directory of an Oracle wallet in PEM form (`ewallet.pem`, as `orapki
+    wallet pem_asn1` writes it): its certificates are the trusted CAs (unless
+    `tls.caFile` is set), and if it has a private key, its certificate is the
+    client certificate (mutual TLS) unless `tls.certFile` is set. `SYSTEM`:
+    no wallet (the system's CAs).
+    +/
+    string walletLocation;
+    /// The password of the wallet's private key (when it is encrypted).
+    string walletPassword;
+    /++
+    The subject the server certificate must have (`SSL_SERVER_CERT_DN`),
+    e.g. `CN=db.example.com,O=Example,C=US`; checked instead of the host name
+    (the attributes in any order). The certificate chain is still verified.
+    +/
+    string serverCertDn;
+
+    /++
+    The TLS options of a connection: `tls` with the wallet applied, and with
+    the host-name check left to the DN check when `serverCertDn` is set.
+
+    Throws: `ClientException` if the wallet directory has no `ewallet.pem`.
+    +/
+    TlsOptions effectiveTls() const @safe
+    {
+        import std.file : exists, readText;
+        import std.path : buildPath;
+        import std.string : indexOf;
+        import std.uni : toUpper;
+
+        // a copy (the cast drops const from this struct value; its one array is duplicated)
+        TlsOptions t = (() @trusted => cast() tls)();
+        t.alpn = tls.alpn.dup;
+        if (serverCertDn.length)
+            t.skipNameCheck = true;
+        if (walletLocation.length == 0 || walletLocation.toUpper == "SYSTEM")
+            return t;
+        const pem = buildPath(walletLocation, "ewallet.pem");
+        if (!(()@trusted => exists(pem))())
+            throw new ClientException("No wallet file " ~ pem ~ " (a PEM wallet is needed: orapki wallet pem_asn1)");
+        if (t.caFile.length == 0)
+            t.caFile = pem;
+        string text;
+        try
+            text = (() @trusted => readText(pem))();
+        catch (Exception e)
+            throw new ClientException("Cannot read the wallet " ~ pem ~ ": " ~ e.msg);
+        if (t.certFile.length == 0 && text.indexOf("PRIVATE KEY-----") >= 0)
+        {
+            t.certFile = pem;
+            t.keyFile = null;
+            t.keyPassword = walletPassword;
+        }
+        return t;
+    }
 
     /// Shown in `V$SESSION.PROGRAM`; empty: the executable's name.
     string program;
@@ -300,7 +355,8 @@ struct ConnectionOptions
 
     Known: `ADDRESS` (`PROTOCOL` tcp/tcps, `HOST`, `PORT`), `ADDRESS_LIST`,
     `LOAD_BALANCE`, `CONNECT_DATA` (`SERVICE_NAME`, `SID`, `INSTANCE_NAME`,
-    `SERVER`), `SECURITY` (`SSL_SERVER_CERT_DN` is not supported yet), `SDU`,
+    `SERVER`), `SECURITY` (`SSL_SERVER_CERT_DN`, `SSL_SERVER_DN_MATCH`,
+    `MY_WALLET_DIRECTORY` / `WALLET_LOCATION`), `SDU`,
     `CONNECT_TIMEOUT`, `TRANSPORT_CONNECT_TIMEOUT`; other entries are ignored.
     All addresses must use the same protocol.
 
@@ -366,8 +422,15 @@ struct ConnectionOptions
             o.serverType = cd.value("SERVER").toLower;
         }
         if (auto sec = description.child("SECURITY"))
-            if (sec.value("SSL_SERVER_CERT_DN").length)
-                throw new ClientException("SSL_SERVER_CERT_DN is not supported yet");
+        {
+            o.serverCertDn = sec.value("SSL_SERVER_CERT_DN");
+            const wallet = sec.value("MY_WALLET_DIRECTORY", sec.value("WALLET_LOCATION"));
+            if (wallet.length)
+                o.walletLocation = wallet;
+            const dnMatch = sec.value("SSL_SERVER_DN_MATCH");
+            if (dnMatch.length && !parseOnOff("SSL_SERVER_DN_MATCH", dnMatch))
+                o.tls.skipNameCheck = true;
+        }
         const sdu = description.value("SDU");
         if (sdu.length)
             o.sdu = parseSdu(sdu);
@@ -384,6 +447,8 @@ struct ConnectionOptions
     Keys: `host`, `port`, `service_name`, `sid`, `instance_name`, `server`,
     `user`, `password`, `proxy_client`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
     `tls_cert_file`, `tls_key_file`, `tls_server_name`, `tls_skip_verify`,
+    `wallet_location` (`my_wallet_directory`), `wallet_password`,
+    `ssl_server_cert_dn`, `ssl_server_dn_match` (flag),
     `program`, `machine`, `osuser`, `terminal`, `time_zone`, `sdu`,
     `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
@@ -470,12 +535,19 @@ struct ConnectionOptions
                 o.tls.skipVerify = parseFlag(key, value);
                 break;
             case "ssl_server_dn_match":
-                // DN matching by host name is what certificate verification does; "off" skips only the name check
-                if (!parseFlag(key, value))
-                    throw new ClientException("ssl_server_dn_match=off is not supported (use tls_server_name)");
+                // on: the host name (or ssl_server_cert_dn) is checked; off: only the certificate chain
+                o.tls.skipNameCheck = !parseOnOff(key, value);
                 break;
             case "ssl_server_cert_dn":
-                throw new ClientException("ssl_server_cert_dn is not supported yet");
+                o.serverCertDn = value;
+                break;
+            case "wallet_location":
+            case "my_wallet_directory":
+                o.walletLocation = value;
+                break;
+            case "wallet_password":
+                o.walletPassword = value;
+                break;
             case "program":
                 o.program = value;
                 break;
@@ -831,4 +903,156 @@ private string toText(T)(T v) @safe pure
     // without a tnsnames.ora, a name is a host
     o = ConnectionOptions.parse("dbhost?config_dir=" ~ buildPath(dir, "none"));
     assert(o.hosts == [HostPort("dbhost", 0)]);
+}
+
+/// An Oracle switch: `on`/`yes`/`true`/`1` or `off`/`no`/`false`/`0`.
+private bool parseOnOff(string key, string value) @safe
+{
+    import std.uni : toLower;
+
+    switch (value.toLower)
+    {
+    case "on":
+    case "yes":
+    case "true":
+    case "1":
+        return true;
+    case "off":
+    case "no":
+    case "false":
+    case "0":
+        return false;
+    default:
+        throw new ClientException("Invalid value '" ~ value ~ "' for '" ~ key ~ "' (on or off expected)");
+    }
+}
+
+/++
+Whether two distinguished names are the same: the same attribute/value pairs
+in any order, attribute names without regard to case (`CN=db, O=Example` and
+`o=Example,cn=db` are). Values may be quoted or have backslash escapes.
++/
+bool sameDistinguishedName(string a, string b) @safe pure
+{
+    import std.algorithm.sorting : sort;
+
+    auto x = dnPairs(a);
+    auto y = dnPairs(b);
+    sort(x);
+    sort(y);
+    return x == y;
+}
+
+/// The attribute/value pairs of a distinguished name (`CN=a,O=b`; `+` joins attributes of one RDN too).
+private string[2][] dnPairs(string dn) @safe pure
+{
+    import std.string : strip;
+    import std.uni : toUpper;
+
+    string[2][] result;
+    string part;
+    bool quoted, escaped;
+    void finish()
+    {
+        const s = part.strip;
+        part = null;
+        if (s.length == 0)
+            return;
+        size_t eq = s.length;
+        foreach (i, c; s)
+            if (c == '=')
+            {
+                eq = i;
+                break;
+            }
+        if (eq == s.length)
+        {
+            result ~= [s.toUpper, ""];
+            return;
+        }
+        string value = s[eq + 1 .. $].strip;
+        if (value.length >= 2 && value[0] == '"' && value[$ - 1] == '"')
+            value = value[1 .. $ - 1];
+        string unescaped;
+        bool backslash;
+        foreach (c; value)
+        {
+            if (!backslash && c == '\\')
+            {
+                backslash = true;
+                continue;
+            }
+            backslash = false;
+            unescaped ~= c;
+        }
+        result ~= [s[0 .. eq].strip.toUpper, unescaped];
+    }
+
+    foreach (c; dn)
+    {
+        if (escaped)
+        {
+            part ~= c;
+            escaped = false;
+            continue;
+        }
+        if (c == '\\')
+        {
+            part ~= c;
+            escaped = true;
+            continue;
+        }
+        if (c == '"')
+            quoted = !quoted;
+        if (!quoted && (c == ',' || c == '+' || c == ';'))
+        {
+            finish();
+            continue;
+        }
+        part ~= c;
+    }
+    finish();
+    return result;
+}
+
+///
+@safe unittest
+{
+    assert(sameDistinguishedName("CN=db.example.com,O=Example,C=US", "c=US, o=Example, cn=db.example.com"));
+    assert(sameDistinguishedName(`CN=a\,b,O="x, y"`, `O=x\, y,CN="a,b"`));
+    assert(!sameDistinguishedName("CN=db,O=Example", "CN=db"));
+    assert(!sameDistinguishedName("CN=db,O=Example", "CN=db,O=example")); // values are compared exactly
+}
+
+/// Wallets and SSL_SERVER_CERT_DN.
+@safe unittest
+{
+    import std.exception : assertThrown;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+
+    auto o = ConnectionOptions.parse("(DESCRIPTION=(ADDRESS=(PROTOCOL=tcps)(HOST=db)(PORT=2484))"
+            ~ "(SECURITY=(SSL_SERVER_CERT_DN=\"CN=db,O=Example\")(MY_WALLET_DIRECTORY=/w))"
+            ~ "(CONNECT_DATA=(SERVICE_NAME=S)))");
+    assert(o.secure && o.serverCertDn == "CN=db,O=Example" && o.walletLocation == "/w");
+    o = ConnectionOptions.parse("oracle://db/S?secure=true&ssl_server_dn_match=off&wallet_location=SYSTEM");
+    assert(o.tls.skipNameCheck && o.effectiveTls().caFile is null);
+
+    const dir = buildPath(tempDir, "oracle-native-wallet-test");
+    (() @trusted {
+        mkdirRecurse(dir);
+        write(buildPath(dir, "ewallet.pem"), "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n");
+    })();
+    scope (exit)
+        (() @trusted => rmdirRecurse(dir))();
+    o = ConnectionOptions.parse("oracle://db/S?secure=true&wallet_location=" ~ dir ~ "&ssl_server_cert_dn=CN%3Ddb");
+    auto t = o.effectiveTls();
+    assert(t.caFile == buildPath(dir, "ewallet.pem") && t.certFile is null && t.skipNameCheck);
+    (() @trusted => write(buildPath(dir, "ewallet.pem"),
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAA==\n-----END ENCRYPTED PRIVATE KEY-----\n"))();
+    o.walletPassword = "pw";
+    t = o.effectiveTls();
+    assert(t.certFile == buildPath(dir, "ewallet.pem") && t.keyPassword == "pw");
+    o.walletLocation = buildPath(dir, "none");
+    assertThrown!ClientException(o.effectiveTls());
 }
