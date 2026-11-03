@@ -31,10 +31,14 @@ import oracle.protocol.messages;
 import oracle.protocol.negotiate;
 import oracle.protocol.tns;
 import oracle.protocol.ttc : TtcReader, TtcWriter;
-import oracle.result : QueryResult;
+import oracle.result : BatchResult, QueryResult;
 import oracle.settings : ConnectionOptions, HostPort;
+import oracle.params : BindDirection, Parameter, Placeholders, findPlaceholders, maxBindBytes, parameters,
+    rewritePlaceholders;
 import oracle.statement : StatementKind, classify;
-import oracle.types.typeinfo : ColumnInfo, OracleType;
+import std.range.primitives : ElementType, isInputRange;
+import dbwire.io.backend : IoLock;
+import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
 import std.datetime.timezone : TimeZone;
 import std.datetime.timezone : UTC;
 import std.typecons : Rebindable;
@@ -71,6 +75,10 @@ final class Connection
     private HostPort connectedHost;
     private KeyValue[] sessionValues;
     private uint[] cursorsToClose; // closed with the next call
+    private CachedStatement[string] statements; // the statement cache, by SQL text
+    private ulong useCounter; // for the least recently used statement
+    private IoLock writeLock; // writes from cancel() and the calls
+    private shared bool cancelPending; // an INTERRUPT was sent and its ORA-01013 not yet read
     private uint lastCallStatus;
     package Rebindable!(immutable TimeZone) sessionZone; // the session time zone, for WITH LOCAL TIME ZONE values
     package Rebindable!(immutable TimeZone) databaseZone; // DBTIMEZONE: WITH LOCAL TIME ZONE values come in it
@@ -199,94 +207,106 @@ final class Connection
 
     /++
     Runs a statement that returns no rows (DML, DDL, a PL/SQL block) and
-    returns the number of rows it changed.
+    returns the number of rows it changed. Arguments are bound to the
+    statement's placeholders (`:1`, `:name`, or `?`), in order, or by name for
+    `Parameter.named` ones; see `oracle.params` for the types.
 
-    Throws: `ServerException` if the statement fails; the connection stays usable.
+    Throws: `ServerException` if the statement fails (the connection stays
+    usable); `ClientException` if the arguments don't match the placeholders.
     +/
     ulong exec(string sql) @safe
     {
-        const kind = classify(sql);
-        if (kind == StatementKind.query)
-        {
-            query(sql).close();
-            return 0;
-        }
-        checkReady();
-        ulong rows;
-        guarded({
-            state = State.busy;
-            scope (exit)
-                if (state == State.busy)
-                    state = State.ready;
-            ExecuteRequest r;
-            r.sql = sql;
-            r.options = ExecuteOption.parse | ExecuteOption.execute;
-            if (kind != StatementKind.plsql)
-                r.options |= ExecuteOption.notPlsql;
-            if (options.autoCommit)
-                r.options |= ExecuteOption.commit;
-            r.executions = 1;
-            call(seq => buildExecute(r, seq, negotiatedFieldVersion));
-            const e = readResponse(null);
-            closeCursorLater(e.cursorId);
-            throwIfError(e);
-            rows = e.rowCount;
-        });
-        return rows;
+        return run(sql, null).rowCount;
+    }
+
+    /// ditto
+    ulong exec(Args...)(string sql, Args args) if (Args.length > 0)
+    {
+        return run(sql, parameters(args)).rowCount;
     }
 
     /++
-    Runs a query and returns its rows. The connection stays busy until all
-    rows are read or the result is closed.
+    Runs a statement and returns its result: the rows of a query (the
+    connection stays busy until all rows are read or the result is closed),
+    or for other statements their row count, the values of OUT and
+    `RETURNING ... INTO` parameters (`QueryResult.outputs`) and the implicit
+    results of PL/SQL. Arguments are bound as in `exec`.
 
-    Throws: `ServerException` if the statement fails; the connection stays usable.
+    Throws: `ServerException` if the statement fails (the connection stays
+    usable); `ClientException` if the arguments don't match the placeholders.
     +/
     QueryResult query(string sql) @safe
     {
-        checkReady();
-        QueryResult result;
-        guarded({
-            state = State.busy;
-            scope (failure)
-                if (state == State.busy)
-                    state = State.ready;
-            const kind = classify(sql);
-            result = new QueryResult(this);
-            ExecuteRequest r;
-            r.sql = sql;
-            r.options = ExecuteOption.parse | ExecuteOption.execute;
-            if (kind != StatementKind.plsql)
-                r.options |= ExecuteOption.notPlsql;
-            if (kind == StatementKind.query)
-            {
-                r.options |= ExecuteOption.fetch;
-                r.prefetchRows = options.fetchSize;
-                r.isQuery = true;
-            }
+        return run(sql, null);
+    }
+
+    /// ditto
+    QueryResult query(Args...)(string sql, Args args) if (Args.length > 0)
+    {
+        return run(sql, parameters(args));
+    }
+
+    /++
+    Runs a DML statement (or PL/SQL block) once for each row of `rows` in a
+    single round trip (array DML) and returns each execution's row count.
+    With `batchErrors`, rows that fail don't stop the others: their errors are
+    in the result; without, the first error is thrown (the rows before it are done).
+
+    Throws: `ServerException` for errors (without `batchErrors`);
+    `ClientException` if the rows don't match the placeholders or their types
+    differ from row to row.
+    +/
+    BatchResult execMany(string sql, const(Parameter[])[] rows, bool batchErrors = false) @safe
+    {
+        return runMany(sql, rows, batchErrors);
+    }
+
+    /// ditto; each element of `rows` is a `Tuple` or an array of values.
+    BatchResult execMany(R)(string sql, R rows, bool batchErrors = false)
+            if (isInputRange!R && !is(ElementType!R : const(Parameter)[]))
+    {
+        import std.typecons : isTuple;
+
+        const(Parameter[])[] converted;
+        foreach (row; rows)
+        {
+            static if (isTuple!(typeof(row)))
+                converted ~= parameters(row.expand).dup;
             else
             {
-                r.executions = 1;
-                if (options.autoCommit)
-                    r.options |= ExecuteOption.commit;
+                Parameter[] values;
+                foreach (v; row)
+                    values ~= Parameter.of(v);
+                converted ~= values;
             }
-            call(seq => buildExecute(r, seq, negotiatedFieldVersion));
-            const e = readResponse(result);
-            result.cursorId = e.cursorId;
-            if (e.number != 0 && e.number != noMoreRows)
-            {
-                closeCursorLater(e.cursorId);
-                throwIfError(e);
-            }
-            result.allFetched = e.number == noMoreRows || kind != StatementKind.query;
-            if (!databaseZoneKnown)
-                foreach (ref c; result.columnInfo)
-                    if (c.type == OracleType.timestampLtz)
-                    {
-                        loadDatabaseZone();
-                        break;
-                    }
-        });
-        return result;
+        }
+        return runMany(sql, converted, batchErrors);
+    }
+
+    /++
+    Cancels the running call: a statement being executed or rows being
+    fetched. The call then fails with ORA-01013 and the connection stays
+    usable. This is the one method that may be called from another thread
+    (or task); it does nothing when the connection isn't busy.
+    +/
+    void cancel() @safe nothrow
+    {
+        import core.atomic : atomicStore;
+
+        if (state != State.busy || writeLock is null)
+            return;
+        try
+        {
+            writeLock.lock();
+            scope (exit)
+                writeLock.unlock();
+            atomicStore(cancelPending, true);
+            tns.sendMarker(MarkerType.interrupt);
+        }
+        catch (Exception)
+        {
+            // the connection broke: the reading side sees it
+        }
     }
 
     /// Commits the transaction.
@@ -336,6 +356,345 @@ final class Connection
     /// ORA-01403: the end of a query's rows.
     package enum uint noMoreRows = 1403;
 
+    /// ORA-01007 and ORA-00932 on a cached query: its tables changed, parse it again.
+    private static bool needsReparse(uint number) @safe pure nothrow @nogc
+    {
+        return number == 1007 || number == 932;
+    }
+
+    /// The cache entry for `sql` (a new, uncached one if it isn't there or is in use).
+    private CachedStatement statementFor(string sql, StatementKind kind) @safe
+    {
+        if (auto cached = sql in statements)
+            if (!cached.inUse)
+                return *cached;
+        auto s = new CachedStatement;
+        s.sql = sql;
+        s.kind = kind;
+        s.placeholders = findPlaceholders(sql);
+        return s;
+    }
+
+    /// Keeps `s` (whose cursor is `cursorId`) in the cache, evicting the least recently used entry.
+    private void cache(CachedStatement s, uint cursorId) @safe
+    {
+        s.cursorId = cursorId;
+        s.lastUse = ++useCounter;
+        if (s.sql in statements)
+            return;
+        if (statements.length >= options.statementCacheSize)
+        {
+            CachedStatement oldest;
+            foreach (c; statements)
+                if (!c.inUse && (oldest is null || c.lastUse < oldest.lastUse))
+                    oldest = c;
+            if (oldest is null)
+                return;
+            closeCursorLater(oldest.cursorId);
+            statements.remove(oldest.sql);
+        }
+        statements[s.sql] = s;
+    }
+
+    /// Forgets a cached statement and closes its cursor.
+    private void uncache(CachedStatement s) @safe nothrow
+    {
+        if (s.sql in statements && statements[s.sql] is s)
+            statements.remove(s.sql);
+        closeCursorLater(s.cursorId);
+        s.cursorId = 0;
+    }
+
+    /++
+    The binds of a statement in the order the server expects them (each
+    occurrence of a placeholder in SQL, each distinct one in PL/SQL), from
+    positional or named parameters.
+    +/
+    private static Parameter[] arrangeBinds(const ref Placeholders ph, StatementKind kind,
+            const(Parameter)[] params, out string[] names) @safe
+    {
+        import std.algorithm.searching : countUntil;
+        import std.conv : to;
+        import std.uni : toUpper;
+
+        auto byName = new Parameter[ph.names.length];
+        size_t named;
+        foreach (ref p; params)
+            if (p.name.length)
+                named++;
+        if (named && named != params.length)
+            throw new ClientException("Parameters must be all positional or all named");
+        if (named)
+        {
+            auto set = new bool[ph.names.length];
+            foreach (ref p; params)
+            {
+                auto i = ph.names.countUntil(p.name);
+                if (i < 0)
+                    i = ph.names.countUntil(p.name.toUpper);
+                if (i < 0)
+                    throw new ClientException("The statement has no placeholder :" ~ p.name);
+                byName[i] = p;
+                set[i] = true;
+            }
+            foreach (i, done; set)
+                if (!done)
+                    throw new ClientException("No value for placeholder :" ~ ph.names[i]);
+        }
+        else
+        {
+            if (params.length != ph.names.length)
+                throw new ClientException("The statement has " ~ ph.names.length.to!string ~ " placeholders but "
+                        ~ params.length.to!string ~ " arguments were given");
+            byName[] = params[];
+        }
+        names = (kind == StatementKind.plsql ? ph.names : ph.occurrences).dup;
+        auto binds = new Parameter[names.length];
+        foreach (i, n; names)
+            binds[i] = byName[ph.names.countUntil(n)];
+        return binds;
+    }
+
+    /// Whether binds can be sent with the metadata of a parsed cursor: same types, values that fit.
+    private static bool fits(const(Parameter)[] cached, Parameter[] binds) @safe pure nothrow
+    {
+        if (cached.length != binds.length)
+            return false;
+        foreach (i, ref b; binds)
+        {
+            if (b.isNull && b.type == OracleType.varchar && b.direction == BindDirection.input)
+                b.type = cached[i].type; // an untyped NULL takes the cursor's type
+            if (b.type != cached[i].type || b.bufferSize > cached[i].bufferSize || b.direction != cached[i].direction)
+                return false;
+        }
+        return true;
+    }
+
+    /// Runs one statement; see `query`.
+    private QueryResult run(string sql, const(Parameter)[] params) @safe
+    {
+        import std.algorithm.searching : canFind;
+
+        checkReady();
+        size_t questionMarks;
+        const text = rewritePlaceholders(sql, questionMarks);
+        const kind = classify(text);
+        auto stmt = statementFor(text, kind);
+        string[] names;
+        auto binds = arrangeBinds(stmt.placeholders, kind, params, names);
+        auto result = new QueryResult(this);
+        result.isQuery = kind == StatementKind.query;
+        result.isPlsql = kind == StatementKind.plsql;
+        result.bindNames = names;
+        result.returning = new bool[binds.length];
+        auto send = new bool[binds.length];
+        send[] = true;
+        if (kind == StatementKind.dml)
+            foreach (i, n; names)
+                if (stmt.placeholders.returning.canFind(n))
+                {
+                    result.returning[i] = true; // its value comes back, none is sent
+                    send[i] = false;
+                    binds[i].direction = BindDirection.output;
+                    binds[i].bufferSize = binds[i].type == OracleType.varchar || binds[i].type == OracleType.raw
+                        ? cast(uint) maxBindBytes : binds[i].bufferSize;
+                }
+        result.binds = binds;
+        guarded({
+            state = State.busy;
+            scope (failure)
+                if (state == State.busy)
+                    state = State.ready;
+            auto e = executeStatement(stmt, result, binds, send);
+            if (e.number != 0 && e.number != noMoreRows)
+            {
+                if (!result.keepCursor)
+                    closeCursorLater(e.cursorId);
+                throwIfError(e);
+            }
+            result.rowCount = result.isQuery ? 0 : e.rowCount;
+            foreach (c; result.outputCursors)
+                if (c !is null && c.columnInfo.length == 0)
+                    c.allFetched = true; // a NULL cursor
+            result.allFetched = e.number == noMoreRows || !result.isQuery;
+            if (!databaseZoneKnown)
+                foreach (ref c; result.columnInfo)
+                    if (c.type == OracleType.timestampLtz)
+                    {
+                        loadDatabaseZone();
+                        break;
+                    }
+        });
+        if (result.allFetched)
+            result.release(); // every row is here: the connection is free
+        return result;
+    }
+
+    /++
+    Executes `stmt` once: re-executes its cached cursor when the binds fit,
+    else parses it (again). Returns the end-of-call status.
+    +/
+    private ErrorInfo executeStatement(CachedStatement stmt, QueryResult result, Parameter[] binds, bool[] send) @safe
+    {
+        const kind = stmt.kind;
+        const cacheable = kind != StatementKind.ddl && options.statementCacheSize > 0;
+        const commit = options.autoCommit && kind != StatementKind.query;
+        if (stmt.cursorId && fits(stmt.binds, binds))
+        {
+            call(seq => buildReexecute(stmt.cursorId, kind == StatementKind.query, options.fetchSize, commit, [
+                binds
+            ],
+            send, seq, negotiatedFieldVersion));
+            result.columnInfo = stmt.columns.dup;
+            result.cursorId = stmt.cursorId;
+            auto e = readResponse(result);
+            if (!needsReparse(e.number))
+            {
+                result.keepCursor = true;
+                stmt.lastUse = ++useCounter;
+                stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
+                result.statement = stmt;
+                return e;
+            }
+            uncache(stmt); // its tables changed: parse it again
+            result.reset();
+        }
+        else if (stmt.cursorId)
+            uncache(stmt); // other bind types: parse it again
+        ExecuteRequest r;
+        r.sql = stmt.sql;
+        r.options = ExecuteOption.parse | ExecuteOption.execute;
+        r.binds = binds;
+        if (binds.length)
+        {
+            r.options |= ExecuteOption.bind;
+            r.rows = [binds];
+            r.sendValue = send;
+        }
+        if (kind == StatementKind.plsql)
+        {
+            r.flags = ExecuteFlag.implicitResultSet;
+            if (binds.length)
+                r.options |= ExecuteOption.plsqlBind;
+        }
+        else
+            r.options |= ExecuteOption.notPlsql;
+        if (kind == StatementKind.query)
+        {
+            r.options |= ExecuteOption.fetch;
+            r.prefetchRows = options.fetchSize;
+            r.isQuery = true;
+        }
+        else
+        {
+            r.executions = 1;
+            if (commit)
+                r.options |= ExecuteOption.commit;
+        }
+        call(seq => buildExecute(r, seq, negotiatedFieldVersion));
+        auto e = readResponse(result);
+        result.cursorId = e.cursorId;
+        if (cacheable && e.cursorId && (e.number == 0 || e.number == noMoreRows))
+        {
+            stmt.binds = binds.dup;
+            stmt.columns = result.columnInfo.dup;
+            stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
+            cache(stmt, e.cursorId);
+            result.keepCursor = true;
+            result.statement = stmt;
+        }
+        return e;
+    }
+
+    /// Array DML; see `execMany`.
+    private BatchResult runMany(string sql, const(Parameter[])[] rows, bool batchErrors) @safe
+    {
+        import std.conv : to;
+
+        checkReady();
+        size_t questionMarks;
+        const text = rewritePlaceholders(sql, questionMarks);
+        const kind = classify(text);
+        if (kind == StatementKind.query || kind == StatementKind.ddl)
+            throw new ClientException("execMany runs DML statements and PL/SQL blocks");
+        BatchResult batch;
+        if (rows.length == 0)
+            return batch;
+        auto stmt = statementFor(text, kind);
+        if (stmt.placeholders.returning.length)
+            throw new ClientException("execMany doesn't support RETURNING INTO");
+        Parameter[][] arranged;
+        foreach (row; rows)
+        {
+            string[] names;
+            arranged ~= arrangeBinds(stmt.placeholders, kind, row, names);
+        }
+        // one type per bind (NULLs take the others' type), the largest size
+        auto binds = arranged[0].dup;
+        foreach (row; arranged[1 .. $])
+            foreach (i, ref p; row)
+            {
+                if (p.isNull && p.type == OracleType.varchar)
+                    continue;
+                if (binds[i].isNull && binds[i].type == OracleType.varchar)
+                    binds[i].type = p.type;
+                else if (p.type != binds[i].type)
+                    throw new ClientException("Bind " ~ (i + 1).to!string ~ " has different types in different rows");
+                if (p.bufferSize > binds[i].bufferSize)
+                    binds[i].bufferSize = p.bufferSize;
+            }
+        foreach (ref b; binds)
+            if (b.direction != BindDirection.input)
+                throw new ClientException("execMany doesn't support OUT parameters");
+        guarded({
+            state = State.busy;
+            scope (exit)
+                if (state == State.busy)
+                    state = State.ready;
+            const cacheable = options.statementCacheSize > 0;
+            ExecuteRequest r;
+            r.options = ExecuteOption.execute | ExecuteOption.bind;
+            if (stmt.cursorId && fits(stmt.binds, binds))
+                r.cursorId = stmt.cursorId; // parsed already
+            else
+            {
+                if (stmt.cursorId)
+                    uncache(stmt);
+                r.options |= ExecuteOption.parse;
+                r.sql = stmt.sql;
+            }
+            r.options |= kind == StatementKind.plsql ? ExecuteOption.plsqlBind : ExecuteOption.notPlsql;
+            if (batchErrors)
+                r.options |= ExecuteOption.batchErrors;
+            if (options.autoCommit)
+                r.options |= ExecuteOption.commit;
+            r.executions = cast(uint) arranged.length;
+            r.binds = binds;
+            r.rows = arranged;
+            r.dmlRowCounts = kind == StatementKind.dml;
+            if (r.dmlRowCounts)
+                r.flags = ExecuteFlag.dmlRowCounts;
+            auto result = new QueryResult(this);
+            result.dmlRowCounts = r.dmlRowCounts;
+            call(seq => buildExecute(r, seq, negotiatedFieldVersion));
+            auto e = readResponse(result);
+            batch.rowCounts = result.rowCounts;
+            batch.rowCount = e.rowCount;
+            if (cacheable && e.cursorId && (e.number == 0 || (e.number == 24_381 && batchErrors)))
+            {
+                stmt.binds = binds;
+                cache(stmt, e.cursorId);
+            }
+            else if (e.cursorId != stmt.cursorId)
+                closeCursorLater(e.cursorId);
+            if (e.number == 24_381 && batchErrors)
+                batch.errors = e.batchErrors;
+            else
+                throwIfError(e);
+        });
+        return batch;
+    }
+
     /++
     Reads DBTIMEZONE: WITH LOCAL TIME ZONE values travel in the database time
     zone, and the client shows them in the session time zone. Read once, when
@@ -365,7 +724,20 @@ final class Connection
         if (state != State.busy)
             throw new ClientException("The connection is closed");
         guarded({
-            call(seq => buildFetch(result.cursorId, options.fetchSize, seq, negotiatedFieldVersion));
+            if (result.needsExecuteFetch)
+            {
+                // the first fetch of a child cursor (implicit result, REF cursor)
+                ExecuteRequest r;
+                r.cursorId = result.cursorId;
+                r.options = ExecuteOption.fetch | ExecuteOption.notPlsql;
+                r.prefetchRows = options.fetchSize;
+                r.executions = options.fetchSize;
+                r.isQuery = true;
+                call(seq => buildExecute(r, seq, negotiatedFieldVersion));
+                result.needsExecuteFetch = false;
+            }
+            else
+                call(seq => buildFetch(result.cursorId, options.fetchSize, seq, negotiatedFieldVersion));
             const e = readResponse(result);
             if (e.number == noMoreRows)
                 result.allFetched = true;
@@ -377,10 +749,26 @@ final class Connection
         });
     }
 
-    /// Called by a result when it is done: its cursor is closed with the next call.
-    package void release(uint cursorId) @safe nothrow
+    /// A child result that was never fetched is closed: its cursor goes with the next call.
+    package void closeChild(uint cursorId) @safe nothrow
     {
         closeCursorLater(cursorId);
+    }
+
+    /// A child result (implicit result, REF cursor) starts fetching: it holds the connection.
+    package void beginChild() @safe
+    {
+        checkReady();
+        state = State.busy;
+    }
+
+    /// Called by a result when it is done: its cursor is kept (cached) or closed with the next call.
+    package void release(QueryResult r) @safe nothrow
+    {
+        if (r.keepCursor && r.statement !is null && r.statement.cursorId == r.cursorId)
+            r.statement.inUse = false;
+        else
+            closeCursorLater(r.cursorId);
         if (state == State.busy)
             state = State.ready;
     }
@@ -409,6 +797,10 @@ final class Connection
     /// Sends a call, preceded by the pending close-cursors piggyback.
     private void call(scope ubyte[]delegate(ubyte sequence) @safe build) @safe
     {
+        import core.atomic : atomicLoad;
+
+        if (atomicLoad(cancelPending))
+            finishCancel(); // a cancel that came after the last call ended
         TtcWriter w;
         if (cursorsToClose.length)
         {
@@ -416,15 +808,59 @@ final class Connection
             cursorsToClose = null;
         }
         w.bytes(build(nextSequence()));
+        writeLock.lock();
+        scope (exit)
+            writeLock.unlock();
         tns.sendData(w.data);
     }
 
     /++
-    Reads a response up to its end (an ERROR or STATUS message), adding the
-    rows to `result` if it is not null.
+    After a cancel: the server answers every INTERRUPT with a reset and an
+    ORA-01013 error, which may come after the response of the call it
+    interrupted. Reads it, unless the response just read was it.
+    +/
+    private ErrorInfo finishCancel(ErrorInfo response = ErrorInfo.init, bool inResponse = false) @safe
+    {
+        import core.atomic : atomicStore;
+
+        atomicStore(cancelPending, false);
+        if (inResponse && tns.takeBreak())
+            return response; // the reset came during the response: it ended with the error
+        for (;;)
+        {
+            const type = reader.u8();
+            if (type == MessageType.error)
+            {
+                auto e = readErrorInfo(reader, serverFieldVersion);
+                checkResponseEnd();
+                tns.takeBreak();
+                return e;
+            }
+            if (type == MessageType.status)
+            {
+                ErrorInfo e;
+                e.callStatus = reader.ub4();
+                continue;
+            }
+            if (type == MessageType.parameter)
+                readReturnParameters(reader, false);
+            else if (type == MessageType.serverSidePiggyback)
+                skipServerPiggyback(reader);
+            else if (type == MessageType.warning)
+                skipWarning(reader);
+            else
+                throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " after a cancel");
+        }
+    }
+
+    /++
+    Reads a response up to its end (an ERROR or STATUS message): rows, OUT
+    values, implicit results and row counts go to `result` if it is not null.
     +/
     private ErrorInfo readResponse(QueryResult result) @safe
     {
+        import core.atomic : atomicLoad;
+
         immutable(ubyte)[] bitVector;
         for (;;)
         {
@@ -449,11 +885,32 @@ final class Connection
             case MessageType.rowData:
                 if (result is null)
                     throw new ProtocolException("Unexpected row in the server's response");
-                readRow(result, bitVector);
+                if (result.hasOutputs)
+                    readOutputs(result);
+                else
+                    readRow(result, bitVector);
                 bitVector = null;
                 break;
+            case MessageType.ioVector:
+                const directions = readIoVector(reader);
+                if (result !is null)
+                    result.directions = directions;
+                break;
             case MessageType.parameter:
-                skipReturnParameters(reader);
+                const counts = readReturnParameters(reader, result !is null && result.dmlRowCounts);
+                if (result !is null && counts.length)
+                    result.rowCounts = counts.dup;
+                break;
+            case MessageType.implicitResultSet:
+                foreach (c; readImplicitResults(reader, negotiatedFieldVersion))
+                    if (result !is null)
+                        result.implicit ~= childResult(c);
+                break;
+            case MessageType.flushOutBinds:
+                writeLock.lock();
+                scope (exit)
+                    writeLock.unlock();
+                tns.sendData([MessageType.flushOutBinds]);
                 break;
             case MessageType.warning:
                 skipWarning(reader);
@@ -466,14 +923,61 @@ final class Connection
                 e.callStatus = reader.ub4();
                 lastCallStatus = e.callStatus;
                 checkResponseEnd();
-                return e;
+                return atomicLoad(cancelPending) ? finishCancel(e, true) : e;
             case MessageType.error:
-                const e = readErrorInfo(reader, serverFieldVersion);
+                auto e = readErrorInfo(reader, serverFieldVersion);
                 lastCallStatus = e.callStatus;
                 checkResponseEnd();
-                return e;
+                return atomicLoad(cancelPending) ? finishCancel(e, true) : e;
             default:
                 throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " in the server's response");
+            }
+        }
+    }
+
+    /// A result for a child cursor (implicit result, REF cursor).
+    private QueryResult childResult(ChildCursor c) @safe
+    {
+        auto r = new QueryResult(this);
+        r.columnInfo = c.columns;
+        r.cursorId = c.cursorId;
+        r.isQuery = true;
+        r.child = true;
+        r.needsExecuteFetch = true;
+        return r;
+    }
+
+    /++
+    Reads the values of OUT and IN OUT binds (after an IO_VECTOR) and of
+    `RETURNING ... INTO` binds (a row count, then the values).
+    +/
+    private void readOutputs(QueryResult result) @safe
+    {
+        if (result.outputData.length != result.binds.length)
+            result.outputData = new immutable(ubyte)[][][result.binds.length];
+        if (result.outputCursors.length != result.binds.length)
+            result.outputCursors = new QueryResult[result.binds.length];
+        foreach (i, ref b; result.binds)
+        {
+            const isReturning = result.returning[i];
+            if (!isReturning && !(i < result.directions.length && (result.directions[i] & BindDirection.output)))
+                continue;
+            const count = isReturning ? reader.ub4() : 1;
+            if (count > 1_000_000)
+                throw new ProtocolException("Invalid RETURNING row count");
+            foreach (_; 0 .. count)
+            {
+                if (b.type == OracleType.cursor)
+                {
+                    result.outputCursors[i] = childResult(readRefCursor(reader, negotiatedFieldVersion));
+                    result.outputData[i] ~= null;
+                }
+                else
+                {
+                    const column = bindColumn(b, result.bindNames[i]);
+                    result.outputData[i] ~= readColumnValue(reader, column, options.maxValueLength);
+                }
+                reader.sb(4); // the value's actual length (or an indicator)
             }
         }
     }
@@ -509,6 +1013,27 @@ final class Connection
     {
         if (e.number != 0)
             throw new ServerException(e.number, e.message, e.position);
+    }
+
+    /// The column metadata of an OUT bind, for reading its value.
+    package static ColumnInfo bindColumn(const ref Parameter b, string name) @safe pure nothrow
+    {
+        import oracle.protocol.negotiate : CharsetId;
+
+        ColumnInfo c;
+        c.name = name;
+        c.type = b.type;
+        c.bufferSize = b.bufferSize ? b.bufferSize : 1;
+        c.maxSize = b.bufferSize;
+        if (b.isText)
+        {
+            c.charsetId = CharsetId.al32utf8;
+            c.charsetForm = CharsetForm.implicit;
+        }
+        c.precision = 9;
+        c.scale = 9;
+        c.nullable = true;
+        return c;
     }
 
     /++
@@ -562,6 +1087,7 @@ final class Connection
     private void connect() @safe
     {
         backend = backendFor(options.ioMode);
+        writeLock = backend.newLock();
 
         void tryHost(HostPort endpoint) @safe
         {
@@ -595,6 +1121,7 @@ final class Connection
         }
         lastSequence = 0;
         cursorsToClose = null;
+        statements = null;
         const program = options.program.length ? options.program : programName();
         const machine = options.machine.length ? options.machine : machineName();
         const osUser = options.osUser.length ? options.osUser : userName();
@@ -752,6 +1279,19 @@ private ubyte[] randomBytes(size_t n) @safe
     import dbwire.crypto.random : secureRandom = randomBytes;
 
     return secureRandom(n);
+}
+
+/// A parsed statement kept with its cursor, to run it again without parsing.
+package final class CachedStatement
+{
+    string sql;
+    StatementKind kind;
+    Placeholders placeholders;
+    uint cursorId; // 0: not parsed
+    Parameter[] binds; // the bind metadata it was parsed with
+    ColumnInfo[] columns; // a query's columns (a re-execution doesn't send them again)
+    bool inUse; // a query result still reads its rows
+    ulong lastUse;
 }
 
 /// The host and port of a REDIRECT address (`(ADDRESS=(PROTOCOL=tcp)(HOST=h)(PORT=p))`).

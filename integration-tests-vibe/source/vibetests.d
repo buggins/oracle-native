@@ -13,7 +13,37 @@ import integrationtests.server : connectToServer, scalar;
 /// Tests registered by the vibe.d runner.
 immutable TestCase[] vibeTests = [
     TestCase("fiber: statements run concurrently", &testConcurrentStatements, true),
+    TestCase("fiber: cancel from another task", &testCancelFromTask, true),
 ];
+
+/// `Connection.cancel` from another task stops a call that waits on the server.
+void testCancelFromTask()
+{
+    import core.time : seconds;
+    import std.exception : collectException;
+    import vibe.core.core : sleep;
+
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    auto canceller = runTask({
+        try
+        {
+            sleep(500.msecs);
+            conn.cancel();
+        }
+        catch (Exception)
+        {
+        }
+    });
+    const start = MonoTime.currTime;
+    enum busyQuery = "SELECT COUNT(*) FROM all_objects a, all_objects b WHERE ROWNUM < 100000000";
+    auto e = collectException!ServerException(scalar(conn, busyQuery));
+    canceller.join();
+    enforce(e !is null && e.code == 1013, e is null ? "not cancelled" : e.msg);
+    enforce(MonoTime.currTime - start < 5.seconds, "the cancel didn't stop the call");
+    enforce(scalar(conn, "SELECT 'after' FROM dual") == "after", "usable after the cancel");
+}
 
 /// Four tasks, each with its own connection, sleep one second on the server: about a second in all.
 void testConcurrentStatements()

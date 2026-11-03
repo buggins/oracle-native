@@ -7,9 +7,10 @@ build time.
 
 > **Status: under development.** Nothing is released yet; the plan is tracked
 > in the [roadmap issue](https://github.com/buggins/oracle-native/issues/10).
-> It connects (TCP or TLS, password logins), runs statements and reads the
-> common column types (below); bind variables, LOBs and the rest come in the
-> next milestones.
+> It connects (TCP or TLS, password logins), runs statements with bind
+> variables, reads the common column types (below), and does array DML, PL/SQL
+> OUT parameters, `RETURNING INTO`, implicit results, REF cursors and cancel;
+> LOBs and the connection pool come in the next milestones.
 
 ```d
 import oracle;
@@ -73,6 +74,30 @@ docker run -d --name oracle-free -p 1521:1521 -e ORACLE_PASSWORD=Oracle_test123 
 ORACLE_HOST=localhost:1521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 \
     dub run :integration-tests-phobos      # or :integration-tests-vibe for vibe.d fibers
 ```
+
+## Bind variables
+
+```d
+conn.exec("INSERT INTO notes VALUES (:1, :2)", 2, "second");          // positional
+conn.exec("UPDATE notes SET text = ? WHERE id = ?", "2nd", 2);         // ? becomes :1, :2
+conn.exec("DELETE FROM notes WHERE id = :id", Parameter.of(2).named("id"));
+
+// array DML: one round trip; per-row counts; with batch errors, failing rows don't stop the others
+auto batch = conn.execMany("INSERT INTO notes VALUES (:1, :2)", [tuple(3, "c"), tuple(4, "d")], true);
+
+// PL/SQL OUT and IN OUT parameters, RETURNING INTO, REF cursors, implicit results
+auto r = conn.query("BEGIN :1 := 'out ' || :2; :3 := :3 * 2; END;",
+    Parameter.output!string, "in", Parameter.inOut(21));
+writeln(r.output(0).getString, " ", r.output(2).getLong);   // "out in 42"
+```
+
+D values are sent as: integers, `bool` and `Decimal` → `NUMBER`; `float` /
+`double` → `BINARY_FLOAT` / `BINARY_DOUBLE`; strings → `VARCHAR2`; `ubyte[]`,
+`UUID` → `RAW`; `Date`, `DateTime` → `DATE`; `SysTime` → `TIMESTAMP WITH TIME
+ZONE`; `Duration`, `MonthInterval` → intervals; `null` and `Nullable` → NULL.
+Statements are kept parsed per connection (option `statement_cache_size`,
+default 20) and run again with new values only. `Connection.cancel` (from
+another thread or task) stops a running call with ORA-01013.
 
 ## Reading values
 

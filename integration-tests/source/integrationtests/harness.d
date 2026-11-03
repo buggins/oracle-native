@@ -9,6 +9,7 @@ import core.exception : AssertError;
 import std.stdio : stderr, writefln;
 
 import integrationtests.basic;
+import integrationtests.binds;
 import integrationtests.connect;
 import integrationtests.server : serverConfigured;
 import integrationtests.types;
@@ -43,7 +44,7 @@ immutable TestCase[] allTests = [
     TestCase("auto-commit", &testAutoCommit, true),
     TestCase("server errors keep the connection", &testServerErrors, true),
     TestCase("fetching in batches, repeated column values", &testFetchBatches, true),
-    TestCase("closed results and many cursors", &testCursors, true),
+    TestCase("closed results and many cursors", &integrationtests.basic.testCursors, true),
     TestCase("busy and closed connections", &testBusy, true),
     TestCase("BINARY_FLOAT and BINARY_DOUBLE", &testFloats, true),
     TestCase("NUMBER as exact decimals, Variant types", &testDecimals, true),
@@ -53,6 +54,13 @@ immutable TestCase[] allTests = [
     TestCase("RAW, LONG, LONG RAW, ROWID, UROWID", &testBinaryLongAndRowids, true),
     TestCase("booleans", &testBooleans, true),
     TestCase("NULL through every getter", &testNullGetters, true),
+    TestCase("binds of every D type, re-executed", &testBindTypes, true),
+    TestCase("placeholders: named, ?, repeated, Variant", &testPlaceholders, true),
+    TestCase("DML with binds", &testBindDml, true),
+    TestCase("array DML, batch errors", &testArrayDml, true),
+    TestCase("OUT, IN OUT and RETURNING INTO", &testOutputs, true),
+    TestCase("implicit results and REF cursors", &integrationtests.binds.testCursors, true),
+    TestCase("statement cache", &testStatementCache, true),
 ];
 
 /// Runner identity, for reports.

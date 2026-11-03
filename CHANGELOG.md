@@ -8,11 +8,20 @@ All notable changes to oracle-native are documented here. The format follows
 
 ### Changed
 
+- Results whose rows have all arrived release the connection at once.
 - Getters return the type's default value for NULL instead of throwing (as
   in mssql-native and ddbc).
 
 ### Added
 
+- Bind variables and statements (#4): `:1`, `:name` and `?` placeholders,
+  `Parameter` (D values to Oracle types, NULLs, named binds, `Variant`),
+  OUT and IN OUT parameters (`Parameter.output`, `inOut`, `refCursor`),
+  `RETURNING ... INTO` (one value per changed row), `QueryResult.outputs`,
+  `rowCount` and `implicitResults`, REF cursors; array DML (`execMany`) with
+  row counts per row and batch errors; a statement cache per connection
+  (re-execution with new values, re-parse when a table changed; option
+  `statement_cache_size`); `Connection.cancel`.
 - Data types (#3): `BINARY_FLOAT`/`BINARY_DOUBLE`, `DATE`, `TIMESTAMP` (with
   nanoseconds), `WITH TIME ZONE` (offsets and regions, with a region table
   generated from the server by `tools/tzregions.d`), `WITH LOCAL TIME ZONE`
