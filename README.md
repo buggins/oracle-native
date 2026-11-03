@@ -39,8 +39,9 @@ void main()
 Features:
 
 - Oracle Database 12.1 and newer, tested on 23ai Free, 21c XE and 18c XE;
-- password logins (11g and 12c verifiers), TLS (TCPS) with certificate and
-  host name verification;
+- password logins (11g and 12c verifiers), proxy authentication
+  (`app_user[end_user]` or `proxy_client=end_user`), TLS (TCPS) with
+  certificate and host name verification;
 - `oracle://` URLs, Easy Connect strings and connect descriptors; failover
   over several addresses;
 - bind variables (`:1`, `:name`, or `?`), a statement cache, array DML with

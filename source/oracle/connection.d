@@ -1529,10 +1529,12 @@ final class Connection : Poolable
         details.machine = machine;
         details.pid = toText(processId());
         details.osUser = osUser;
-        call(seq => buildPhase1(options.user, details, seq, negotiatedFieldVersion));
+        string login, proxyClient;
+        options.loginUsers(login, proxyClient);
+        call(seq => buildPhase1(login, details, seq, negotiatedFieldVersion));
         const phase1 = readAuthResponse();
         const keys = deriveKeys(phase1, options.password, (size_t n) @safe => randomBytes(n));
-        call(seq => buildPhase2(options.user, keys, oracleClientName, options.sessionTimeZone, seq,
+        call(seq => buildPhase2(login, proxyClient, keys, oracleClientName, options.sessionTimeZone, seq,
                 negotiatedFieldVersion));
         sessionValues = readAuthResponse();
         checkServerResponse(sessionValues, keys);

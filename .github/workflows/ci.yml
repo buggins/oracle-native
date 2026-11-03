@@ -90,6 +90,10 @@ jobs:
         run: |
           docker exec ${{ job.services.oracle.id }} bash -c \
             "printf 'hello from a bfile\\n' > /tmp/hello.txt && chmod 644 /tmp/hello.txt && printf \"create or replace directory itest_dir as '/tmp';\\ngrant read on directory itest_dir to testuser;\\n\" | sqlplus -s system/Oracle_test123@${{ matrix.service }}"
+      - name: Proxy authentication test user
+        run: |
+          docker exec ${{ job.services.oracle.id }} bash -c \
+            "printf \"create user itest_proxied identified by \\\"Proxied_pw123\\\";\\ngrant create session to itest_proxied;\\nalter user itest_proxied grant connect through testuser;\\n\" | sqlplus -s system/Oracle_test123@${{ matrix.service }}"
       - name: TLS proxy (TCPS stand-in)
         run: sh integration-tests/tls/start-proxy.sh 127.0.0.1:1521 2484
       - name: Integration tests (threads)

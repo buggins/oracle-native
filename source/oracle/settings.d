@@ -48,10 +48,42 @@ struct ConnectionOptions
     string instanceName;
     /// Server process type (`SERVER`): `dedicated`, `shared` or `pooled`; empty: the listener's default.
     string serverType;
-    /// User name.
+    /++
+    User name. `proxy[target]` logs in as `proxy` (with `proxy`'s password)
+    to a session of user `target` (proxy authentication, see `proxyClient`).
+    +/
     string user;
     /// Password.
     string password;
+    /++
+    Proxy authentication: the user the session runs as (`PROXY_CLIENT_NAME`).
+    `user` and `password` are then those of the proxy user, which the target
+    user must allow: `ALTER USER target GRANT CONNECT THROUGH proxy`. Also
+    written `proxy[target]` in `user`.
+    +/
+    string proxyClient;
+
+    /++
+    The user that logs in and the proxy client: `user` split at `[...]`, or
+    `user` and `proxyClient`.
+
+    Throws: `ClientException` if both name a different proxy client.
+    +/
+    void loginUsers(out string login, out string client) const @safe pure
+    {
+        import std.string : indexOf;
+
+        login = user;
+        client = proxyClient;
+        const open = user.indexOf('[');
+        if (open < 0 || user.length < 2 || user[$ - 1] != ']')
+            return;
+        login = user[0 .. open];
+        const named = user[open + 1 .. $ - 1];
+        if (client.length && client != named)
+            throw new ClientException("Two proxy clients given: '" ~ named ~ "' and '" ~ client ~ "'");
+        client = named;
+    }
 
     /++
     TLS (TCPS) from the first byte. The server certificate is verified against
@@ -315,7 +347,7 @@ struct ConnectionOptions
     Easy Connect string.
 
     Keys: `host`, `port`, `service_name`, `sid`, `instance_name`, `server`,
-    `user`, `password`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
+    `user`, `password`, `proxy_client`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
     `tls_cert_file`, `tls_key_file`, `tls_server_name`, `tls_skip_verify`,
     `program`, `machine`, `osuser`, `terminal`, `time_zone`, `sdu`,
     `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
@@ -368,6 +400,10 @@ struct ConnectionOptions
                 break;
             case "password":
                 o.password = value;
+                break;
+            case "proxy_client":
+            case "proxy_client_name":
+                o.proxyClient = value;
                 break;
             case "secure":
             case "tcps":
@@ -702,4 +738,26 @@ private string toText(T)(T v) @safe pure
     assertThrown!ClientException(ConnectionOptions.parse("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=x)))"));
     assertThrown!ClientException(ConnectionOptions.parse("ipc://x/y"));
     assertThrown!ClientException(ConnectionOptions.parse("h/s?sdu=10"));
+}
+
+/// Proxy authentication: `proxy[target]` in the user name, or `proxy_client`.
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    string login, client;
+    auto o = ConnectionOptions.parse("oracle://app%5Bjane%5D:secret@db/SALES");
+    o.loginUsers(login, client);
+    assert(login == "app" && client == "jane" && o.password == "secret");
+    o = ConnectionOptions.parse("oracle://app:secret@db/SALES?proxy_client=jane");
+    o.loginUsers(login, client);
+    assert(login == "app" && client == "jane");
+    o.user = "app[jane]";
+    o.loginUsers(login, client); // the same client twice is fine
+    assert(login == "app" && client == "jane");
+    o.proxyClient = "john";
+    assertThrown!ClientException(o.loginUsers(login, client));
+    o = ConnectionOptions.parse("oracle://plain:pw@db/SALES");
+    o.loginUsers(login, client);
+    assert(login == "plain" && client is null);
 }
