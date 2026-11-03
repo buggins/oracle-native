@@ -34,7 +34,10 @@ import oracle.protocol.ttc : TtcReader, TtcWriter;
 import oracle.result : QueryResult;
 import oracle.settings : ConnectionOptions, HostPort;
 import oracle.statement : StatementKind, classify;
-import oracle.types.typeinfo : ColumnInfo;
+import oracle.types.typeinfo : ColumnInfo, OracleType;
+import std.datetime.timezone : TimeZone;
+import std.datetime.timezone : UTC;
+import std.typecons : Rebindable;
 
 /++
 One connection to Oracle Database.
@@ -69,6 +72,9 @@ final class Connection
     private KeyValue[] sessionValues;
     private uint[] cursorsToClose; // closed with the next call
     private uint lastCallStatus;
+    package Rebindable!(immutable TimeZone) sessionZone; // the session time zone, for WITH LOCAL TIME ZONE values
+    package Rebindable!(immutable TimeZone) databaseZone; // DBTIMEZONE: WITH LOCAL TIME ZONE values come in it
+    private bool databaseZoneKnown;
 
     /++
     Connects and logs in.
@@ -272,6 +278,13 @@ final class Connection
                 throwIfError(e);
             }
             result.allFetched = e.number == noMoreRows || kind != StatementKind.query;
+            if (!databaseZoneKnown)
+                foreach (ref c; result.columnInfo)
+                    if (c.type == OracleType.timestampLtz)
+                    {
+                        loadDatabaseZone();
+                        break;
+                    }
         });
         return result;
     }
@@ -322,6 +335,29 @@ final class Connection
 
     /// ORA-01403: the end of a query's rows.
     package enum uint noMoreRows = 1403;
+
+    /++
+    Reads DBTIMEZONE: WITH LOCAL TIME ZONE values travel in the database time
+    zone, and the client shows them in the session time zone. Read once, when
+    a result first has such a column (another cursor may be open meanwhile).
+    +/
+    private void loadDatabaseZone() @safe
+    {
+        auto zone = new QueryResult(this);
+        ExecuteRequest r;
+        r.sql = "SELECT DBTIMEZONE FROM dual";
+        r.options = ExecuteOption.parse | ExecuteOption.execute | ExecuteOption.fetch | ExecuteOption.notPlsql;
+        r.prefetchRows = 1;
+        r.isQuery = true;
+        call(seq => buildExecute(r, seq, negotiatedFieldVersion));
+        const e = readResponse(zone);
+        closeCursorLater(e.cursorId);
+        if (e.number != 0 && e.number != noMoreRows)
+            throwIfError(e);
+        if (zone.batch.length && zone.batch[0].length && zone.batch[0][0]!is null)
+            databaseZone = zoneOf(cast(string) zone.batch[0][0]);
+        databaseZoneKnown = true;
+    }
 
     /// Fetches the next batch of `result`'s rows.
     package void fetchMore(QueryResult result) @safe
@@ -650,6 +686,9 @@ final class Connection
         checkServerResponse(sessionValues, keys);
 
         transport.setTimeouts(options.receiveTimeout, options.sendTimeout);
+        sessionZone = zoneOf(options.sessionTimeZone);
+        databaseZone = UTC();
+        databaseZoneKnown = false;
         connectedHost = endpoint;
         state = State.ready;
     }
@@ -683,6 +722,29 @@ final class Connection
             }
         }
     }
+}
+
+/// The `std.datetime` zone of a session time zone setting: `+02:00`, `UTC`, `Europe/Lisbon`.
+private immutable(TimeZone) zoneOf(string setting) @safe
+{
+    import core.time : minutes;
+    import std.conv : ConvException, to;
+    import std.datetime.timezone : SimpleTimeZone, UTC;
+    import dbwire.types.timezone : resolveTimeZone;
+
+    if (setting.length == 6 && (setting[0] == '+' || setting[0] == '-') && setting[3] == ':')
+    {
+        try
+        {
+            const m = setting[1 .. 3].to!int * 60 + setting[4 .. 6].to!int;
+            if (m == 0)
+                return UTC();
+            return new immutable SimpleTimeZone(minutes(setting[0] == '-' ? -m : m));
+        }
+        catch (ConvException)
+            return UTC();
+    }
+    return resolveTimeZone(setting);
 }
 
 private ubyte[] randomBytes(size_t n) @safe

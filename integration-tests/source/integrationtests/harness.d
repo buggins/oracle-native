@@ -11,6 +11,7 @@ import std.stdio : stderr, writefln;
 import integrationtests.basic;
 import integrationtests.connect;
 import integrationtests.server : serverConfigured;
+import integrationtests.types;
 
 /// Integration test entry point. Throws on failure.
 alias TestFunction = void function();
@@ -44,6 +45,14 @@ immutable TestCase[] allTests = [
     TestCase("fetching in batches, repeated column values", &testFetchBatches, true),
     TestCase("closed results and many cursors", &testCursors, true),
     TestCase("busy and closed connections", &testBusy, true),
+    TestCase("BINARY_FLOAT and BINARY_DOUBLE", &testFloats, true),
+    TestCase("NUMBER as exact decimals, Variant types", &testDecimals, true),
+    TestCase("DATE and TIMESTAMP", &testDatesAndTimestamps, true),
+    TestCase("time zones: offsets, regions, local time zone", &testTimeZones, true),
+    TestCase("INTERVAL YEAR TO MONTH and DAY TO SECOND", &testIntervals, true),
+    TestCase("RAW, LONG, LONG RAW, ROWID, UROWID", &testBinaryLongAndRowids, true),
+    TestCase("booleans", &testBooleans, true),
+    TestCase("NULL through every getter", &testNullGetters, true),
 ];
 
 /// Runner identity, for reports.

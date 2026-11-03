@@ -18,6 +18,9 @@ public import oracle.exception;
 public import oracle.result : QueryResult, Row;
 public import oracle.settings : ConnectionOptions, HostPort, HostSelection;
 public import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
+public import oracle.value : Value;
+public import dbwire.types.decimal : Decimal;
+public import dbwire.types.interval : MonthInterval;
 public import dbwire.io.backend : IoMode;
 
 /// Library version.

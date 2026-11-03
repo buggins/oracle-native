@@ -95,7 +95,7 @@ void testNullsAndRowids()
     const row = r.front;
     foreach (i; 0 .. 4)
         enforce(row.isNull(i) && row.getString(i) is null, "NULL value");
-    enforce(collectException!ClientException(row.getLong(1)) !is null, "NULL as long");
+    enforce(row.getLong(1) == 0, "NULL as long");
     enforce(row.getLong(4) == 1, "value after NULLs");
     r.close();
 

@@ -43,6 +43,40 @@ string rowidText(scope const(ubyte)[] b) @safe pure
     return s[].idup;
 }
 
+/++
+The text of a UROWID: a physical ROWID (first byte 1) in its usual form; a
+logical one (e.g. of an index-organized table) as `*` and the base-64 of the
+bytes after the first, without padding: `*BAYAABsCwQL+`.
+
+Throws: `ProtocolException` for malformed values.
++/
+string urowidText(scope const(ubyte)[] b) @safe pure
+{
+    import std.base64 : Base64;
+
+    if (b.length == 0)
+        throw new ProtocolException("Invalid UROWID");
+    if (b[0] == 1)
+    {
+        if (b.length != 13)
+            throw new ProtocolException("Invalid physical UROWID length");
+        // object number, file, block, slot: as in a ROWID, which has an extra byte after the file
+        return rowidText(b[1 .. 7] ~ cast(const(ubyte)[])[0] ~ b[7 .. 13]);
+    }
+    auto s = Base64.encode(b[1 .. $]);
+    while (s.length && s[$ - 1] == '=')
+        s = s[0 .. $ - 1];
+    return "*" ~ s.idup;
+}
+
+///
+@safe unittest
+{
+    // from Oracle 26ai: rows of an index-organized table
+    assert(urowidText([2, 4, 6, 0, 0, 0x1B, 2, 0xC1, 2, 0xFE]) == "*BAYAABsCwQL+");
+    assert(urowidText([2, 4, 6, 0, 0, 0x1B, 4, 0xC3, 0x0D, 0x23, 0x39, 0xFE]) == "*BAYAABsEww0jOf4");
+}
+
 ///
 @safe unittest
 {
