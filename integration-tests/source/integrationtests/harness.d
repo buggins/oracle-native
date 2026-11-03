@@ -61,6 +61,7 @@ immutable TestCase[] allTests = [
     TestCase("booleans", &testBooleans, true),
     TestCase("native BOOLEAN binds", &testNativeBooleans, true),
     TestCase("JSON", &testJson, true),
+    TestCase("JSON binds", &testJsonBinds, true),
     TestCase("VECTOR", &testVectors, true),
     TestCase("column domains and annotations", &testColumnMetadata, true),
     TestCase("end-to-end attributes", &testEndToEnd, true),

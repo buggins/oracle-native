@@ -2,6 +2,7 @@
 module integrationtests.binds;
 
 import core.time : days, hnsecs, hours, minutes, seconds;
+import std.conv : to;
 import std.datetime.date : Date, DateTime;
 import std.datetime.systime : SysTime;
 import std.datetime.timezone : SimpleTimeZone, UTC;
@@ -163,6 +164,15 @@ void testOutputs()
     enforce(r.outputs.length == 4 && r.outputs[2].value.getSysTime.year >= 2026, "OUT timestamp");
     enforce(r.output(":5").isNull, "OUT NULL");
     enforce(!conn.isBusy, "free");
+    // the same block again (a re-execution of the cached cursor: no values for OUT parameters)
+    foreach (i; 0 .. 3)
+    {
+        r = conn.query("BEGIN :1 := 'out ' || :2; :3 := :3 * 2; :4 := SYSTIMESTAMP; :5 := NULL; END;",
+                Parameter.output!string, "again" ~ i.to!string, Parameter.inOut(i), Parameter.output!SysTime,
+                Parameter.output!long);
+        enforce(r.output(0).getString == "out again" ~ i.to!string && r.output("3").getLong == 2 * i,
+                "re-executed: " ~ r.output(0).getString);
+    }
 
     dropTable(conn, "itest_ret");
     conn.exec("CREATE TABLE itest_ret (id NUMBER, n NUMBER, s VARCHAR2(20))");

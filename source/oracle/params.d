@@ -20,6 +20,7 @@ $(TR $(TD `SysTime`) $(TD `TIMESTAMP WITH TIME ZONE` with the time's UTC offset,
 $(TR $(TD `Duration`) $(TD `INTERVAL DAY TO SECOND`))
 $(TR $(TD `MonthInterval`) $(TD `INTERVAL YEAR TO MONTH`))
 $(TR $(TD `Vector`, `float[]`, `double[]`) $(TD `VECTOR` (23ai; for older servers its text)))
+$(TR $(TD `JSONValue`, `Parameter.json(text)`) $(TD `JSON` as Oracle's binary JSON (OSON; 21c and later; for older servers its text)))
 $(TR $(TD `Nullable!T`) $(TD NULL of T's type, or T's value))
 $(TR $(TD `typeof(null)`) $(TD NULL `VARCHAR2`))
 $(TR $(TD `Variant`) $(TD by its content; empty: NULL `VARCHAR2`))
@@ -37,6 +38,7 @@ import core.time : Duration;
 import std.datetime.date : Date, DateTime;
 import std.datetime.systime : SysTime;
 import std.traits : isFloatingPoint, isIntegral, isSomeChar, isSomeString, Unqual;
+import std.json : JSONValue;
 import std.typecons : Nullable;
 import std.uuid : UUID;
 import std.variant : Variant;
@@ -45,6 +47,7 @@ import dbwire.types.interval : MonthInterval;
 import oracle.exception : ClientException;
 import oracle.lob : Lob;
 import oracle.types.typeinfo : CharsetForm, OracleType;
+import oracle.types.oson : jsonMaxLength;
 import oracle.types.vector : Vector, vectorMaxLength;
 
 /// The largest VARCHAR2 and RAW bind value, in bytes.
@@ -151,6 +154,25 @@ struct Parameter
         return p;
     }
 
+    /++
+    A JSON parameter from JSON text, sent as JSON (Oracle's binary JSON,
+    OSON), so the server doesn't parse text: for JSON columns, and for PL/SQL
+    `JSON` parameters. Numbers are kept exactly (rounded to NUMBER's 40
+    digits, as the server would), object members keep their order. Field
+    names longer than 255 bytes need Oracle Database 23ai. Servers before
+    21c get the text.
+
+    Throws: `ClientException` if `text` isn't valid JSON.
+    +/
+    static Parameter json(string text) @safe
+    {
+        import oracle.types.oson : encodeOson;
+
+        auto p = typed(OracleType.json, jsonMaxLength);
+        p.data = encodeOson(text, true);
+        return p;
+    }
+
     /// This parameter bound by name: to the placeholder `:name`.
     Parameter named(string name) const @safe
     {
@@ -211,6 +233,34 @@ package Parameter asTextVector(Parameter p) @safe
 }
 
 /++
+A JSON parameter as the server can take it: an OSON image from field version
+21.1 (21c), its text before (the server parses it).
+
+Throws: `ClientException` if the image has field names longer than 255 bytes
+and the server is older than 23ai (field version 23.1).
++/
+package Parameter asWireJson(Parameter p, ubyte fieldVersion) @safe
+{
+    import oracle.protocol.negotiate : TtcFieldVersion;
+    import oracle.types.oson : osonToText;
+
+    if (p.type != OracleType.json)
+        return p;
+    if (fieldVersion >= TtcFieldVersion.v21_1)
+    {
+        if (!p.isNull && p.data.length > 3 && p.data[3] == 3 && fieldVersion < TtcFieldVersion.v23_1)
+            throw new ClientException("JSON field names longer than 255 bytes need Oracle Database 23ai");
+        return p;
+    }
+    p.type = OracleType.varchar;
+    if (!p.isNull)
+        p.data = cast(immutable(ubyte)[]) osonToText(p.data);
+    p.bufferSize = p.direction != BindDirection.input ? cast(uint) maxBindBytes : p.isNull ? 4 : cast(
+            uint)(p.data.length < 0x1FFF_FFFF ? p.data.length * 4 : 0x7FFF_FFFF);
+    return p;
+}
+
+/++
 A BOOLEAN parameter as the NUMBER 1 or 0, for servers before 23ai (TTC field
 version below 23.1); other parameters as they are.
 +/
@@ -254,6 +304,8 @@ private Parameter typeOf(T)() @safe
         return typed(OracleType.blob, 112);
     else static if (is(T == Vector) || is(T : const(float)[]) || is(T : const(double)[]))
         return typed(OracleType.vector, vectorMaxLength);
+    else static if (is(T == JSONValue))
+        return typed(OracleType.json, jsonMaxLength);
     else
         static assert(false, "Unsupported parameter type " ~ T.stringof);
 }
@@ -310,6 +362,12 @@ private Parameter make(T)(T value)
         p.data = encodeIntervalYm(value);
     else static if (is(U == Vector))
         p.data = encodeVector(value);
+    else static if (is(U == JSONValue))
+    {
+        import oracle.types.oson : encodeOson;
+
+        p.data = encodeOson(value, true);
+    }
     else static if (is(U : const(float)[]) || is(U : const(double)[]))
     {
         if (value.length)
@@ -338,7 +396,7 @@ private Parameter ofVariant(Variant value) @trusted // Variant.get is @system
         return Parameter.nullOf!string();
     static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
             Decimal, string, wstring, dstring, char, ubyte[], immutable(ubyte)[], const(ubyte)[], UUID, Date,
-            DateTime, SysTime, Duration, MonthInterval, Parameter, Lob, Vector, float[], double[]))
+            DateTime, SysTime, Duration, MonthInterval, Parameter, Lob, Vector, float[], double[], JSONValue))
         if (value.type == typeid(T))
             return Parameter.of(value.get!T);
     throw new ClientException("Unsupported Variant parameter type " ~ value.type.toString);

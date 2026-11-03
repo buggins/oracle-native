@@ -659,7 +659,7 @@ final class Connection : Poolable
     private Parameter[] arrangeBinds(const ref Placeholders ph, StatementKind kind,
             const(Parameter)[] params, out string[] names) @safe
     {
-        import oracle.params : asNumberBoolean, asTextVector;
+        import oracle.params : asNumberBoolean, asTextVector, asWireJson;
 
         import std.algorithm.searching : countUntil;
         import std.conv : to;
@@ -707,6 +707,7 @@ final class Connection : Poolable
                 binds[i] = asNumberBoolean(binds[i]);
             if (!nativeVector)
                 binds[i] = asTextVector(binds[i]);
+            binds[i] = asWireJson(binds[i], negotiatedFieldVersion);
         }
         return binds;
     }
@@ -1002,11 +1003,18 @@ final class Connection : Poolable
         const commit = options.autoCommit && kind != StatementKind.query;
         if (stmt.cursorId && fits(stmt.binds, binds))
         {
+            // a re-execution sends no values for OUT parameters (the first execution sends NULLs);
+            // in PL/SQL the server's IO vector says which ones are OUT
+            auto values = send.dup;
+            foreach (i, ref b; binds)
+                if ((i < stmt.directions.length ? stmt.directions[i] : b.direction) == BindDirection.output)
+                    values[i] = false;
             call(seq => buildReexecute(stmt.cursorId, kind == StatementKind.query, options.fetchSize, commit, [
                 binds
             ],
-            send, seq, negotiatedFieldVersion));
+            values, seq, negotiatedFieldVersion));
             result.columnInfo = stmt.columns.dup;
+            result.directions = stmt.directions;
             result.cursorId = stmt.cursorId;
             auto e = readResponse(result);
             if (!needsReparse(e.number))
@@ -1030,6 +1038,7 @@ final class Connection : Poolable
         {
             stmt.binds = binds.dup;
             stmt.columns = result.columnInfo.dup;
+            stmt.directions = result.directions;
             stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
             if (cache(stmt, e.cursorId))
             {
@@ -1961,6 +1970,7 @@ package final class CachedStatement
     uint cursorId; // 0: not parsed
     Parameter[] binds; // the bind metadata it was parsed with
     ColumnInfo[] columns; // a query's columns (a re-execution doesn't send them again)
+    immutable(ubyte)[] directions; // PL/SQL: the bind directions (a re-execution gets no IO vector)
     bool inUse; // a query result still reads its rows
     ulong lastUse;
 }

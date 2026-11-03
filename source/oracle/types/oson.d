@@ -19,8 +19,12 @@ zone), INTERVAL DAY TO SECOND, RAW, IDs, and extended types such as VECTOR.
 
 `osonToText` gives the JSON text as the server's `JSON_SERIALIZE` writes it:
 dates and timestamps in ISO 8601 (`2024-01-31T12:00:00.500000+02:30`),
-intervals as ISO 8601 durations (`P1DT2H3M4.500000S`), RAW in upper-case
-hexadecimal, NUMBERs exactly.
+intervals as ISO 8601 durations (`P1DT2H3M4.500000S`, `P1Y2M`), RAW in
+upper-case hexadecimal, NUMBERs exactly.
+
+`encodeOson` makes an image of JSON text or a `std.json` value (for JSON
+binds), storing numbers as the server's JSON parser does: as NUMBERs, rounded
+to NUMBER's precision, or as BINARY_DOUBLE outside NUMBER's range.
 
 Copyright: Copyright © 2026, Vadim Lopatin
 License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
@@ -28,6 +32,9 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.types.oson;
 
 import oracle.exception : ClientException, ProtocolException;
+
+/// The largest JSON value sent or fetched (as an OSON image), in bytes.
+enum uint jsonMaxLength = 32 * 1024 * 1024;
 
 /++
 The JSON text of an OSON image.
@@ -202,7 +209,7 @@ private struct OsonDecoder
                 return vector(take(u32()));
             throw new ClientException("OSON extended type " ~ toText(extended) ~ " is not supported yet");
         case 0x3D:
-            throw new ClientException("INTERVAL YEAR TO MONTH values in JSON are not supported yet");
+            return yearToMonth(take(5));
         default:
             break;
         }
@@ -303,21 +310,22 @@ private struct OsonDecoder
         import oracle.types.number : decodeNumber;
 
         const d = decodeNumber(b);
-        const n = cast(int) d.digits.length;
-        if (d.infinite || n == 0 || (d.pointPosition <= 40 && n - d.pointPosition <= 40))
+        if (d.infinite)
             return put(d.toString());
-        const exponent = d.pointPosition - 1;
-        put((d.negative ? "-" : "") ~ d.digits[0 .. 1] ~ (n > 1 ? "." ~ d.digits[1 .. $] : "") ~ "E"
-                ~ (exponent < 0 ? "-" : "+") ~ toText(exponent < 0 ? -exponent : exponent));
+        put(decimalText(d.negative, d.digits, d.pointPosition));
     }
 
+    /// BINARY_FLOAT and BINARY_DOUBLE: the shortest digits that read back exactly, written as NUMBERs are.
     void floating(scope const(ubyte)[] b, bool single) @safe
     {
         import oracle.types.floats : decodeBinaryFloat, floatText;
 
         const v = decodeBinaryFloat(b);
         const s = floatText(v, single);
-        put(s == "Nan" || s == "Inf" || s == "-Inf" ? "\"" ~ s ~ "\"" : s);
+        if (s == "Nan" || s == "Inf" || s == "-Inf")
+            return quoted(s);
+        const d = parseDecimal(s);
+        put(decimalText(d.negative, d.digits, d.point));
     }
 
     void dateTime(scope const(ubyte)[] b, bool zoned) @safe
@@ -354,6 +362,23 @@ private struct OsonDecoder
 
         quoted(format("%sP%dDT%dH%dM%d.%06dS", negative ? "-" : "", abs(d.days), abs(d.hours), abs(d.minutes),
                 abs(d.seconds), abs(d.nanoseconds) / 1000));
+    }
+
+    /// As `JSON_SERIALIZE` writes it: `P1Y2M`, `-P3M`, `P1Y`, `P0Y`.
+    void yearToMonth(scope const(ubyte)[] b) @safe
+    {
+        import oracle.types.temporal : decodeYearToMonth;
+
+        const ym = decodeYearToMonth(b);
+        const negative = ym.years < 0 || ym.months < 0;
+        const years = ym.years < 0 ? -ym.years : ym.years;
+        const months = ym.months < 0 ? -ym.months : ym.months;
+        string s = negative ? "-P" : "P";
+        if (years || !months)
+            s ~= toText(years) ~ "Y";
+        if (months)
+            s ~= toText(months) ~ "M";
+        quoted(s);
     }
 
     void hex(scope const(ubyte)[] b) @safe
@@ -456,6 +481,779 @@ private struct OsonDecoder
     }
 }
 
+/// A decimal number: 0.`digits` × 10^`point`, digits without leading or trailing zeros (none for zero).
+private struct DecimalParts
+{
+    bool negative;
+    char[] digits;
+    long point;
+}
+
+/// Splits a decimal number in JSON syntax (`-12.5e3`, also C's `1e+02`) into its sign and digits.
+private DecimalParts parseDecimal(string text) @safe pure
+{
+    DecimalParts p;
+    size_t i;
+    const negative = text.length && text[0] == '-';
+    char[] digits;
+    long point;
+    if (negative)
+        i++;
+    for (; i < text.length && text[i] >= '0' && text[i] <= '9'; i++)
+        digits ~= text[i];
+    point = digits.length;
+    if (i < text.length && text[i] == '.')
+        for (i++; i < text.length && text[i] >= '0' && text[i] <= '9'; i++)
+            digits ~= text[i];
+    long exponent;
+    if (i < text.length && (text[i] == 'e' || text[i] == 'E'))
+    {
+        i++;
+        const expNegative = i < text.length && text[i] == '-';
+        if (i < text.length && (text[i] == '-' || text[i] == '+'))
+            i++;
+        for (; i < text.length && text[i] >= '0' && text[i] <= '9'; i++)
+            if (exponent < 100_000)
+                exponent = exponent * 10 + (text[i] - '0');
+        if (expNegative)
+            exponent = -exponent;
+    }
+    size_t start;
+    while (start < digits.length && digits[start] == '0')
+    {
+        start++;
+        point--;
+    }
+    digits = digits[start .. $];
+    while (digits.length && digits[$ - 1] == '0')
+        digits = digits[0 .. $ - 1];
+    p.negative = negative;
+    p.digits = digits;
+    p.point = point + exponent;
+    return p;
+}
+
+/++
+A number as `JSON_SERIALIZE` writes it: plain with up to 40 digits before
+and after the point (`-0.015`, `1000`), else `1.5E-40`.
++/
+private string decimalText(bool negative, scope const(char)[] digits, long point) @safe pure
+{
+    import std.array : replicate;
+
+    const n = cast(long) digits.length;
+    if (n == 0)
+        return "0";
+    const sign = negative ? "-" : "";
+    if (point <= 40 && n - point <= 40)
+    {
+        if (point <= 0)
+            return sign ~ "0." ~ "0".replicate(cast(size_t)-point) ~ digits.idup;
+        if (point >= n)
+            return sign ~ digits.idup ~ "0".replicate(cast(size_t)(point - n));
+        return sign ~ digits[0 .. cast(size_t) point].idup ~ "." ~ digits[cast(size_t) point .. $].idup;
+    }
+    const exponent = point - 1;
+    return sign ~ digits[0 .. 1].idup ~ (n > 1 ? "." ~ digits[1 .. $].idup : "") ~ "E" ~ (exponent < 0 ? "-" : "+")
+        ~ toText(exponent < 0 ? -exponent : exponent);
+}
+
+@safe unittest
+{
+    const a = parseDecimal("-0012.5000e+3");
+    assert(a.negative && a.digits == "125" && a.point == 5);
+    const b = parseDecimal("1e-05");
+    assert(!b.negative && b.digits == "1" && b.point == -4);
+    assert(decimalText(false, "1", -4) == "0.00001" && decimalText(false, "1", 3) == "100");
+    assert(decimalText(false, "12345678901234568", 18) == "123456789012345680");
+    assert(decimalText(true, "25", -299) == "-2.5E-300" && decimalText(false, "1", 301) == "1E+300");
+    assert(decimalText(false, "123456789", 6) == "123456.789" && decimalText(false, "", 0) == "0");
+}
+
+// --- encoding ---
+
+/++
+The OSON image of a JSON text (for a JSON bind). Object members keep their
+order; a name may not repeat in an object (the server refuses that too).
+`longFieldNames`: field names may be longer than 255 bytes (up to 65535;
+Oracle Database 23ai), else such names are refused.
+
+Throws: `ClientException` if the text isn't valid JSON, an object repeats a
+name, or a field name is too long.
++/
+immutable(ubyte)[] encodeOson(string json, bool longFieldNames) @safe
+{
+    auto parser = JsonParser(json);
+    return encodeTree(parser.document(), longFieldNames);
+}
+
+/// ditto; objects get their members in name order (a `JSONValue` keeps none).
+immutable(ubyte)[] encodeOson(const JSONValue value, bool longFieldNames) @safe
+{
+    return encodeTree(fromJsonValue(value, 0), longFieldNames);
+}
+
+/++
+Checks that `json` is valid JSON text (as `encodeOson` reads it).
+
+Throws: `ClientException` if it isn't.
++/
+void checkJsonText(string json) @safe
+{
+    auto parser = JsonParser(json);
+    parser.document();
+}
+
+import std.json : JSONValue;
+
+/// A JSON value to encode.
+private struct JsonNode
+{
+    enum Kind : ubyte
+    {
+        null_,
+        true_,
+        false_,
+        string_,
+        number, // `bytes`: a NUMBER
+        binaryDouble, // `bytes`: a BINARY_DOUBLE
+        array,
+        object,
+    }
+
+    Kind kind;
+    string text; // a string's value
+    immutable(ubyte)[] bytes;
+    JsonNode[] children; // array elements, object member values
+    string[] names; // object member names
+}
+
+private enum maxDepth = 1000;
+
+private JsonNode scalarNode(JsonNode.Kind kind) @safe pure nothrow
+{
+    JsonNode n;
+    n.kind = kind;
+    return n;
+}
+
+/++
+A JSON number given as text (`-12.5e3`, valid JSON syntax): a NUMBER rounded
+to NUMBER's 20 base-100 digits, or a BINARY_DOUBLE outside NUMBER's range,
+as the server's JSON parser stores it.
++/
+private JsonNode numberNode(string text) @safe
+{
+    import oracle.types.encode : encodeBinaryDouble, encodeNumber;
+    import oracle.types.floats : parseDouble;
+
+    const parts = parseDecimal(text);
+    const negative = parts.negative;
+    auto digits = parts.digits.dup; // rounded in place below
+    long point = parts.point; // moved by the alignment and rounding below
+    JsonNode n;
+    n.kind = JsonNode.Kind.number;
+    if (digits.length == 0)
+    {
+        n.bytes = encodeNumber(0L);
+        return n;
+    }
+    // align on base-100 digits, then keep 20 of them (40 decimal digits), rounding half up
+    if (point % 2 != 0)
+    {
+        digits = "0" ~ digits;
+        point++;
+    }
+    if (digits.length > 40)
+    {
+        const roundUp = digits[40] >= '5';
+        digits = digits[0 .. 40];
+        if (roundUp)
+        {
+            size_t k = digits.length;
+            while (k > 0 && digits[k - 1] == '9')
+                digits[--k] = '0';
+            if (k == 0)
+            {
+                digits = "01" ~ digits[0 .. 38]; // 99...9 rounds to 100...0: one more base-100 digit
+                point += 2;
+            }
+            else
+                digits[k - 1]++;
+        }
+    }
+    const pairExponent = point / 2 - 1; // NUMBER's range: 100^-65 to below 100^63
+    if (pairExponent < -65 || pairExponent > 62)
+    {
+        n.kind = JsonNode.Kind.binaryDouble;
+        n.bytes = encodeBinaryDouble(parseDouble(text));
+        return n;
+    }
+    n.bytes = encodeNumber(negative, digits, cast(int) point);
+    return n;
+}
+
+private JsonNode fromJsonValue(const JSONValue v, uint depth) @safe
+{
+    import std.algorithm.sorting : sort;
+    import std.conv : to;
+    import std.json : JSONType;
+    import std.math : isFinite;
+    import oracle.types.encode : encodeBinaryDouble;
+    import oracle.types.floats : floatText;
+
+    if (depth > maxDepth)
+        throw new ClientException("JSON value nested too deeply");
+    final switch (v.type)
+    {
+    case JSONType.null_:
+        return scalarNode(JsonNode.Kind.null_);
+    case JSONType.true_:
+        return scalarNode(JsonNode.Kind.true_);
+    case JSONType.false_:
+        return scalarNode(JsonNode.Kind.false_);
+    case JSONType.string:
+        JsonNode n;
+        n.kind = JsonNode.Kind.string_;
+        n.text = v.str;
+        return n;
+    case JSONType.integer:
+        return numberNode(v.integer.to!string);
+    case JSONType.uinteger:
+        return numberNode(v.uinteger.to!string);
+    case JSONType.float_:
+        if (isFinite(v.floating))
+            return numberNode(floatText(v.floating, false));
+        JsonNode n;
+        n.kind = JsonNode.Kind.binaryDouble;
+        n.bytes = encodeBinaryDouble(v.floating);
+        return n;
+    case JSONType.array:
+        JsonNode n;
+        n.kind = JsonNode.Kind.array;
+        foreach (ref e; (()@trusted => v.array)())
+            n.children ~= fromJsonValue(e, depth + 1);
+        return n;
+    case JSONType.object:
+        JsonNode n;
+        n.kind = JsonNode.Kind.object;
+        const members = (() @trusted => v.object)();
+        auto keys = (() @trusted => members.keys)(); // @system for a const AA before frontend 2.098
+        sort(keys);
+        foreach (k; keys)
+        {
+            n.names ~= k;
+            n.children ~= fromJsonValue(members[k], depth + 1);
+        }
+        return n;
+    }
+}
+
+/// A JSON text parser (RFC 8259) building `JsonNode`s.
+private struct JsonParser
+{
+    string text;
+    size_t pos;
+
+    JsonNode document() @safe
+    {
+        skipSpace();
+        auto n = value(0);
+        skipSpace();
+        if (pos != text.length)
+            fail("unexpected text after the value");
+        return n;
+    }
+
+    JsonNode value(uint depth) @safe
+    {
+        if (depth > maxDepth)
+            fail("nested too deeply");
+        if (pos >= text.length)
+            fail("a value expected");
+        switch (text[pos])
+        {
+        case '{':
+            return object(depth);
+        case '[':
+            return array(depth);
+        case '"':
+            JsonNode n;
+            n.kind = JsonNode.Kind.string_;
+            n.text = str();
+            return n;
+        case 't':
+            literal("true");
+            return scalarNode(JsonNode.Kind.true_);
+        case 'f':
+            literal("false");
+            return scalarNode(JsonNode.Kind.false_);
+        case 'n':
+            literal("null");
+            return scalarNode(JsonNode.Kind.null_);
+        default:
+            return number();
+        }
+    }
+
+    JsonNode object(uint depth) @safe
+    {
+        JsonNode n;
+        n.kind = JsonNode.Kind.object;
+        bool[string] seen;
+        pos++; // {
+        skipSpace();
+        if (peek('}'))
+            return n;
+        for (;;)
+        {
+            skipSpace();
+            if (!peek('"', false))
+                fail("a member name expected");
+            const name = str();
+            skipSpace();
+            expect(':');
+            skipSpace();
+            if (name in seen)
+                fail("the name \"" ~ name ~ "\" repeats in an object");
+            seen[name] = true;
+            n.names ~= name;
+            n.children ~= value(depth + 1);
+            skipSpace();
+            if (peek('}'))
+                return n;
+            expect(',');
+        }
+    }
+
+    JsonNode array(uint depth) @safe
+    {
+        JsonNode n;
+        n.kind = JsonNode.Kind.array;
+        pos++; // [
+        skipSpace();
+        if (peek(']'))
+            return n;
+        for (;;)
+        {
+            skipSpace();
+            n.children ~= value(depth + 1);
+            skipSpace();
+            if (peek(']'))
+                return n;
+            expect(',');
+        }
+    }
+
+    JsonNode number() @safe
+    {
+        const start = pos;
+        if (pos < text.length && text[pos] == '-')
+            pos++;
+        if (pos < text.length && text[pos] == '0')
+            pos++;
+        else if (!digits())
+            fail("invalid value");
+        if (pos < text.length && text[pos] == '.')
+        {
+            pos++;
+            if (!digits())
+                fail("digits expected after the decimal point");
+        }
+        if (pos < text.length && (text[pos] == 'e' || text[pos] == 'E'))
+        {
+            pos++;
+            if (pos < text.length && (text[pos] == '+' || text[pos] == '-'))
+                pos++;
+            if (!digits())
+                fail("digits expected in the exponent");
+        }
+        return numberNode(text[start .. pos]);
+    }
+
+    bool digits() @safe pure nothrow
+    {
+        const start = pos;
+        while (pos < text.length && text[pos] >= '0' && text[pos] <= '9')
+            pos++;
+        return pos > start;
+    }
+
+    string str() @safe
+    {
+        import std.utf : encode;
+
+        pos++; // "
+        char[] result;
+        for (;;)
+        {
+            if (pos >= text.length)
+                fail("unterminated string");
+            const c = text[pos++];
+            if (c == '"')
+                break;
+            if (c < 0x20)
+                fail("control character in a string");
+            if (c != '\\')
+            {
+                result ~= c;
+                continue;
+            }
+            if (pos >= text.length)
+                fail("unterminated string");
+            const e = text[pos++];
+            switch (e)
+            {
+            case '"':
+            case '\\':
+            case '/':
+                result ~= e;
+                break;
+            case 'b':
+                result ~= '\b';
+                break;
+            case 'f':
+                result ~= '\f';
+                break;
+            case 'n':
+                result ~= '\n';
+                break;
+            case 'r':
+                result ~= '\r';
+                break;
+            case 't':
+                result ~= '\t';
+                break;
+            case 'u':
+                dchar u = hex4();
+                if (u >= 0xD800 && u < 0xDC00) // a surrogate pair
+                {
+                    if (pos + 2 > text.length || text[pos] != '\\' || text[pos + 1] != 'u')
+                        fail("unpaired surrogate");
+                    pos += 2;
+                    const low = hex4();
+                    if (low < 0xDC00 || low > 0xDFFF)
+                        fail("unpaired surrogate");
+                    u = 0x10000 + ((u - 0xD800) << 10) + (low - 0xDC00);
+                }
+                else if (u >= 0xDC00 && u <= 0xDFFF)
+                    fail("unpaired surrogate");
+                encode(result, u);
+                break;
+            default:
+                fail("invalid escape");
+            }
+        }
+        return (() @trusted => cast(string) result)(); // unique: built here
+    }
+
+    dchar hex4() @safe
+    {
+        if (pos + 4 > text.length)
+            fail("invalid \\u escape");
+        uint v;
+        foreach (c; text[pos .. pos + 4])
+        {
+            v <<= 4;
+            if (c >= '0' && c <= '9')
+                v |= c - '0';
+            else if (c >= 'a' && c <= 'f')
+                v |= c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F')
+                v |= c - 'A' + 10;
+            else
+                fail("invalid \\u escape");
+        }
+        pos += 4;
+        return cast(dchar) v;
+    }
+
+    void literal(string word) @safe
+    {
+        if (text.length - pos < word.length || text[pos .. pos + word.length] != word)
+            fail("invalid value");
+        pos += word.length;
+    }
+
+    bool peek(char c, bool consume = true) @safe pure nothrow
+    {
+        if (pos < text.length && text[pos] == c)
+        {
+            if (consume)
+                pos++;
+            return true;
+        }
+        return false;
+    }
+
+    void expect(char c) @safe
+    {
+        if (!peek(c))
+            fail("'" ~ c ~ "' expected");
+    }
+
+    void skipSpace() @safe pure nothrow
+    {
+        while (pos < text.length && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' || text[pos] == '\r'))
+            pos++;
+    }
+
+    void fail(string what) @safe
+    {
+        throw new ClientException("Invalid JSON text at offset " ~ toText(pos) ~ ": " ~ what);
+    }
+}
+
+/// A field name of an image: its hash (FNV-1a), and its ID once sorted.
+private struct FieldName
+{
+    string name;
+    uint hash;
+    uint id;
+    uint offset; // in its segment
+}
+
+private uint fieldNameHash(string name) @safe pure nothrow @nogc
+{
+    uint h = 0x811C_9DC5;
+    foreach (char c; name)
+        h = (h ^ cast(ubyte) c) * 16_777_619;
+    return h;
+}
+
+/// Big-endian integers into a byte buffer.
+private struct Bytes
+{
+    ubyte[] data;
+
+    void u8(uint v) @safe pure nothrow
+    {
+        data ~= cast(ubyte) v;
+    }
+
+    void u16(uint v) @safe pure nothrow
+    {
+        data ~= [cast(ubyte)(v >> 8), cast(ubyte) v];
+    }
+
+    void u32(uint v) @safe pure nothrow
+    {
+        data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+    }
+
+    void put32At(size_t at, uint v) @safe pure nothrow
+    {
+        data[at .. at + 4] = [
+            cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v
+        ];
+    }
+
+    void bytes(scope const(ubyte)[] b) @safe pure nothrow
+    {
+        data ~= b;
+    }
+}
+
+/// Header flags of an image.
+private enum : uint
+{
+    inlineLeaf = 0x02,
+    lengthInType = 0x04,
+    fieldIds32 = 0x08,
+    isScalar = 0x10,
+    hashIds8 = 0x0100,
+    fieldIds16 = 0x0400,
+    namesSegment32 = 0x0800,
+    tree32 = 0x1000,
+    tinyNodeCount = 0x2000,
+}
+
+private immutable(ubyte)[] encodeTree(const JsonNode root, bool longFieldNames) @safe
+{
+    import std.algorithm.sorting : sort;
+
+    // the field names, short (up to 255 bytes) and long ones, sorted by hash byte, length and bytes
+    uint[string] ids;
+    FieldName[] shortNames, longNames;
+    void collect(const ref JsonNode n)
+    {
+        foreach (name; n.names)
+            if (name !in ids)
+            {
+                if (name.length > (longFieldNames ? 65_535 : 255))
+                    throw new ClientException("JSON field name longer than " ~ (longFieldNames
+                            ? "65535 bytes" : "255 bytes (longer ones need Oracle Database 23ai)"));
+                ids[name] = 0;
+                (name.length > 255 ? longNames : shortNames) ~= FieldName(name, fieldNameHash(name));
+            }
+        foreach (ref c; n.children)
+            collect(c);
+    }
+
+    collect(root);
+    static bool before(const FieldName a, const FieldName b) @safe pure nothrow
+    {
+        if ((a.hash & 0xFF) != (b.hash & 0xFF))
+            return (a.hash & 0xFF) < (b.hash & 0xFF);
+        if (a.name.length != b.name.length)
+            return a.name.length < b.name.length;
+        return a.name < b.name;
+    }
+
+    sort!before(shortNames);
+    sort!before(longNames);
+    Bytes shortSegment, longSegment;
+    foreach (i, ref f; shortNames)
+    {
+        f.id = cast(uint)(i + 1);
+        ids[f.name] = f.id;
+        f.offset = cast(uint) shortSegment.data.length;
+        shortSegment.u8(cast(uint) f.name.length);
+        shortSegment.bytes(cast(const(ubyte)[]) f.name);
+    }
+    foreach (i, ref f; longNames)
+    {
+        f.id = cast(uint)(shortNames.length + i + 1);
+        ids[f.name] = f.id;
+        f.offset = cast(uint) longSegment.data.length;
+        longSegment.u16(cast(uint) f.name.length);
+        longSegment.bytes(cast(const(ubyte)[]) f.name);
+    }
+    const names = shortNames.length + longNames.length;
+    const idWidth = names > 65_535 ? 4 : names > 255 ? 2 : 1;
+
+    // the tree: containers with 32-bit child offsets from the start of the tree
+    Bytes tree;
+    void node(const ref JsonNode n)
+    {
+        final switch (n.kind)
+        {
+        case JsonNode.Kind.null_:
+            return tree.u8(0x30);
+        case JsonNode.Kind.true_:
+            return tree.u8(0x31);
+        case JsonNode.Kind.false_:
+            return tree.u8(0x32);
+        case JsonNode.Kind.string_:
+            if (n.text.length < 256)
+            {
+                tree.u8(0x33);
+                tree.u8(cast(uint) n.text.length);
+            }
+            else if (n.text.length < 65_536)
+            {
+                tree.u8(0x37);
+                tree.u16(cast(uint) n.text.length);
+            }
+            else
+            {
+                if (n.text.length > uint.max)
+                    throw new ClientException("JSON string too long");
+                tree.u8(0x38);
+                tree.u32(cast(uint) n.text.length);
+            }
+            return tree.bytes(cast(const(ubyte)[]) n.text);
+        case JsonNode.Kind.number:
+            tree.u8(0x34);
+            tree.u8(cast(uint) n.bytes.length);
+            return tree.bytes(n.bytes);
+        case JsonNode.Kind.binaryDouble:
+            tree.u8(0x36);
+            return tree.bytes(n.bytes);
+        case JsonNode.Kind.array:
+        case JsonNode.Kind.object:
+            const isObject = n.kind == JsonNode.Kind.object;
+            const count = n.children.length;
+            if (count > uint.max)
+                throw new ClientException("JSON container too big");
+            ubyte type = isObject ? 0x84 : 0xC0;
+            type |= 0x20; // 32-bit offsets
+            type |= count > 65_535 ? 0x10 : count > 255 ? 0x08 : 0;
+            tree.u8(type);
+            if (count > 65_535)
+                tree.u32(cast(uint) count);
+            else if (count > 255)
+                tree.u16(cast(uint) count);
+            else
+                tree.u8(cast(uint) count);
+            if (isObject)
+                foreach (name; n.names)
+                {
+                    const id = ids[name];
+                    if (idWidth == 1)
+                        tree.u8(id);
+                    else if (idWidth == 2)
+                        tree.u16(id);
+                    else
+                        tree.u32(id);
+                }
+            const offsets = tree.data.length;
+            tree.data.length += 4 * count;
+            foreach (i, ref c; n.children)
+            {
+                if (tree.data.length > uint.max)
+                    throw new ClientException("JSON value too big");
+                tree.put32At(offsets + 4 * i, cast(uint) tree.data.length);
+                node(c);
+            }
+            return;
+        }
+    }
+
+    node(root);
+    if (tree.data.length > uint.max)
+        throw new ClientException("JSON value too big");
+    const treeSize = cast(uint) tree.data.length;
+
+    Bytes image;
+    image.bytes([0xFF, 0x4A, 0x5A]);
+    image.u8(longNames.length ? 3 : 1);
+    const scalar = root.kind != JsonNode.Kind.array && root.kind != JsonNode.Kind.object;
+    uint flags = inlineLeaf | lengthInType | (treeSize > 65_535 ? tree32 : 0);
+    if (scalar)
+    {
+        image.u16(flags | isScalar);
+        treeSize > 65_535 ? image.u32(treeSize) : image.u16(treeSize);
+        image.bytes(tree.data);
+        return (() @trusted => cast(immutable(ubyte)[]) image.data)(); // unique: built here
+    }
+    const shortSize = shortSegment.data.length;
+    const longSize = longSegment.data.length;
+    if (shortSize > uint.max || longSize > uint.max)
+        throw new ClientException("JSON field names too big");
+    flags |= hashIds8 | tinyNodeCount | (idWidth == 4 ? fieldIds32 : idWidth == 2 ? fieldIds16
+            : 0)
+        | (shortSize > 65_535 ? namesSegment32 : 0);
+    image.u16(flags);
+    if (idWidth == 1)
+        image.u8(cast(uint) shortNames.length);
+    else if (idWidth == 2)
+        image.u16(cast(uint) shortNames.length);
+    else
+        image.u32(cast(uint) shortNames.length);
+    shortSize > 65_535 ? image.u32(cast(uint) shortSize) : image.u16(cast(uint) shortSize);
+    if (longNames.length)
+    {
+        image.u16(longSize < 65_536 ? 0x0100 : 0); // 16-bit offsets of long names
+        image.u32(cast(uint) longNames.length);
+        image.u32(cast(uint) longSize);
+    }
+    treeSize > 65_535 ? image.u32(treeSize) : image.u16(treeSize);
+    image.u16(0); // tiny nodes
+    foreach (ref f; shortNames)
+        image.u8(f.hash & 0xFF);
+    foreach (ref f; shortNames)
+        shortSize > 65_535 ? image.u32(f.offset) : image.u16(f.offset);
+    image.bytes(shortSegment.data);
+    foreach (ref f; longNames)
+        image.u16(f.hash & 0xFFFF);
+    foreach (ref f; longNames)
+        longSize < 65_536 ? image.u16(f.offset) : image.u32(f.offset);
+    image.bytes(longSegment.data);
+    image.bytes(tree.data);
+    return (() @trusted => cast(immutable(ubyte)[]) image.data)(); // unique: built here
+}
+
 private string toText(T)(T v) @safe pure
 {
     import std.conv : to;
@@ -490,4 +1288,79 @@ private string toText(T)(T v) @safe pure
     assertThrown!ProtocolException(osonToText(scalar[0 .. 10]));
     immutable ubyte[] notOson = [1, 2, 3, 4];
     assertThrown!ProtocolException(osonToText(notOson));
+}
+
+///
+@safe unittest
+{
+    import std.exception : assertThrown;
+    import std.json : parseJSON;
+
+    // round trips through the decoder
+    foreach (text; [
+        `{"a":1,"b":[true,null,"x"],"c":{"d":-12.5}}`, `[1,2]`, `"a\"b"`, `[]`, `{}`, `0`,
+        `{"z":{"z":{"z":[{"y":1E+125}]}}}`, `["\u00e9\ud83d\ude00\n"]`, `[1E-130,1E+200,123456789]`
+    ])
+    {
+        const image = encodeOson(text, false);
+        assert(isOson(image));
+        const back = osonToText(image);
+        assert(back == text || parseJSON(back) == parseJSON(text), text ~ " -> " ~ back);
+    }
+    // numbers as the server stores them: rounded to NUMBER's precision
+    assert(osonToText(encodeOson(
+            `[0.99999999999999999999999999999999999999999,12345678901234567890123456789012345678951]`,
+            false)) == `[1,1.2345678901234567890123456789012345679E+40]`);
+    assert(osonToText(encodeOson(`[-0,0.0,1E3,-1.50e-2]`, false)) == `[0,0,1000,-0.015]`);
+    assertThrown!ClientException(encodeOson(`{"a":1,"b":2,"a":3}`, false)); // a repeated name
+    assert(osonToText(encodeOson(`[{"a":1},{"a":2}]`, false)) == `[{"a":1},{"a":2}]`);
+    // a std.json value: members in name order
+    assert(osonToText(encodeOson(parseJSON(`{"b":[1.5,-2,"s"],"a":null}`), false)) == `{"a":null,"b":[1.5,-2,"s"]}`);
+    // a scalar image: FF 4A 5A, version 1, flags (scalar), tree size, the node
+    assert(encodeOson(`"ab"`, false) == [
+        0xFF, 0x4A, 0x5A, 0x01, 0x00, 0x16, 0x00, 0x04, 0x33, 0x02, 'a', 'b'
+    ]);
+    // an object: one short field name with its FNV-1a hash byte
+    assert(encodeOson(`{"a":true}`, false) == [
+        0xFF, 0x4A, 0x5A, 0x01, 0x21, 0x06, 0x01, 0x00, 0x02, 0x00, 0x08,
+        0x00, 0x00, 0x2C, 0x00, 0x00, 0x01, 'a', 0xA4, 0x01, 0x01, 0x00, 0x00, 0x00, 0x07, 0x31
+    ]);
+    foreach (bad; [
+        ``, `{`, `[1,]`, `{"a" 1}`, `01`, `1.`, `"\x"`, `tru`, `[1] 2`, `"\ud800"`, "\"a\nb\""
+    ])
+        assertThrown!ClientException(encodeOson(bad, false), bad);
+    // names over 255 bytes: version 3 with a long-name segment, only when allowed
+    import std.array : replicate;
+
+    const longName = "n".replicate(300);
+    assertThrown!ClientException(encodeOson(`{"` ~ longName ~ `":1}`, false));
+    const image = encodeOson(`{"` ~ longName ~ `":1,"s":2}`, true);
+    assert(image[3] == 3 && osonToText(image) == `{"` ~ longName ~ `":1,"s":2}`);
+    // many names and a big tree: 16-bit field IDs, 32-bit sizes
+    string many = "{";
+    foreach (i; 0 .. 3000)
+        many ~= (i ? "," : "") ~ `"field` ~ toText(i) ~ `":"` ~ "v".replicate(30) ~ `"`;
+    many ~= "}";
+    assert(parseJSON(osonToText(encodeOson(many, false))) == parseJSON(many));
+}
+
+@safe unittest
+{
+    // INTERVAL YEAR TO MONTH nodes, as 23ai sends them
+    immutable ubyte[] ym = [
+        0xFF, 0x4A, 0x5A, 0x01, 0x00, 0x16, 0x00, 0x06, 0x3D, 0x80, 0x00, 0x00, 0x01, 0x3E
+    ];
+    assert(osonToText(ym) == `"P1Y2M"`);
+    immutable ubyte[] negative = [
+        0xFF, 0x4A, 0x5A, 0x01, 0x00, 0x16, 0x00, 0x06, 0x3D, 0x7F, 0xFF, 0xFF, 0xFD, 0x31
+    ];
+    assert(osonToText(negative) == `"-P3Y11M"`);
+    immutable ubyte[] zero = [
+        0xFF, 0x4A, 0x5A, 0x01, 0x00, 0x16, 0x00, 0x06, 0x3D, 0x80, 0x00, 0x00, 0x00, 0x3C
+    ];
+    assert(osonToText(zero) == `"P0Y"`);
+    immutable ubyte[] months = [
+        0xFF, 0x4A, 0x5A, 0x01, 0x00, 0x16, 0x00, 0x06, 0x3D, 0x80, 0x00, 0x00, 0x00, 0x39
+    ];
+    assert(osonToText(months) == `"-P3M"`);
 }

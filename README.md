@@ -110,8 +110,12 @@ D values are sent as: integers and `Decimal` → `NUMBER`; `bool` → `BOOLEAN`
 `BINARY_DOUBLE`; strings → `VARCHAR2`; `ubyte[]`, `UUID` → `RAW`; `Date`,
 `DateTime` → `DATE`; `SysTime` → `TIMESTAMP WITH TIME ZONE`; `Duration`,
 `MonthInterval` → intervals; `Vector`, `float[]`, `double[]` → `VECTOR`
-(23ai); `null` and `Nullable` → NULL. JSON is sent as text (a string, or a
-temporary CLOB for long documents): the server parses it.
+(23ai); `JSONValue` and `Parameter.json(text)` → `JSON`; `null` and
+`Nullable` → NULL. JSON parameters go in Oracle's binary format (OSON, built
+by the client: the server doesn't parse text) to JSON columns and PL/SQL
+`JSON` parameters, also as OUT parameters and `RETURNING ... INTO` targets
+(`Parameter.output!JSONValue`); numbers in JSON text stay exact. Servers
+before 21c get the text.
 Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
 another thread or task) stops a running call with ORA-01013.

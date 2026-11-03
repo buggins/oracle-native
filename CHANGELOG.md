@@ -39,6 +39,15 @@ All notable changes to oracle-native are documented here. The format follows
   the session back to the database's pool when a connection is returned
   (`Connection.releaseSession`), with a connection class of its own and
   purity `self`; closing a DRCP connection ends its session without a logoff.
+- JSON parameters (#24): `std.json.JSONValue` values and JSON text
+  (`Parameter.json`) are sent as JSON, encoded by the client in Oracle's
+  binary format (OSON), so the server doesn't parse text: for JSON columns,
+  PL/SQL `JSON` parameters (IN, OUT, IN OUT) and `RETURNING ... INTO`
+  (`Parameter.output!JSONValue`). Numbers in JSON text are kept exactly
+  (rounded to NUMBER's precision, or BINARY_DOUBLE outside its range, as the
+  server's parser does); field names longer than 255 bytes need 23ai. Servers
+  before 21c get the text. `Variant` parameters take `JSONValue` too.
+- `INTERVAL YEAR TO MONTH` values inside JSON are decoded (`P1Y2M`).
 
 ### Fixed
 
@@ -48,6 +57,13 @@ All notable changes to oracle-native are documented here. The format follows
 - A statement parsed again while its SQL was cached and in use (an open
   result of the same SQL) kept its cursor open on the server after its result
   was done; it is closed now.
+- Running a PL/SQL block with OUT parameters a second time on a connection
+  (a re-execution of its cached cursor) failed with ORA-03146 and the server
+  closed the connection: the client sent values for the OUT parameters and
+  didn't know their directions without the server's IO vector.
+- `BINARY_FLOAT` and `BINARY_DOUBLE` values inside JSON read as
+  `JSON_SERIALIZE` writes them (`0.00001`, `100`, `1E+300`), not as
+  `1e-05`, `1e+02`, `1e+300`.
 
 ## 0.2.0 — 2026-11-03
 
