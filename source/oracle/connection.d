@@ -103,8 +103,8 @@ final class Connection : Poolable
 
     /++
     Connects with a connection string: a URL (`oracle://...`), Easy Connect
-    (`host:port/service`) or a connect descriptor (`(DESCRIPTION=...)`); see
-    `ConnectionOptions.parse`.
+    (`host:port/service`), a connect descriptor (`(DESCRIPTION=...)`) or a
+    connect alias from `tnsnames.ora`; see `ConnectionOptions.parse`.
     +/
     this(string connectString) @safe
     {

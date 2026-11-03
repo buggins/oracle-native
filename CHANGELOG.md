@@ -12,6 +12,12 @@ All notable changes to oracle-native are documented here. The format follows
   `proxy_client`), or the user name written `proxy[target]`: the proxy user
   logs in with its own password to a session of the target user, who must
   allow it (`ALTER USER target GRANT CONNECT THROUGH proxy`).
+- `tnsnames.ora` connect aliases (#22): `ConnectionOptions.parse` (and so
+  `new Connection(alias, user, password)` and pools) resolves a name such as
+  `SALES` through `tnsnames.ora` in `config_dir` (new option `configDir`),
+  `$TNS_ADMIN` or `$ORACLE_HOME/network/admin`, with several names per
+  entry, comments and `IFILE` includes; parameters may follow the alias
+  (`SALES?config_dir=/etc/oracle`).
 
 ## 0.2.0 — 2026-11-03
 

@@ -25,7 +25,8 @@ import std.stdio;
 void main()
 {
     auto conn = new Connection("oracle://scott:tiger@localhost:1521/FREEPDB1");
-    // or: new Connection("localhost:1521/FREEPDB1", "scott", "tiger"), or a (DESCRIPTION=...) descriptor
+    // or: new Connection("localhost:1521/FREEPDB1", "scott", "tiger"), a (DESCRIPTION=...) descriptor,
+    // or a tnsnames.ora alias: new Connection("SALES", "scott", "tiger") ($TNS_ADMIN or ?config_dir=...)
     scope (exit)
         conn.close();
     conn.exec("CREATE TABLE notes (id NUMBER, text VARCHAR2(100))");
@@ -42,7 +43,8 @@ Features:
 - password logins (11g and 12c verifiers), proxy authentication
   (`app_user[end_user]` or `proxy_client=end_user`), TLS (TCPS) with
   certificate and host name verification;
-- `oracle://` URLs, Easy Connect strings and connect descriptors; failover
+- `oracle://` URLs, Easy Connect strings, connect descriptors and
+  `tnsnames.ora` aliases; failover
   over several addresses;
 - bind variables (`:1`, `:name`, or `?`), a statement cache, array DML with
   batch errors, `RETURNING INTO`, PL/SQL with OUT parameters, REF cursors,
@@ -57,7 +59,7 @@ Features:
 - a connection pool for threads and vibe.d fibers, and struct mapping; a
   [ddbc](https://github.com/buggins/ddbc) driver (configuration `ORACLE`).
 
-Later: `tnsnames.ora` aliases and wallets, proxy authentication, pipelining,
+Later: wallets, pipelining, DRCP
 and a [hibernated](https://github.com/buggins/hibernated) dialect.
 Native Network Encryption (Oracle's own encryption, an alternative to TLS) is
 not supported: servers that require it are refused with a clear error.

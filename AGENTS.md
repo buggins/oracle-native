@@ -77,6 +77,7 @@ source/oracle/
                        exec/query/commit/rollback/ping/close, response reading, deferred cursor closing
   result.d             QueryResult (input range, fetches in batches), Row (typed getters)
   settings.d           ConnectionOptions; URL, Easy Connect and descriptor parsing (DescriptorNode)
+  tnsnames.d           tnsnames.ora: finding (config_dir, TNS_ADMIN, ORACLE_HOME), parsing, IFILE
   statement.d          statement classification by first keyword
   exception.d          ServerException (ORA code, message, position) + dbwire's exceptions
   protocol/            tns.d (packets, TnsStream), ttc.d (ub*/CLR), negotiate.d (protocol and data-type messages,
