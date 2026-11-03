@@ -14,14 +14,18 @@ import std.typecons : Rebindable;
 import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 import dbwire.types.interval : MonthInterval;
-import oracle.connection : Connection;
+import oracle.connection : CachedStatement, Connection;
+import oracle.params : BindDirection, Parameter;
+public import oracle.protocol.messages : BatchError;
 import oracle.exception : ClientException;
 import oracle.types.typeinfo : ColumnInfo, OracleType;
 import oracle.value : Value;
 
 /++
-The rows of a query. Iterate with `foreach`; the connection stays busy until
-all rows are read or `close` is called.
+The result of a statement: the rows of a query (an input range: iterate with
+`foreach`; the connection stays busy until all rows are read or `close` is
+called), and for other statements their row count, OUT values and implicit
+results.
 +/
 final class QueryResult
 {
@@ -33,16 +37,102 @@ final class QueryResult
     private size_t index;
     package bool allFetched; // the server reported the end of the rows
     private bool finished; // the connection is released
+    package bool isQuery, isPlsql;
+    package CachedStatement statement; // the cache entry whose cursor this is (keepCursor)
+    package bool keepCursor; // the cursor stays open for the statement cache
+    package bool child; // an implicit result or REF cursor, not fetching yet
+    package bool needsExecuteFetch; // a child's first fetch is an EXECUTE with the fetch option
+    package const(Parameter)[] binds; // the binds, in bind order
+    package string[] bindNames; // their placeholder names
+    package bool[] returning; // which are RETURNING INTO targets
+    package immutable(ubyte)[] directions; // from the IO vector: BindDirection per bind
+    package immutable(ubyte)[][][] outputData; // OUT values per bind (several rows for RETURNING)
+    package QueryResult[] outputCursors; // REF cursors returned by OUT binds
+    package bool dmlRowCounts; // row counts per execution were asked for
+    package ulong[] rowCounts;
+    package QueryResult[] implicit;
+    package ulong rowCount_;
 
     package this(Connection conn) @safe pure nothrow
     {
         this.conn = conn;
     }
 
-    /// The result columns.
+    /// The result columns (none for statements other than queries).
     @property const(ColumnInfo)[] columns() const @safe pure nothrow
     {
         return columnInfo;
+    }
+
+    /// The number of rows the statement changed (DML; 0 for queries).
+    @property ulong rowCount() const @safe pure nothrow
+    {
+        return rowCount_;
+    }
+
+    package @property void rowCount(ulong n) @safe pure nothrow
+    {
+        rowCount_ = n;
+    }
+
+    /++
+    The values of the statement's OUT and IN OUT parameters and of its
+    `RETURNING ... INTO` targets, in placeholder order.
+    +/
+    @property Output[] outputs() @safe
+    {
+        Output[] result;
+        foreach (i, ref b; binds)
+        {
+            if (!isOutputBind(i))
+                continue;
+            Output o;
+            o.name = bindNames[i];
+            const column = Connection.bindColumn(b, o.name);
+            if (i < outputData.length)
+                foreach (bytes; outputData[i])
+                    o.values ~= Value(column, bytes, conn.sessionZone, conn.databaseZone);
+            if (i < outputCursors.length)
+                o.cursor = outputCursors[i];
+            result ~= o;
+        }
+        return result;
+    }
+
+    /++
+    The value of the OUT parameter or `RETURNING` target `name` (with or
+    without its colon; case-insensitive), or at position `index` of `outputs`.
+
+    Throws: `ClientException` if there is no such output.
+    +/
+    Value output(string name) @safe
+    {
+        import std.uni : icmp;
+
+        const bare = name.length && name[0] == ':' ? name[1 .. $] : name;
+        foreach (o; outputs)
+            if (icmp(o.name, bare) == 0)
+                return o.value;
+        throw new ClientException("No output parameter :" ~ bare);
+    }
+
+    /// ditto
+    Value output(size_t index) @safe
+    {
+        auto all = outputs;
+        if (index >= all.length)
+            throw new ClientException("No output parameter " ~ toText(index));
+        return all[index].value;
+    }
+
+    /++
+    The implicit results of a PL/SQL block (`DBMS_SQL.RETURN_RESULT`), in
+    order. Each holds the connection while its rows are read, like a query's
+    result; read them one after the other.
+    +/
+    @property QueryResult[] implicitResults() @safe pure nothrow
+    {
+        return implicit;
     }
 
     /++
@@ -63,6 +153,8 @@ final class QueryResult
     /// Whether all rows have been read. Fetches the next batch from the server when needed.
     @property bool empty() @safe
     {
+        if (child && !finished && !allFetched && batch.length == 0 && index == 0 && needsExecuteFetch)
+            conn.beginChild();
         while (index >= batch.length)
         {
             if (allFetched || finished)
@@ -101,12 +193,51 @@ final class QueryResult
 
     /++
     Releases the connection. Unread rows are dropped; the server cursor is
-    closed with the next call. Calling it again does nothing.
+    closed with the next call (or kept for the statement cache). Calling it
+    again does nothing.
     +/
     void close() @safe
     {
-        batch = null;
+        index = batch.length;
+        allFetched = true;
         finish();
+    }
+
+    /// Releases the connection while keeping the rows (all of them are here).
+    package void release() @safe
+    {
+        finish();
+    }
+
+    /// Whether bind `i` returns a value: OUT, IN OUT, or a RETURNING target.
+    private bool isOutputBind(size_t i) const @safe pure nothrow
+    {
+        if (i < returning.length && returning[i])
+            return true;
+        if (binds[i].direction != BindDirection.input)
+            return true;
+        return i < directions.length && (directions[i] & BindDirection.output) != 0;
+    }
+
+    /// Whether ROW_DATA messages carry OUT values rather than rows.
+    package @property bool hasOutputs() const @safe pure nothrow
+    {
+        import std.algorithm.searching : canFind;
+
+        return !isQuery && (isPlsql || returning.canFind(true));
+    }
+
+    /// Forgets what a failed attempt read (before executing the statement again).
+    package void reset() @safe pure nothrow
+    {
+        batch = null;
+        lastRow = null;
+        index = 0;
+        directions = null;
+        outputData = null;
+        outputCursors = null;
+        implicit = null;
+        rowCounts = null;
     }
 
     private void finish() @safe
@@ -114,8 +245,41 @@ final class QueryResult
         if (finished)
             return;
         finished = true;
-        conn.release(cursorId);
+        if (child && needsExecuteFetch)
+        {
+            conn.closeChild(cursorId); // never fetched: just close its cursor
+            return;
+        }
+        conn.release(this);
     }
+}
+
+/// An OUT parameter or `RETURNING ... INTO` target and its value(s).
+struct Output
+{
+    /// The placeholder's name (upper case unless quoted; `1` for `:1`).
+    string name;
+    /// The values: one for an OUT parameter, one per changed row for `RETURNING ... INTO`.
+    Value[] values;
+    /// A REF cursor returned by the parameter (`SYS_REFCURSOR` OUT parameters), or null.
+    QueryResult cursor;
+
+    /// The first value (a NULL `Value` if there is none).
+    @property Value value() const @safe
+    {
+        return values.length ? values[0] : Value.init;
+    }
+}
+
+/// The outcome of array DML (`Connection.execMany`).
+struct BatchResult
+{
+    /// The row count of each execution (each row of the batch), when the server reports them.
+    ulong[] rowCounts;
+    /// The total number of rows changed.
+    ulong rowCount;
+    /// The rows that failed, with batch errors.
+    BatchError[] errors;
 }
 
 /++

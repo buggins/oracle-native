@@ -16,6 +16,7 @@ import oracle.protocol.ttc : TtcReader, TtcWriter;
 enum FunctionCode : ubyte
 {
     reexecute = 4, /// re-execute a parsed cursor
+    reexecuteAndFetch = 78, /// re-execute a parsed query and fetch
     fetch = 5, /// fetch rows
     logoff = 9, /// log off
     commit = 14, /// commit
@@ -86,6 +87,19 @@ struct ErrorInfo
     ulong rowCount;
     /// The error text (`ORA-nnnnn: ...`).
     string message;
+    /// The errors of single executions of array DML with batch errors.
+    BatchError[] batchErrors;
+}
+
+/// The error of one execution of array DML with batch errors.
+struct BatchError
+{
+    /// The execution (row) it happened in, from 0.
+    uint offset;
+    /// The ORA error number.
+    uint code;
+    /// The error text.
+    string message;
 }
 
 /++
@@ -116,24 +130,30 @@ ErrorInfo readErrorInfo(ref TtcReader r, ubyte serverFieldVersion) @safe
     r.ub2(); // padding
     r.ub4(); // successful iterations
     r.bytesWithLength(); // logical rowid
-    // batch errors: codes, offsets, messages
+    // batch errors: codes, offsets, messages (array DML with the batch errors option)
     const codes = r.ub2();
+    uint[] codeList;
     if (codes)
-        skipArray(r, codes, 2);
+        codeList = readArray(r, codes, 2);
     const offsets = r.ub4();
+    uint[] offsetList;
     if (offsets)
-        skipArray(r, offsets, 4);
+        offsetList = readArray(r, offsets, 4);
     const messages = r.ub2();
+    string[] messageList;
     if (messages)
     {
-        r.u8();
+        r.u8(); // packed size
         foreach (_; 0 .. messages)
         {
-            r.ub2();
-            r.clr();
-            r.skip(2);
+            r.ub2(); // chunk length
+            messageList ~= cast(string) r.clr();
+            r.skip(2); // end marker
         }
     }
+    foreach (i, code; codeList)
+        e.batchErrors ~= BatchError(i < offsetList.length ? offsetList[i] : 0, code,
+                i < messageList.length ? stripNewline(messageList[i]) : null);
     e.number = r.ub4();
     if (e.number == 0)
         e.number = shortNumber;
@@ -158,17 +178,32 @@ void skipRowid(ref TtcReader r) @safe
     r.ub2(); // slot
 }
 
-/// An array of batch error codes or offsets: a marker byte (254: each element has a ub4 prefix), elements, an end byte.
-private void skipArray(ref TtcReader r, size_t count, size_t width) @safe
+/++
+An array of batch error codes or offsets: a first byte (254: each element has
+a ub4 prefix, and an end byte follows), then the elements.
++/
+private uint[] readArray(ref TtcReader r, size_t count, size_t width) @safe
 {
-    const marker = r.u8();
-    foreach (_; 0 .. count)
+    if (count > 1_000_000)
+        throw new ProtocolException("Invalid batch error count");
+    const first = r.u8();
+    auto values = new uint[count];
+    foreach (ref v; values)
     {
-        if (marker == 254)
+        if (first == 254)
             r.ub4();
-        r.ub(width);
+        v = cast(uint) r.ub(width);
     }
-    r.u8();
+    if (first == 254)
+        r.u8();
+    return values;
+}
+
+private string stripNewline(string s) @safe pure nothrow
+{
+    while (s.length && (s[$ - 1] == '\n' || s[$ - 1] == '\0'))
+        s = s[0 .. $ - 1];
+    return s;
 }
 
 /// Reads a WARNING message (after its type byte).

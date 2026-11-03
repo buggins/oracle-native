@@ -15,7 +15,8 @@ module oracle;
 
 public import oracle.connection : Connection;
 public import oracle.exception;
-public import oracle.result : QueryResult, Row;
+public import oracle.params : BindDirection, Parameter;
+public import oracle.result : BatchError, BatchResult, Output, QueryResult, Row;
 public import oracle.settings : ConnectionOptions, HostPort, HostSelection;
 public import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
 public import oracle.value : Value;

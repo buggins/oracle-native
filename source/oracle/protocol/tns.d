@@ -431,7 +431,7 @@ final class TnsStream : Transport
                     return;
                 break;
             case PacketType.marker:
-                reset();
+                reset(p.bytes.length >= 11 ? p.bytes[10] : 0);
                 break;
             case PacketType.control:
                 control(p.bytes);
@@ -442,15 +442,19 @@ final class TnsStream : Transport
         }
     }
 
-    /// The reset handshake after a break: send RESET, skip until the server's RESET, skip further markers.
-    private void reset() @safe
+    /++
+    The reset handshake after a marker from the server: send RESET and, unless
+    the marker was the server's RESET already (as after a cancel), skip until
+    it comes (a BREAK is followed by a RESET).
+    +/
+    private void reset(ubyte markerType) @safe
     {
         sendMarker(MarkerType.reset);
-        for (;;)
+        while (markerType != MarkerType.reset)
         {
             const p = readPacket();
-            if (p.type == PacketType.marker && p.bytes.length >= 11 && p.bytes[10] == MarkerType.reset)
-                break;
+            if (p.type == PacketType.marker && p.bytes.length >= 11)
+                markerType = p.bytes[10];
         }
         breakPending = true;
         payload = null;

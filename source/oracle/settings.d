@@ -81,6 +81,12 @@ struct ConnectionOptions
     bool autoCommit;
     /// Rows fetched per round trip (also returned with a query's execution).
     uint fetchSize = 100;
+    /++
+    Parsed statements kept per connection (with their server cursors), to run
+    them again without parsing; 0 turns the cache off. DDL statements are
+    never kept.
+    +/
+    uint statementCacheSize = 20;
     /// Largest value (string, binary) accepted from the server, in bytes.
     size_t maxValueLength = 1024 * 1024 * 1024;
 
@@ -306,7 +312,7 @@ struct ConnectionOptions
     `user`, `password`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
     `tls_cert_file`, `tls_key_file`, `tls_server_name`, `tls_skip_verify`,
     `program`, `machine`, `osuser`, `terminal`, `time_zone`, `sdu`,
-    `auto_commit` (flag), `fetch_size`,
+    `auto_commit` (flag), `fetch_size`, `statement_cache_size`,
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
     `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`).
@@ -396,6 +402,12 @@ struct ConnectionOptions
                 break;
             case "sdu":
                 o.sdu = parseSdu(value);
+                break;
+            case "statement_cache_size":
+                try
+                    o.statementCacheSize = value.to!uint;
+                catch (ConvException)
+                    throw new ClientException("Invalid statement cache size '" ~ value ~ "'");
                 break;
             case "auto_commit":
             case "autocommit":
