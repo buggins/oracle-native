@@ -79,5 +79,8 @@ string floatText(double v, bool single) @safe
     assert(floatText(0.1, false) == "0.1" && floatText(cast(float) 0.1f, true) == "0.1");
     assert(floatText(-2.25, false) == "-2.25" && floatText(1e300, false) == "1e+300");
     assert(floatText(-double.infinity, false) == "-Inf");
-    assert(floatText(double.max, false) == "1.7976931348623157e+308" && floatText(float.max, true) == "3.4028235e+38");
+    // the largest values read back exactly (older Phobos versions need one more digit than newer ones)
+    import std.conv : to;
+
+    assert(floatText(double.max, false).to!double == double.max && floatText(float.max, true).to!float == float.max);
 }
