@@ -18,6 +18,14 @@ All notable changes to oracle-native are documented here. The format follows
   `$TNS_ADMIN` or `$ORACLE_HOME/network/admin`, with several names per
   entry, comments and `IFILE` includes; parameters may follow the alias
   (`SALES?config_dir=/etc/oracle`).
+- Wallets and server certificate subjects (#22): `walletLocation`
+  (`wallet_location`, `MY_WALLET_DIRECTORY` in descriptors) reads an Oracle
+  wallet in PEM form (`ewallet.pem`): its certificates are the trusted CAs,
+  and its private key (password `walletPassword` / `wallet_password`) and
+  certificate are used for mutual TLS. `serverCertDn` (`ssl_server_cert_dn`,
+  `SSL_SERVER_CERT_DN`) checks the server certificate's subject instead of
+  the host name; `ssl_server_dn_match=off` / `SSL_SERVER_DN_MATCH=off` checks
+  only the certificate chain. Needs dbwire 0.6.
 
 ## 0.2.0 — 2026-11-03
 

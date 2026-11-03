@@ -35,7 +35,7 @@ import oracle.protocol.ttc : TtcReader, TtcWriter;
 import oracle.lob : Lob, LobOperation, LobRequest, LobResponse, buildLobOperation;
 import oracle.mapping : RowRange, columnNames, fieldParameters, fieldPositions, quoteIdentifier, readStruct, readValue;
 import oracle.result : BatchResult, QueryResult;
-import oracle.settings : ConnectionOptions, HostPort;
+import oracle.settings : ConnectionOptions, HostPort, sameDistinguishedName;
 import oracle.params : BindDirection, Parameter, Placeholders, findPlaceholders, maxBindBytes, parameters,
     rewritePlaceholders;
 import oracle.statement : StatementKind, classify;
@@ -1429,8 +1429,20 @@ final class Connection : Poolable
         raw.setTimeouts(options.connectTimeout, options.connectTimeout);
         if (!options.secure)
             return raw;
-        return new TlsTransport(raw, backend, TlsContext.client(options.tls), endpoint.host, options.tls,
+        const tls = options.effectiveTls();
+        auto secure = new TlsTransport(raw, backend, TlsContext.client(tls), endpoint.host, tls,
                 options.connectTimeout);
+        if (options.serverCertDn.length && !tls.skipVerify)
+        {
+            const subject = secure.peerSubject;
+            if (!sameDistinguishedName(subject, options.serverCertDn))
+            {
+                secure.close();
+                throw new ConnectionException("The server certificate's subject '" ~ subject
+                        ~ "' is not the expected '" ~ options.serverCertDn ~ "' (SSL_SERVER_CERT_DN)");
+            }
+        }
+        return secure;
     }
 
     private void connectTo(HostPort endpoint) @safe

@@ -42,6 +42,7 @@ immutable TestCase[] allTests = [
     TestCase("small SDU and long statements", &testSdu, true),
     TestCase("receive timeout closes the connection", &testReceiveTimeout, true),
     TestCase("TLS (TCPS)", &testTls, true),
+    TestCase("mutual TLS with a wallet", &testMutualTls, true),
     TestCase("NUMBER values", &testNumbers, true),
     TestCase("VARCHAR2, CHAR and Unicode text", &testStrings, true),
     TestCase("NULL values and ROWIDs", &testNullsAndRowids, true),
