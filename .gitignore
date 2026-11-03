@@ -30,3 +30,7 @@ dub.selections.json
 
 # Test executables
 /oracle-native-test-*
+/integration-tests-*/oracle-native_integration-tests-*
+/integration-tests-*/integration-tests-*
+/examples/*/oracle-native_example-*
+/examples/*/example-*

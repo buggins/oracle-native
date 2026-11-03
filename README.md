@@ -7,6 +7,27 @@ build time.
 
 > **Status: under development.** Nothing is released yet; the plan is tracked
 > in the [roadmap issue](https://github.com/buggins/oracle-native/issues/10).
+> It connects (TCP or TLS, password logins), runs statements and reads `NUMBER`
+> and character columns; the other types, bind variables and the rest come in
+> the next milestones.
+
+```d
+import oracle;
+import std.stdio;
+
+void main()
+{
+    auto conn = new Connection("oracle://scott:tiger@localhost:1521/FREEPDB1");
+    // or: new Connection("localhost:1521/FREEPDB1", "scott", "tiger"), or a (DESCRIPTION=...) descriptor
+    scope (exit)
+        conn.close();
+    conn.exec("CREATE TABLE notes (id NUMBER, text VARCHAR2(100))");
+    conn.exec("INSERT INTO notes VALUES (1, 'first')");
+    conn.commit(); // transactions are explicit (or set auto_commit=true)
+    foreach (row; conn.query("SELECT id, text FROM notes ORDER BY id"))
+        writeln(row.getLong(0), " ", row.getString(1));
+}
+```
 
 Planned for the first release (0.1.0):
 
@@ -38,6 +59,20 @@ and fibers, TLS with OpenSSL loaded at run time, cryptography for the password
 exchange, exact decimals, connection pools.
 
 Requires a D frontend 2.097 or newer (DMD 2.097+, LDC 1.27+).
+
+Without TLS, only the password exchange is encrypted: the rest of the session
+(statements and data) travels in clear. Use TLS (`tcps://` or `secure=true`)
+on untrusted networks.
+
+## Tests
+
+```sh
+dub test                                   # unit tests, no server needed
+docker run -d --name oracle-free -p 1521:1521 -e ORACLE_PASSWORD=Oracle_test123 \
+    -e APP_USER=testuser -e APP_USER_PASSWORD=Test_password123 gvenzl/oracle-free:23-slim-faststart
+ORACLE_HOST=localhost:1521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 \
+    dub run :integration-tests-phobos      # or :integration-tests-vibe for vibe.d fibers
+```
 
 ## Disclaimer
 

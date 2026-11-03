@@ -11,6 +11,11 @@
     "toolchainRequirements": {
         "frontend": ">=2.097"
     },
+    "subPackages": [
+        "./integration-tests",
+        "./integration-tests-phobos",
+        "./integration-tests-vibe"
+    ],
     "dependencies": {
         "dbwire:types": "~>0.5.0",
         "dbwire:io": "~>0.5.0",

@@ -48,14 +48,59 @@ dub test                                                   # unit tests
 dub run dscanner@0.15.2 -- --styleCheck .                  # lint (CI fails on any warning)
 dub run dfmt@0.15.2 -- --inplace $(git ls-files '*.d')     # format (CI fails if this changes files)
 dub build -b docs                                          # docs into /docs/ (git-ignored)
+dub run :integration-tests-phobos                          # integration tests, threads
+dub run :integration-tests-vibe                            # the same tests in vibe.d tasks
+ORACLE_HOST=localhost:11521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 dub run :integration-tests-phobos
+sh integration-tests/tls/start-proxy.sh 127.0.0.1:11521 12484   # TLS proxy as a TCPS stand-in, then add:
+ORACLE_TLS_HOST=127.0.0.1:12484 ORACLE_TLS_CA=$PWD/integration-tests/tls/ca.pem
 ```
+
+Integration tests: a `void function()` that throws on failure in an `integrationtests.*` module, listed in `allTests` (`integration-tests/source/integrationtests/harness.d`); mode-specific ones in `threadTests` (`integration-tests-phobos/source/threadtests.d`) and `vibeTests` (`integration-tests-vibe/source/vibetests.d`). Server tests use `connectToServer()` and `scalar()` from `integrationtests.server`.
 
 Run lint and format before committing D code. dfmt 0.15.2 mangles lambdas with attributes (`() nothrow {` → `() nothrow{`): use named nested functions. It merges `@safe return` into `@safereturn`: avoid the `return` attribute. Run dfmt twice when it changes files. `dub.selections.json` files are git-ignored (a root one listing vibe-core would enable vibe support silently).
 
 ## Local environment
 
 - WSL2 Linux. **LDC 1.36.0** (`ldc2`); DMD is not installed. Test the minimum frontend with LDC 1.27.1 (download `https://github.com/ldc-developers/ldc/releases/download/v1.27.1/ldc2-1.27.1-linux-x86_64.tar.xz` into the scratchpad, run dub with `--compiler=<path>/bin/ldc2`).
-- Oracle in Docker: container `oracle-free` (`gvenzl/oracle-free:23`, 23ai Free) on port **11521**, service `FREEPDB1`; `SYSTEM` password `Oracle_test123`, application user `testuser` / `Test_password123`. `sqlplus` is inside the container: `docker exec -it oracle-free sqlplus testuser/Test_password123@FREEPDB1`. 21c/18c: `gvenzl/oracle-xe:21` / `:18` (service `XEPDB1`).
+- Oracle in Docker: container `oracle-free` (`gvenzl/oracle-free:23`, 23ai Free) on port **11521**, service `FREEPDB1`; `SYSTEM` password `Oracle_test123`, application user `testuser` / `Test_password123`. `sqlplus` is inside the container: `docker exec -it oracle-free sqlplus testuser/Test_password123@FREEPDB1`.
+- 21c and 18c: containers `oracle-xe21` (port **11522**) and `oracle-xe18` (port **11523**), images `gvenzl/oracle-xe:21-slim-faststart` / `:18-slim-faststart`, service `XEPDB1`, same users. Each needs about 2 GB of memory: run one besides `oracle-free` at a time (`docker start`/`docker stop`).
+- The local `grep` is ugrep, which treats files with odd bytes as binary and prints nothing: use `grep -a` on wire dumps.
+
+## Layout
+
+```
+source/oracle/
+  package.d            public imports, version constants, oracleHasVibe
+  connection.d         Connection: listener handshake (REDIRECT, RESEND, REFUSE), TLS, negotiation, O5LOGON,
+                       exec/query/commit/rollback/ping/close, response reading, deferred cursor closing
+  result.d             QueryResult (input range, fetches in batches), Row (typed getters)
+  settings.d           ConnectionOptions; URL, Easy Connect and descriptor parsing (DescriptorNode)
+  statement.d          statement classification by first keyword
+  exception.d          ServerException (ORA code, message, position) + dbwire's exceptions
+  protocol/            tns.d (packets, TnsStream), ttc.d (ub*/CLR), negotiate.d (protocol and data-type messages,
+                       capabilities, the generated type table), auth.d (O5LOGON), messages.d (function header,
+                       key/value pairs, ERROR), execute.d (EXECUTE/FETCH, describe info, rows, piggybacks)
+  types/               typeinfo.d (OracleType, ColumnInfo), number.d (NUMBER), rowid.d
+integration-tests/     shared harness (dub subpackage `:integration-tests`); tls/ has the test CA, server certificate
+                       and the TLS proxy script
+integration-tests-phobos/, integration-tests-vibe/   runners
+```
+
+## Protocol behaviour learned from real servers
+
+Checked on 26ai Free (23.26), 21c XE and 18c XE.
+
+- **Versions:** the client offers TNS 318 (no END_OF_RESPONSE, no fast auth: a response ends after its ERROR or STATUS message) and TTC field version **13** (19.1 ext1). The negotiated field version is min(client, server); 26ai's is 27, 21c's 16, 18c's 11. Raising the client's means implementing every gated field in between (describe information has 23.1 fields from 17; the function header gets a token number from 18). `readDescribeInfo` refuses field versions ≥ 23.1 until then.
+- **Data-type negotiation:** the server needs its internal TTC types listed, or it closes the connection at the first call (its trace says "Network protocol error on first data after new connect", ORA-28546). `negotiate.d` lists every type 26ai accepts with an identity conversion (generated from its answer to a request for types 1–1023), plus NUMBER and DATE (and their aliases) in representation 10, and **type 27 in representation 10**: in the universal representation, one-byte fields such as a column's scale come as length-prefixed integers.
+- **ERROR message:** the end-to-end sequence number after the call status is only sent to clients with the OCI1 capability bit 0x10 (not set here). The SQL type and checksum fields (20.1) depend on the *server's* field version (≥ 14), whatever the client announces (checked with client versions 10–24 on 26ai; absent on 18c). The ROWID in it has no length byte (in fetched rows it has one). STATUS (ping, logoff) is just the ub4 call status.
+- **Describe information** honours the client's field version. A column's position and flags vary; NULL literals are VARCHAR2 with buffer size 0.
+- **Rows:** a column with buffer size 0 sends no bytes at all (always NULL), except LONG, LONG RAW and UROWID. Duplicate-column bit vectors arrive in BIT_VECTOR messages *or* inside ROW_HEADERs (length, the length again, the bits); a clear bit repeats the previous row's value, also across fetches. The first response to a query may have no rows even with rows to come.
+- **Cursors:** every EXECUTE with cursor 0 opens a cursor on the server (300 open cursors by default). The client closes them with the close-cursors piggyback (function 105) sent before the next call; the cursor ID comes in the ERROR message, also after errors.
+- **Text:** with AL32UTF8 as both client character sets, NCHAR/NVARCHAR2 still arrive as AL16UTF16 (UTF-16BE, describe charset ID 2000).
+- **Login:** a wrong password and an unknown user both give ORA-01017 (a server error: failover stops). An unknown service is the listener's REFUSE with ERR=12514 (a connection error: failover goes on). `AUTH_VERSION_NO` decodes as major.minor(8 bits).patch.port(8 bits).build from server field version 18.1 ext1 on.
+- **Logoff:** function 9, its STATUS, then a DATA packet with the EOF flag.
+- **TLS tests** use a socat proxy (`integration-tests/tls/start-proxy.sh`) in front of the plain listener: TCPS is TLS from the first byte with the same TNS traffic inside. Server-side TCPS features (RESEND with renegotiation, client certificates checked by the server) are not covered by it.
+- **Debugging:** set `ConnectionOptions.transportFactory` to wrap the transport in a logging one to see the bytes.
 
 ## Conventions
 
