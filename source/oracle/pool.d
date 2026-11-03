@@ -23,6 +23,14 @@ stays: `ALTER SESSION` settings, package variables, the statement cache (which
 saves parsing). Idle connections are checked lazily, when connections are
 taken or returned, so the pool needs no background thread or timer.
 
+With DRCP (`ConnectionOptions.serverType` `pooled`) a returned connection
+also hands its session back to the database's pool (`Connection.releaseSession`),
+so many client connections can share few server sessions. The pool's
+connections share one connection class (`ConnectionOptions.connectionClass`,
+generated when not set) and purity `self` by default: a connection may get a
+session with the state an earlier user of the class left (its statement cache
+stays valid when it gets the same session back).
+
 Copyright: Copyright © 2026, Vadim Lopatin
 License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
@@ -59,6 +67,16 @@ final class ConnectionPool
     +/
     this(ConnectionOptions connectionOptions, PoolOptions poolOptions = PoolOptions.init) @safe
     {
+        import oracle.settings : Purity;
+
+        if (connectionOptions.usesDrcp)
+        {
+            if (connectionOptions.connectionClass.length == 0)
+                connectionOptions.connectionClass = newConnectionClass();
+            if (connectionOptions.purity == Purity.default_)
+                connectionOptions.purity = Purity.self;
+        }
+
         Poolable open() @safe
         {
             return new Connection(connectionOptions);
@@ -124,6 +142,11 @@ struct PooledConnection
 
     @disable this(this);
 
+    ~this() @safe
+    {
+        release();
+    }
+
     private this(PoolLease lease) @trusted
     {
         import std.algorithm.mutation : move;
@@ -144,12 +167,35 @@ struct PooledConnection
     ///
     alias connection this;
 
-    /// Returns the connection to the pool now. Calling it again does nothing.
+    /++
+    Returns the connection to the pool now (DRCP: after releasing its
+    session; a connection whose release fails is closed). Calling it again
+    does nothing.
+    +/
     void release() @safe
     {
+        if (conn !is null && conn.isOpen && !conn.isBusy)
+        {
+            try
+                conn.releaseSession();
+            catch (Exception)
+                conn.close();
+        }
         conn = null;
         lease.release();
     }
+}
+
+/// A connection class for the DRCP sessions of one pool: `ONA:` and 16 random bytes in base64.
+private string newConnectionClass() @safe
+{
+    import std.base64 : Base64;
+    import std.random : uniform;
+
+    ubyte[16] bytes;
+    foreach (ref b; bytes)
+        b = cast(ubyte) uniform(0, 256);
+    return "ONA:" ~ Base64.encode(bytes[]).idup;
 }
 
 /// The pool options of a connection string: its `pool_*` parameters (URL or Easy Connect).

@@ -25,6 +25,14 @@ enum ushort defaultPort = 1521;
 /// ditto
 enum ushort defaultSecurePort = 2484;
 
+/// DRCP session purity: whether a session from the server's pool may keep state of an earlier use.
+enum Purity
+{
+    default_, /// `new_` for a single connection, `self` for the connections of a `ConnectionPool`
+    new_, /// a fresh session (`NEW`)
+    self, /// a session of the same connection class with its state (`SELF`): session settings, package state
+}
+
 /// Options of a connection.
 struct ConnectionOptions
 {
@@ -46,8 +54,30 @@ struct ConnectionOptions
     string sid;
     /// A specific instance of the service (`INSTANCE_NAME`); empty: any.
     string instanceName;
-    /// Server process type (`SERVER`): `dedicated`, `shared` or `pooled`; empty: the listener's default.
+    /++
+    Server process type (`SERVER`): `dedicated`, `shared` or `pooled`; empty:
+    the listener's default. `pooled` uses Database Resident Connection Pooling
+    (DRCP): the session comes from a pool the database keeps (started with
+    `DBMS_CONNECTION_POOL.START_POOL`); see `connectionClass` and `purity`.
+    +/
     string serverType;
+    /++
+    DRCP: the connection class (`POOL_CONNECTION_CLASS`). The server hands a
+    pooled session only to connections of the class that used it before.
+    Empty: a class of its own for each connection, or for each
+    `ConnectionPool` (whose connections then share sessions).
+    +/
+    string connectionClass;
+    /// DRCP: whether a session may keep the state of an earlier use (`POOL_PURITY`).
+    Purity purity;
+
+    /// Whether the connection uses DRCP (`serverType` `pooled`).
+    @property bool usesDrcp() const @safe pure nothrow
+    {
+        import std.uni : sicmp;
+
+        return sicmp(serverType, "pooled") == 0;
+    }
     /++
     User name. `proxy[target]` logs in as `proxy` (with `proxy`'s password)
     to a session of user `target` (proxy authentication, see `proxyClient`).
@@ -355,7 +385,7 @@ struct ConnectionOptions
 
     Known: `ADDRESS` (`PROTOCOL` tcp/tcps, `HOST`, `PORT`), `ADDRESS_LIST`,
     `LOAD_BALANCE`, `CONNECT_DATA` (`SERVICE_NAME`, `SID`, `INSTANCE_NAME`,
-    `SERVER`), `SECURITY` (`SSL_SERVER_CERT_DN`, `SSL_SERVER_DN_MATCH`,
+    `SERVER`, `POOL_CONNECTION_CLASS`, `POOL_PURITY`), `SECURITY` (`SSL_SERVER_CERT_DN`, `SSL_SERVER_DN_MATCH`,
     `MY_WALLET_DIRECTORY` / `WALLET_LOCATION`), `SDU`,
     `CONNECT_TIMEOUT`, `TRANSPORT_CONNECT_TIMEOUT`; other entries are ignored.
     All addresses must use the same protocol.
@@ -420,6 +450,10 @@ struct ConnectionOptions
             o.sid = cd.value("SID");
             o.instanceName = cd.value("INSTANCE_NAME");
             o.serverType = cd.value("SERVER").toLower;
+            o.connectionClass = cd.value("POOL_CONNECTION_CLASS");
+            const purity = cd.value("POOL_PURITY");
+            if (purity.length)
+                o.purity = parsePurity("POOL_PURITY", purity);
         }
         if (auto sec = description.child("SECURITY"))
         {
@@ -445,7 +479,7 @@ struct ConnectionOptions
     Easy Connect string.
 
     Keys: `host`, `port`, `service_name`, `sid`, `instance_name`, `server`,
-    `user`, `password`, `proxy_client`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
+    `pool_connection_class` (`cclass`), `pool_purity` (`purity`: `new`, `self`), `user`, `password`, `proxy_client`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
     `tls_cert_file`, `tls_key_file`, `tls_server_name`, `tls_skip_verify`,
     `wallet_location` (`my_wallet_directory`), `wallet_password`,
     `ssl_server_cert_dn`, `ssl_server_dn_match` (flag),
@@ -455,7 +489,7 @@ struct ConnectionOptions
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
     `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`),
     `config_dir` (where `tnsnames.ora` is).
-    `pool_*` keys are for the pool (`PoolOptions.fromParams`) and ignored here.
+    Other `pool_*` keys are for the pool (`PoolOptions.fromParams`) and ignored here.
 
     Throws: `ClientException` for unknown keys or invalid values.
     +/
@@ -477,9 +511,10 @@ struct ConnectionOptions
         {
             import std.algorithm.searching : startsWith;
 
-            if (key.toLower.startsWith("pool_"))
+            const lower = key.toLower;
+            if (lower.startsWith("pool_") && lower != "pool_connection_class" && lower != "pool_purity")
                 continue; // for the pool (PoolOptions.fromParams)
-            switch (key.toLower)
+            switch (lower)
             {
             case "host":
                 o.host = value;
@@ -503,6 +538,14 @@ struct ConnectionOptions
             case "server":
             case "server_type":
                 o.serverType = value.toLower;
+                break;
+            case "pool_connection_class":
+            case "cclass":
+                o.connectionClass = value;
+                break;
+            case "pool_purity":
+            case "purity":
+                o.purity = parsePurity(key, value);
                 break;
             case "user":
                 o.user = value;
@@ -903,6 +946,39 @@ private string toText(T)(T v) @safe pure
     // without a tnsnames.ora, a name is a host
     o = ConnectionOptions.parse("dbhost?config_dir=" ~ buildPath(dir, "none"));
     assert(o.hosts == [HostPort("dbhost", 0)]);
+}
+
+/// A DRCP purity: `new`, `self` or `default`.
+private Purity parsePurity(string key, string value) @safe
+{
+    import std.uni : toLower;
+
+    switch (value.toLower)
+    {
+    case "new":
+        return Purity.new_;
+    case "self":
+        return Purity.self;
+    case "default":
+        return Purity.default_;
+    default:
+        throw new ClientException("Invalid value '" ~ value ~ "' for '" ~ key ~ "' (new or self expected)");
+    }
+}
+
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    auto o = ConnectionOptions.parse("db:1521/sales:POOLED?pool_connection_class=app&pool_purity=self");
+    assert(o.usesDrcp && o.serverType == "pooled" && o.connectionClass == "app" && o.purity == Purity.self);
+    o = ConnectionOptions.parse("(DESCRIPTION=(ADDRESS=(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=sales)"
+            ~ "(SERVER=POOLED)(POOL_CONNECTION_CLASS=reports)(POOL_PURITY=NEW)))");
+    assert(o.usesDrcp && o.connectionClass == "reports" && o.purity == Purity.new_);
+    o = ConnectionOptions.parse("oracle://u:p@db/sales?server=pooled&cclass=x&purity=default");
+    assert(o.usesDrcp && o.connectionClass == "x" && o.purity == Purity.default_);
+    assert(!ConnectionOptions.parse("db/sales").usesDrcp);
+    assertThrown!ClientException(ConnectionOptions.parse("db/sales:pooled?pool_purity=old"));
 }
 
 /// An Oracle switch: `on`/`yes`/`true`/`1` or `off`/`no`/`false`/`0`.

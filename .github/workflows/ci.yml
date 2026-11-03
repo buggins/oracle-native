@@ -77,6 +77,7 @@ jobs:
       ORACLE_SERVICE: ${{ matrix.service }}
       ORACLE_USER: testuser
       ORACLE_PASSWORD: Test_password123
+      ORACLE_DRCP: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dlang-community/setup-dlang@v2.0.0
@@ -94,6 +95,10 @@ jobs:
         run: |
           docker exec ${{ job.services.oracle.id }} bash -c \
             "printf \"create user itest_proxied identified by \\\"Proxied_pw123\\\";\\ngrant create session to itest_proxied;\\nalter user itest_proxied grant connect through testuser;\\n\" | sqlplus -s system/Oracle_test123@${{ matrix.service }}"
+      - name: DRCP (the database's connection pool)
+        run: |
+          docker exec ${{ job.services.oracle.id }} bash -c \
+            "echo 'EXEC DBMS_CONNECTION_POOL.START_POOL();' | sqlplus -s / as sysdba"
       - name: TLS proxies (TCPS stand-ins; the second requires client certificates)
         run: |
           sh integration-tests/tls/start-proxy.sh 127.0.0.1:1521 2484

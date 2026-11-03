@@ -59,11 +59,11 @@ Features:
   (`CLOB`, `NCLOB`, `BLOB`, `BFILE`), `JSON` (21c), `VECTOR` and `BOOLEAN`
   (23ai);
 - end-to-end attributes (module, action, client identifier) for monitoring;
-- a connection pool for threads and vibe.d fibers, and struct mapping; a
+- a connection pool for threads and vibe.d fibers, and DRCP (Database
+  Resident Connection Pooling); struct mapping; a
   [ddbc](https://github.com/buggins/ddbc) driver (configuration `ORACLE`).
 
-Later: DRCP
-and a [hibernated](https://github.com/buggins/hibernated) dialect.
+Later: a [hibernated](https://github.com/buggins/hibernated) dialect.
 Native Network Encryption (Oracle's own encryption, an alternative to TLS) is
 not supported: servers that require it are refused with a clear error.
 
@@ -168,6 +168,27 @@ waiting for the server suspends only the task: the I/O mode follows the
 caller (`ConnectionOptions.ioMode`). A connection handed out again has the
 previous user's uncommitted changes rolled back. See `examples/` (`dub run
 :example-basic`, `dub run :example-vibe`).
+
+### DRCP
+
+With Database Resident Connection Pooling the database keeps a pool of
+sessions that many client connections share (start it with
+`EXEC DBMS_CONNECTION_POOL.START_POOL()`). Ask for a pooled server with
+`:pooled` in Easy Connect, `server=pooled` in a URL or `(SERVER=POOLED)` in a
+descriptor:
+
+```d
+auto pool = new ConnectionPool("db:1521/FREEPDB1:pooled?pool_max=50");
+```
+
+A returned connection hands its session back to the database's pool, and
+gets one again with its next call. The pool's connections share a
+connection class (`pool_connection_class`, generated if not set) and purity
+`self`: a connection may get a session with the state an earlier user of the
+class left (session settings, package state, and the statement cache stays
+valid when the session is the same). A single connection gets a fresh session
+(`pool_purity=new`) unless told otherwise; `Connection.releaseSession`
+releases its session by hand.
 
 ## LOBs
 

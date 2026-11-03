@@ -32,6 +32,7 @@ enum MessageType : ubyte
     serverSidePiggyback = 23, /// server piggyback
     implicitResultSet = 27, /// implicit results
     renegotiate = 28, /// renegotiate
+    oneWayFunction = 26, /// a function call without a response (client)
     endOfResponse = 29, /// end of response (23ai)
 }
 
@@ -135,6 +136,7 @@ enum Cap : size_t
     lob = 23, /// LOB flags
     ttc2 = 26, /// TTC2 flags
     ub2Dty = 27, /// UB2 data types
+    oci2 = 31, /// OCI2 flags
     clientFunctions = 34, /// client functions
     oci3 = 35, /// OCI3 flags
     ttc3 = 37, /// TTC3 flags
@@ -166,6 +168,7 @@ immutable(ubyte)[] clientCompileCaps(bool endOfResponse = false) @safe pure noth
     c[Cap.lob] = 0x01 | 0x02 | 0x04 | 0x08 | 0x40 | 0x80; // ub8 sizes, encodings, prefetch, temp size, prefetch length, 12c
     c[Cap.ttc2] = 0x04; // zero-length non-pointer
     c[Cap.ub2Dty] = 1;
+    c[Cap.oci2] = 0x10; // DRCP
     c[Cap.clientFunctions] = 12;
     c[Cap.oci3] = 0x20;
     c[Cap.ttc3] = 0x10 | 0x20 | 0x80 | 0x08; // implicit results, big CLR chunks, keep out of order, LTXID
