@@ -32,7 +32,7 @@ public import dbwire.io.backend : IoMode;
 /// Library version.
 enum uint oracleVersionMajor = 0;
 /// ditto
-enum uint oracleVersionMinor = 2;
+enum uint oracleVersionMinor = 3;
 /// ditto
 enum uint oracleVersionPatch = 0;
 
