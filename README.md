@@ -7,9 +7,9 @@ build time.
 
 > **Status: under development.** Nothing is released yet; the plan is tracked
 > in the [roadmap issue](https://github.com/buggins/oracle-native/issues/10).
-> It connects (TCP or TLS, password logins), runs statements and reads `NUMBER`
-> and character columns; the other types, bind variables and the rest come in
-> the next milestones.
+> It connects (TCP or TLS, password logins), runs statements and reads the
+> common column types (below); bind variables, LOBs and the rest come in the
+> next milestones.
 
 ```d
 import oracle;
@@ -73,6 +73,35 @@ docker run -d --name oracle-free -p 1521:1521 -e ORACLE_PASSWORD=Oracle_test123 
 ORACLE_HOST=localhost:1521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 \
     dub run :integration-tests-phobos      # or :integration-tests-vibe for vibe.d fibers
 ```
+
+## Reading values
+
+`Row` getters convert a column to D types (`getLong`, `getInt`, `getBool`,
+`getDouble`, `getDecimal`, `getString`, `getBytes`, `getDate`, `getTime`,
+`getDateTime`, `getSysTime`, `getNanoseconds`, `getDuration`,
+`getMonthInterval`, `getVariant`); NULL gives the type's default value
+(`isNull` tells).
+
+| Oracle type | Natural D type (`getVariant`) | Notes |
+|---|---|---|
+| `NUMBER(p)`, p ≤ 18 | `long` | |
+| other `NUMBER`, `FLOAT` | `Decimal` (exact) | `getString`: plain decimal text (`0.5`, `-0.001`) |
+| `BINARY_FLOAT` / `BINARY_DOUBLE` | `float` / `double` | text: shortest exact (`0.1`), `Nan`, `Inf` |
+| `VARCHAR2`, `CHAR`, `NVARCHAR2`, `NCHAR`, `LONG` | `string` | UTF-8 |
+| `RAW`, `LONG RAW` | `ubyte[]` | text: hexadecimal |
+| `DATE` | `DateTime` | |
+| `TIMESTAMP` | `SysTime` (UTC) | nanoseconds with `getNanoseconds` |
+| `TIMESTAMP WITH TIME ZONE` | `SysTime` in its zone | offsets and regions (`Europe/Lisbon`) |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `SysTime` in the session time zone | option `time_zone`, default `+00:00` |
+| `INTERVAL YEAR TO MONTH` | `MonthInterval` | |
+| `INTERVAL DAY TO SECOND` | `Duration` | nanoseconds with `getNanoseconds` |
+| `ROWID`, `UROWID` | `string` | |
+
+`getString` writes dates, timestamps and intervals as the server does
+(`2026-11-03 10:20:30.123456`, `+02-03`, `+03 04:05:06.789000`). Time zone
+regions use the system's time zone database for their local time (Windows has
+none: such values are shown in UTC). `BOOLEAN` columns (23ai) are read as
+numbers 1/0: use `getBool`.
 
 ## Disclaimer
 

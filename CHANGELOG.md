@@ -6,8 +6,22 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- Getters return the type's default value for NULL instead of throwing (as
+  in mssql-native and ddbc).
+
 ### Added
 
+- Data types (#3): `BINARY_FLOAT`/`BINARY_DOUBLE`, `DATE`, `TIMESTAMP` (with
+  nanoseconds), `WITH TIME ZONE` (offsets and regions, with a region table
+  generated from the server by `tools/tzregions.d`), `WITH LOCAL TIME ZONE`
+  (converted from the database to the session time zone), `INTERVAL YEAR TO
+  MONTH`, `INTERVAL DAY TO SECOND`, `LONG`, `LONG RAW`, `UROWID`; `NUMBER` as an
+  exact `Decimal`. New `Value` type and getters (`getInt`, `getBool`,
+  `getDecimal`, `getDate`, `getTime`, `getDateTime`, `getSysTime`,
+  `getNanoseconds`, `getDuration`, `getMonthInterval`, `getVariant`); the
+  texts of dates, timestamps and intervals are those of the server.
 - Connecting and first statements (#2):
   - the listener handshake (TNS 318: CONNECT, ACCEPT, REFUSE, REDIRECT,
     RESEND, SDU up to 2 MB), protocol and data-type negotiation, Native Network

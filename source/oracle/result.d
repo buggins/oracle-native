@@ -6,9 +6,18 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.result;
 
+import core.time : Duration;
+import std.datetime.date : Date, DateTime, TimeOfDay;
+import std.datetime.systime : SysTime;
+import std.datetime.timezone : TimeZone;
+import std.typecons : Rebindable;
+import std.variant : Variant;
+import dbwire.types.decimal : Decimal;
+import dbwire.types.interval : MonthInterval;
 import oracle.connection : Connection;
 import oracle.exception : ClientException;
 import oracle.types.typeinfo : ColumnInfo, OracleType;
+import oracle.value : Value;
 
 /++
 The rows of a query. Iterate with `foreach`; the connection stays busy until
@@ -79,7 +88,7 @@ final class QueryResult
     {
         if (empty)
             throw new ClientException("No more rows");
-        return Row(batch[index], columnInfo);
+        return Row(batch[index], columnInfo, conn.sessionZone, conn.databaseZone);
     }
 
     /// Moves to the next row.
@@ -109,11 +118,16 @@ final class QueryResult
     }
 }
 
-/// One row of a result. Valid until the result moves past the batch it came in.
+/++
+One row of a result. Valid until the result moves past the batch it came in.
+The getters are those of `Value` (`row.getLong(i)` is `row[i].getLong()`).
++/
 struct Row
 {
     private const(immutable(ubyte)[])[] values;
     private const(ColumnInfo)[] columnInfo;
+    private Rebindable!(immutable TimeZone) sessionZone;
+    private Rebindable!(immutable TimeZone) databaseZone;
 
     /// Number of columns.
     @property size_t length() const @safe pure nothrow
@@ -127,154 +141,113 @@ struct Row
         return columnInfo;
     }
 
-    /// Whether column `i` is NULL (empty strings are NULL in Oracle).
-    bool isNull(size_t i) const @safe pure
-    {
-        return value(i) is null;
-    }
-
     /++
-    Column `i` as text: strings as they are, numbers in plain decimal notation
-    (`-12.5`, `0.001`), RAW in upper-case hexadecimal, ROWIDs in their
-    base-64 form; `null` for NULL.
+    Column `i`.
 
-    Throws: `ClientException` for types without a text form yet.
+    Throws: `ClientException` if `i` is out of range.
     +/
-    string getString(size_t i) const @safe
-    {
-        import oracle.types.number : decodeNumber;
-        import oracle.types.rowid : rowidText;
-        import oracle.protocol.auth : hex;
-
-        const v = value(i);
-        if (v is null)
-            return null;
-        switch (columnInfo[i].type)
-        {
-        case OracleType.varchar:
-        case OracleType.char_:
-            return text(v, columnInfo[i]);
-        case OracleType.number:
-            return decodeNumber(v).toString();
-        case OracleType.raw:
-            return hex(v);
-        case OracleType.rowid:
-            return rowidText(v);
-        default:
-            throw unsupported(i, "string");
-        }
-    }
-
-    /++
-    Column `i` as a `long`.
-
-    Throws: `ClientException` if the value is NULL, not an integer or out of range.
-    +/
-    long getLong(size_t i) const @safe
-    {
-        import std.conv : ConvException, to;
-        import std.string : strip;
-        import oracle.types.number : numberToLong;
-
-        const v = notNull(i);
-        switch (columnInfo[i].type)
-        {
-        case OracleType.number:
-            return numberToLong(v);
-        case OracleType.varchar:
-        case OracleType.char_:
-            const s = text(v, columnInfo[i]).strip;
-            try
-                return s.to!long;
-            catch (ConvException)
-                throw new ClientException("'" ~ s ~ "' is not an integer (column " ~ columnInfo[i].name ~ ")");
-        default:
-            throw unsupported(i, "long");
-        }
-    }
-
-    /++
-    Column `i` as a `double`.
-
-    Throws: `ClientException` if the value is NULL or not a number.
-    +/
-    double getDouble(size_t i) const @safe
-    {
-        import std.conv : ConvException, to;
-        import std.string : strip;
-        import oracle.types.number : numberToDouble;
-
-        const v = notNull(i);
-        switch (columnInfo[i].type)
-        {
-        case OracleType.number:
-            return numberToDouble(v);
-        case OracleType.varchar:
-        case OracleType.char_:
-            const s = text(v, columnInfo[i]).strip;
-            try
-                return s.to!double;
-            catch (ConvException)
-                throw new ClientException("'" ~ s ~ "' is not a number (column " ~ columnInfo[i].name ~ ")");
-        default:
-            throw unsupported(i, "double");
-        }
-    }
-
-    /++
-    Column `i`'s value in its wire form (e.g. the NUMBER bytes, UTF-8 text);
-    `null` for NULL.
-    +/
-    immutable(ubyte)[] getBytes(size_t i) const @safe pure
-    {
-        return value(i);
-    }
-
-    private immutable(ubyte)[] value(size_t i) const @safe pure
+    Value opIndex(size_t i) const @safe pure
     {
         if (i >= values.length)
             throw new ClientException("Column index " ~ toText(i) ~ " out of range");
-        return values[i];
+        return Value(columnInfo[i], values[i], sessionZone, databaseZone);
     }
 
-    private immutable(ubyte)[] notNull(size_t i) const @safe pure
+    /// Whether column `i` is NULL (empty strings are NULL in Oracle).
+    bool isNull(size_t i) const @safe pure
     {
-        const v = value(i);
-        if (v is null)
-            throw new ClientException("Column " ~ columnInfo[i].name ~ " is NULL");
-        return v;
+        return this[i].isNull;
     }
 
-    private ClientException unsupported(size_t i, string what) const @safe pure
+    /// The getters of `Value` for column `i`.
+    string getString(size_t i) const @safe
     {
-        return new ClientException(
-                "Column " ~ columnInfo[i].name ~ " (" ~ columnInfo[i].typeText()
-                ~ ") can't be read as a " ~ what);
+        return this[i].getString();
     }
-}
 
-/++
-The text of a character value: UTF-8 (the client's character set) or, for
-national character data in AL16UTF16, UTF-16 big-endian.
-+/
-private string text(immutable(ubyte)[] v, const ref ColumnInfo c) @safe pure
-{
-    import std.utf : UTFException, validate;
-    import dbwire.charset.utf16 : decodeUtf16be;
-    import oracle.protocol.negotiate : CharsetId;
-
-    if (c.charsetId == CharsetId.al16utf16)
+    /// ditto
+    long getLong(size_t i) const @safe
     {
-        if (v.length % 2)
-            throw new ClientException("Invalid UTF-16 text in column " ~ c.name);
-        return decodeUtf16be(v);
+        return this[i].getLong();
     }
-    const s = cast(string) v;
-    try
-        validate(s);
-    catch (UTFException)
-        throw new ClientException("Invalid UTF-8 text in column " ~ c.name);
-    return s;
+
+    /// ditto
+    int getInt(size_t i) const @safe
+    {
+        return this[i].getInt();
+    }
+
+    /// ditto
+    bool getBool(size_t i) const @safe
+    {
+        return this[i].getBool();
+    }
+
+    /// ditto
+    double getDouble(size_t i) const @safe
+    {
+        return this[i].getDouble();
+    }
+
+    /// ditto
+    Decimal getDecimal(size_t i) const @safe
+    {
+        return this[i].getDecimal();
+    }
+
+    /// ditto
+    immutable(ubyte)[] getBytes(size_t i) const @safe
+    {
+        return this[i].getBytes();
+    }
+
+    /// ditto
+    DateTime getDateTime(size_t i) const @safe
+    {
+        return this[i].getDateTime();
+    }
+
+    /// ditto
+    Date getDate(size_t i) const @safe
+    {
+        return this[i].getDate();
+    }
+
+    /// ditto
+    TimeOfDay getTime(size_t i) const @safe
+    {
+        return this[i].getTime();
+    }
+
+    /// ditto
+    SysTime getSysTime(size_t i) const @safe
+    {
+        return this[i].getSysTime();
+    }
+
+    /// ditto
+    int getNanoseconds(size_t i) const @safe
+    {
+        return this[i].getNanoseconds();
+    }
+
+    /// ditto
+    Duration getDuration(size_t i) const @safe
+    {
+        return this[i].getDuration();
+    }
+
+    /// ditto
+    MonthInterval getMonthInterval(size_t i) const @safe
+    {
+        return this[i].getMonthInterval();
+    }
+
+    /// ditto
+    Variant getVariant(size_t i) const @safe
+    {
+        return this[i].getVariant();
+    }
 }
 
 private string toText(T)(T v) @safe pure

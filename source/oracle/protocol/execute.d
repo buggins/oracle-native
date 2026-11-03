@@ -273,6 +273,15 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
     case OracleType.intervalDs:
     case OracleType.boolean:
         return r.clr(maxLength);
+    case OracleType.long_:
+    case OracleType.longRaw:
+        // chunked, then an indicator and a return code
+        const v = r.clr(maxLength);
+        r.sb(4);
+        r.ub4();
+        return v;
+    case OracleType.urowid:
+        return r.bytesWithLength();
     case OracleType.rowid:
         // a length byte (0/255: NULL), then block address, partition, a byte, block, slot
         const length = r.u8();
