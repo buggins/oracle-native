@@ -4,6 +4,28 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Newer types and the 23.4 protocol (#7): the client now speaks TTC field
+  version 24 (23.4; 21c negotiates 16, 18c 11). `JSON` columns (21c) are
+  decoded from Oracle's binary JSON (OSON) to their text, as
+  `JSON_SERIALIZE` writes it, and `Value.getJson` gives a `std.json` value.
+  `VECTOR` columns (23ai) read as `Vector` (FLOAT32, FLOAT64, INT8, BINARY,
+  sparse; `getVector`, text as `FROM_VECTOR` writes it), and `Vector`,
+  `float[]` and `double[]` parameters are sent as VECTOR. `BOOLEAN` columns
+  arrive natively, and `bool` parameters are sent as `BOOLEAN` to 23ai
+  (`NUMBER` 1/0 to older servers), also for PL/SQL `BOOLEAN` parameters.
+- Column metadata of 23ai: SQL domain, annotations, VECTOR dimensions and
+  format; `isJson` / `isOson` flags (`ColumnInfo`).
+- End-to-end attributes: `Connection.moduleName`, `action`,
+  `clientIdentifier`, `clientInfo`, `dbOp`, sent with the next call.
+
+### Fixed
+
+- Queries with a `JSON` column failed with ORA-01002.
+
 ## 0.1.0 — 2026-11-03
 
 First release.

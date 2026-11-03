@@ -22,6 +22,7 @@ public import oracle.pool : ConnectionPool, PoolOptions, PooledConnection;
 public import oracle.result : BatchError, BatchResult, Output, QueryResult, Row;
 public import oracle.settings : ConnectionOptions, HostPort, HostSelection;
 public import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
+public import oracle.types.vector : Vector, VectorFormat;
 public import oracle.value : Value;
 public import dbwire.types.decimal : Decimal;
 public import dbwire.types.interval : MonthInterval;

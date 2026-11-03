@@ -24,6 +24,7 @@ enum FunctionCode : ubyte
     execute = 94, /// execute ("OALL8")
     lobOp = 96, /// LOB operation
     closeCursors = 105, /// close cursors (piggyback)
+    setEndToEnd = 135, /// set end-to-end attributes (piggyback)
     authPhase2 = 115, /// authentication, phase 2
     authPhase1 = 118, /// authentication, phase 1
     ping = 147, /// ping
@@ -111,10 +112,12 @@ on add two fields whatever field version the client announced (checked on
 that some clients get after the call status is only sent to clients with the
 OCI1 capability bit 0x10, which this client doesn't announce.
 +/
-ErrorInfo readErrorInfo(ref TtcReader r, ubyte serverFieldVersion) @safe
+ErrorInfo readErrorInfo(ref TtcReader r, ubyte serverFieldVersion, bool endToEndSequence = true) @safe
 {
     ErrorInfo e;
     e.callStatus = r.ub4();
+    if (endToEndSequence)
+        r.ub2(); // end-to-end sequence number (the client sends OCI1 session propagation)
     r.ub4(); // current row number
     const shortNumber = r.ub2();
     r.ub2(); // array element errors
@@ -292,4 +295,67 @@ private string toText(T)(T v) @safe pure
     w = TtcWriter.init;
     keyValue(w, "AUTH_PID", "42");
     assert(w.data == [1, 8, 8, 'A', 'U', 'T', 'H', '_', 'P', 'I', 'D', 1, 2, 2, '4', '2', 0]);
+}
+
+/// End-to-end attributes of a session (`V$SESSION`, `SYS_CONTEXT('USERENV', ...)`), sent when they change.
+struct EndToEnd
+{
+    /// The attributes, in `EndToEndAttribute` order; null clears one.
+    string[5] values;
+    /// Which attributes changed (bit `1 << EndToEndAttribute`).
+    uint changed;
+}
+
+/// The end-to-end attributes.
+enum EndToEndAttribute
+{
+    clientIdentifier, /// `CLIENT_IDENTIFIER`
+    module_, /// `MODULE`
+    action, /// `ACTION`
+    clientInfo, /// `CLIENT_INFO`
+    dbOp, /// `DBOP` (database operation)
+}
+
+/// The piggyback that sends the changed end-to-end attributes before a call.
+void putEndToEnd(ref TtcWriter w, const ref EndToEnd e, ubyte sequence, ubyte fieldVersion) @safe pure
+{
+    static immutable uint[5] flagBits = [0x0001, 0x0008, 0x0010, 0x0100, 0x0200];
+    w.u8(MessageType.piggyback);
+    w.u8(FunctionCode.setEndToEnd);
+    w.u8(sequence);
+    if (fieldVersion >= TtcFieldVersion.v23_1_ext1)
+        w.ub(0); // token number
+    w.u8(0); // pointer (name)
+    w.u8(0); // pointer (serial number)
+    uint flags;
+    foreach (i, bit; flagBits)
+        if (e.changed & (1 << i))
+            flags |= bit;
+    w.ub(flags);
+    void header(EndToEndAttribute a)
+    {
+        const changed = (e.changed & (1 << a)) != 0;
+        w.u8(changed ? 1 : 0);
+        w.ub(changed ? e.values[a].length : 0);
+    }
+
+    header(EndToEndAttribute.clientIdentifier);
+    header(EndToEndAttribute.module_);
+    header(EndToEndAttribute.action);
+    w.u8(0); // execution context ID: pointer, length, and two more fields
+    w.ub(0);
+    w.u8(0);
+    w.ub(0);
+    header(EndToEndAttribute.clientInfo);
+    w.u8(0); // two unused attributes: pointer and length each
+    w.ub(0);
+    w.u8(0);
+    w.ub(0);
+    header(EndToEndAttribute.dbOp);
+    foreach (a; [
+        EndToEndAttribute.clientIdentifier, EndToEndAttribute.module_, EndToEndAttribute.action,
+        EndToEndAttribute.clientInfo, EndToEndAttribute.dbOp
+    ])
+        if ((e.changed & (1 << a)) && e.values[a].length)
+            w.clr(cast(const(ubyte)[]) e.values[a]);
 }

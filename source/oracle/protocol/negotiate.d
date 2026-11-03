@@ -46,14 +46,21 @@ enum TtcFieldVersion : ubyte
     v18_1_ext1 = 11, /// 18.1, extension 1
     v19_1 = 12, /// 19.1
     v19_1_ext1 = 13, /// 19.1, extension 1
-    v20_1 = 14, /// 20.1
-    v21_1 = 16, /// 21.1
-    v23_1 = 17, /// 23.1
+    v20_1 = 14, /// 20.1: two more ERROR fields
+    v20_1_ext1 = 15, /// 20.1, extension 1
+    v21_1 = 16, /// 21.1: native JSON
+    v23_1 = 17, /// 23.1: column domains, native BOOLEAN
     v23_1_ext1 = 18, /// 23.1, extension 1: a token number in every function header
+    v23_1_ext2 = 19, /// 23.1, extension 2
+    v23_1_ext3 = 20, /// 23.1, extension 3: column annotations
+    v23_1_ext4 = 21, /// 23.1, extension 4
+    v23_1_ext5 = 22, /// 23.1, extension 5
+    v23_3_ext6 = 23, /// 23.3, extension 6
+    v23_4 = 24, /// 23.4: VECTOR metadata
 }
 
 /// The TTC field version this client implements.
-enum ubyte clientFieldVersion = TtcFieldVersion.v19_1_ext1;
+enum ubyte clientFieldVersion = TtcFieldVersion.v23_4;
 
 /// Character set IDs.
 enum CharsetId : ushort
@@ -120,6 +127,7 @@ enum Cap : size_t
     logonTypes = 4, /// supported logon types
     fieldVersion = 7, /// TTC field version
     ttc1 = 15, /// TTC1 flags
+    oci1 = 16, /// OCI1 flags
     tdsVersion = 17, /// TDS version
     rpcVersion = 18, /// RPC version
     rpcSignature = 19, /// RPC signature
@@ -133,6 +141,8 @@ enum Cap : size_t
     sessionSignature = 39, /// session signature version
     ttc4 = 40, /// TTC4 flags
     lob2 = 42, /// LOB2 flags
+    ttc5 = 44, /// TTC5 flags
+    vectorFeatures = 52, /// VECTOR features
 }
 
 /// The client's compile-time capabilities.
@@ -158,6 +168,9 @@ immutable(ubyte)[] clientCompileCaps() @safe pure nothrow
     c[Cap.sessionSignature] = 8;
     c[Cap.ttc4] = 0x04 | 0x40; // in-band notifications, explicit boundary
     c[Cap.lob2] = 0x01 | 0x04;
+    c[Cap.oci1] = 0x10; // session state propagation: end-to-end attributes apply; ERROR and STATUS carry a sequence number
+    c[Cap.ttc5] = 0x08; // VECTOR
+    c[Cap.vectorFeatures] = 0x01 | 0x02; // BINARY and sparse vectors
     return (() @trusted => cast(immutable(ubyte)[]) c)();
 }
 
@@ -169,6 +182,9 @@ immutable(ubyte)[] clientRuntimeCaps() @safe pure nothrow
     c[6] = 0x01 | 0x04; // zero copy, 32 KB strings
     return (() @trusted => cast(immutable(ubyte)[]) c)();
 }
+
+/// The internal type of column describe information (user-defined structure).
+private enum ushort udsType = 663;
 
 /// Data-type representations.
 enum Representation : ushort
@@ -289,6 +305,10 @@ ubyte[] buildDataTypesMessage() @safe pure
         entry(c.type, c.to, c.representation);
     foreach (t; identityTypes)
         entry(t, t, Representation.universal);
+    // the describe-information structure (UDS): a server answers its identity question without it, but
+    // describes columns with the fields of the negotiated field version (23.1 domains, annotations,
+    // VECTOR metadata) only to clients that list it
+    entry(udsType, udsType, Representation.universal);
     w.u16be(0);
     return w.data;
 }
@@ -315,5 +335,5 @@ void readDataTypesResponse(ref TtcReader r) @safe
     assert(buildProtocolMessage("d") == [1, 6, 0, 'd', 0]);
     const dt = buildDataTypesMessage();
     assert(dt[0 .. 6] == [2, 0x69, 0x03, 0x69, 0x03, 3] && dt[6] == 55 && dt[$ - 2 .. $] == [0, 0]);
-    assert(clientCompileCaps()[Cap.fieldVersion] == 13 && dt.length > 8 * 300);
+    assert(clientCompileCaps()[Cap.fieldVersion] == 24 && dt.length > 8 * 300);
 }

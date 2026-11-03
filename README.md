@@ -50,12 +50,14 @@ Features:
   `BINARY_FLOAT`/`BINARY_DOUBLE`, `VARCHAR2`/`CHAR`/`NVARCHAR2`/`NCHAR`,
   `RAW`, `DATE`, `TIMESTAMP` (with its nanoseconds, time zone offsets and
   regions, local time zone), `INTERVAL`s, `ROWID`/`UROWID`, `LONG`, LOBs
-  (`CLOB`, `NCLOB`, `BLOB`, `BFILE`);
-- a connection pool for threads and vibe.d fibers, and struct mapping.
+  (`CLOB`, `NCLOB`, `BLOB`, `BFILE`), `JSON` (21c), `VECTOR` and `BOOLEAN`
+  (23ai);
+- end-to-end attributes (module, action, client identifier) for monitoring;
+- a connection pool for threads and vibe.d fibers, and struct mapping; a
+  [ddbc](https://github.com/buggins/ddbc) driver (configuration `ORACLE`).
 
-Later: `JSON` (OSON), `VECTOR`, native `BOOLEAN` (23ai; read as numbers for
-now), `tnsnames.ora` aliases and wallets, a [ddbc](https://github.com/buggins/ddbc)
-driver and a [hibernated](https://github.com/buggins/hibernated) dialect.
+Later: `tnsnames.ora` aliases and wallets, proxy authentication, pipelining,
+and a [hibernated](https://github.com/buggins/hibernated) dialect.
 Native Network Encryption (Oracle's own encryption, an alternative to TLS) is
 not supported: servers that require it are refused with a clear error.
 
@@ -97,10 +99,13 @@ auto r = conn.query("BEGIN :1 := 'out ' || :2; :3 := :3 * 2; END;",
 writeln(r.output(0).getString, " ", r.output(2).getLong);   // "out in 42"
 ```
 
-D values are sent as: integers, `bool` and `Decimal` → `NUMBER`; `float` /
-`double` → `BINARY_FLOAT` / `BINARY_DOUBLE`; strings → `VARCHAR2`; `ubyte[]`,
-`UUID` → `RAW`; `Date`, `DateTime` → `DATE`; `SysTime` → `TIMESTAMP WITH TIME
-ZONE`; `Duration`, `MonthInterval` → intervals; `null` and `Nullable` → NULL.
+D values are sent as: integers and `Decimal` → `NUMBER`; `bool` → `BOOLEAN`
+(23ai; `NUMBER` 1/0 for older servers); `float` / `double` → `BINARY_FLOAT` /
+`BINARY_DOUBLE`; strings → `VARCHAR2`; `ubyte[]`, `UUID` → `RAW`; `Date`,
+`DateTime` → `DATE`; `SysTime` → `TIMESTAMP WITH TIME ZONE`; `Duration`,
+`MonthInterval` → intervals; `Vector`, `float[]`, `double[]` → `VECTOR`
+(23ai); `null` and `Nullable` → NULL. JSON is sent as text (a string, or a
+temporary CLOB for long documents): the server parses it.
 Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
 another thread or task) stops a running call with ORA-01013.
@@ -169,8 +174,8 @@ BFILE columns are always locators (`getLob(i).read()`).
 `Row` getters convert a column to D types (`getLong`, `getInt`, `getBool`,
 `getDouble`, `getDecimal`, `getString`, `getBytes`, `getDate`, `getTime`,
 `getDateTime`, `getSysTime`, `getNanoseconds`, `getDuration`,
-`getMonthInterval`, `getVariant`); NULL gives the type's default value
-(`isNull` tells).
+`getMonthInterval`, `getJson`, `getVector`, `getVariant`); NULL gives the
+type's default value (`isNull` tells).
 
 | Oracle type | Natural D type (`getVariant`) | Notes |
 |---|---|---|
@@ -188,12 +193,26 @@ BFILE columns are always locators (`getLob(i).read()`).
 | `ROWID`, `UROWID` | `string` | |
 | `CLOB`, `NCLOB` / `BLOB` | `string` / `ubyte[]` | contents; locators: `getLob` |
 | `BFILE` | `Lob` | read-only |
+| `BOOLEAN` (23ai) | `bool` | text `true` / `false` |
+| `JSON` (21c) | `string` (its text) | `getJson`: `std.json` value; text as `JSON_SERIALIZE` writes it |
+| `VECTOR` (23ai) | `Vector` | FLOAT32, FLOAT64, INT8, BINARY, sparse; text as `FROM_VECTOR` writes it |
 
 `getString` writes dates, timestamps and intervals as the server does
 (`2026-11-03 10:20:30.123456`, `+02-03`, `+03 04:05:06.789000`). Time zone
 regions use the system's time zone database for their local time (Windows has
-none: such values are shown in UTC). `BOOLEAN` columns (23ai) are read as
-numbers 1/0: use `getBool`.
+none: such values are shown in UTC). JSON values arrive in Oracle's binary
+format (OSON) and are decoded by the client; dates and timestamps in them read
+as ISO 8601 strings. Column metadata (`ColumnInfo`) also has the 23ai SQL
+domain, annotations and VECTOR dimensions and format.
+
+Monitoring tools see the end-to-end attributes of a session (`V$SESSION`,
+`SYS_CONTEXT('USERENV', ...)`); they are sent with the next call:
+
+```d
+conn.moduleName = "billing";
+conn.action = "monthly run";
+conn.clientIdentifier = "user 42";
+```
 
 ## Disclaimer
 

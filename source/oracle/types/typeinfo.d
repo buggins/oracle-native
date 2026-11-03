@@ -68,6 +68,22 @@ struct ColumnInfo
     string typeSchema;
     /// ditto
     string typeName;
+    /// Owner and name of the column's SQL domain (23ai), if any.
+    string domainSchema;
+    /// ditto
+    string domainName;
+    /// The column's annotations (23ai): name and value (empty when it has none).
+    immutable(string[2])[] annotations;
+    /// Whether the column holds JSON: the JSON type, or a column with an `IS JSON` check.
+    bool isJson;
+    /// Whether the values are binary JSON (OSON): the JSON type, also as a BLOB for older clients.
+    bool isOson;
+    /// VECTOR columns (23ai): the number of dimensions (0: any).
+    uint vectorDimensions;
+    /// VECTOR columns: the element format (`VectorFormat`; 0: any).
+    ubyte vectorFormat;
+    /// VECTOR columns: flags (sparse vectors: 0x02).
+    ubyte vectorFlags;
     /// The type the column is fetched as (LOBs: as LONG / LONG RAW values or as locators); none: `type`.
     package(oracle) OracleType fetchType = cast(OracleType) 0;
 
