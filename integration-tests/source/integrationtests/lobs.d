@@ -33,7 +33,8 @@ void testLobValues()
     conn.exec("INSERT INTO itest_lob VALUES (1, 'small', N'Ωmega', HEXTORAW('0102'))");
     conn.exec("INSERT INTO itest_lob VALUES (2, EMPTY_CLOB(), EMPTY_CLOB(), EMPTY_BLOB())");
     conn.exec("INSERT INTO itest_lob VALUES (3, NULL, NULL, NULL)");
-    conn.exec("INSERT INTO itest_lob VALUES (4, :1, :1, :2)", big, bytes);
+    // separate placeholders: 21c refuses the same long value bound twice (ORA-22284)
+    conn.exec("INSERT INTO itest_lob VALUES (4, :1, :2, :3)", big, big, bytes);
     conn.exec("INSERT INTO itest_lob VALUES (5, 'five', N'five', HEXTORAW('05'))");
     foreach (pass; 0 .. 2) // the second time the statement is re-executed from the cache
     {
@@ -83,7 +84,7 @@ void testLobLocators()
     dropTable(conn, "itest_loc");
     conn.exec("CREATE TABLE itest_loc (id NUMBER, c CLOB, n NCLOB, b BLOB)");
     const text = mixedText(100_000);
-    conn.exec("INSERT INTO itest_loc VALUES (1, :1, :1, :2)", text, new ubyte[70_000]);
+    conn.exec("INSERT INTO itest_loc VALUES (1, :1, :2, :3)", text, text, new ubyte[70_000]);
     conn.exec("INSERT INTO itest_loc VALUES (2, 'two', N'two', HEXTORAW('02'))");
     conn.exec("INSERT INTO itest_loc VALUES (3, NULL, NULL, NULL)");
     conn.commit();
