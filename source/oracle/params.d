@@ -12,8 +12,9 @@ $(TR $(TD integers) $(TD `NUMBER`))
 $(TR $(TD `float`) $(TD `BINARY_FLOAT`))
 $(TR $(TD `double`, `real`) $(TD `BINARY_DOUBLE`))
 $(TR $(TD `Decimal`) $(TD `NUMBER`, exactly (at most 40 significant digits)))
-$(TR $(TD strings, `char`) $(TD `VARCHAR2` (at most 32767 bytes)))
-$(TR $(TD `ubyte[]`, `UUID`) $(TD `RAW` (at most 32767 bytes)))
+$(TR $(TD strings, `char`) $(TD `VARCHAR2`; longer than 32767 bytes: for `CLOB` and `LONG` columns))
+$(TR $(TD `ubyte[]`, `UUID`) $(TD `RAW`; longer than 32767 bytes: for `BLOB` and `LONG RAW` columns))
+$(TR $(TD `Lob`) $(TD the LOB (e.g. a temporary LOB from `Connection.createLob`)))
 $(TR $(TD `Date`, `DateTime`) $(TD `DATE`))
 $(TR $(TD `SysTime`) $(TD `TIMESTAMP WITH TIME ZONE` with the time's UTC offset, to 100 ns))
 $(TR $(TD `Duration`) $(TD `INTERVAL DAY TO SECOND`))
@@ -41,6 +42,7 @@ import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 import dbwire.types.interval : MonthInterval;
 import oracle.exception : ClientException;
+import oracle.lob : Lob;
 import oracle.types.typeinfo : CharsetForm, OracleType;
 
 /// The largest VARCHAR2 and RAW bind value, in bytes.
@@ -73,7 +75,8 @@ struct Parameter
     /// Whether the type is character data (sent with the AL32UTF8 character set).
     @property bool isText() const @safe pure nothrow
     {
-        return type == OracleType.varchar || type == OracleType.char_ || type == OracleType.long_;
+        return type == OracleType.varchar || type == OracleType.char_ || type == OracleType.long_
+            || type == OracleType.clob;
     }
 
     /++
@@ -81,8 +84,8 @@ struct Parameter
     Attributes are inferred: `@safe` except for `Variant`, whose copies are `@system`.
 
     Throws: `ClientException` for values Oracle can't hold (NaN is fine:
-    BINARY_DOUBLE has it; a `Decimal` with more than 40 digits, strings or
-    bytes over 32767 bytes, dates outside -4712 to 9999).
+    BINARY_DOUBLE has it; a `Decimal` with more than 40 digits, dates outside
+    -4712 to 9999).
     +/
     static Parameter of(T)(T value)
     {
@@ -209,6 +212,8 @@ private Parameter typeOf(T)() @safe
         return typed(OracleType.intervalDs, 11);
     else static if (is(T == MonthInterval))
         return typed(OracleType.intervalYm, 5);
+    else static if (is(T : Lob))
+        return typed(OracleType.blob, 112);
     else
         static assert(false, "Unsupported parameter type " ~ T.stringof);
 }
@@ -238,12 +243,9 @@ private Parameter make(T)(T value)
             const text = value;
         else
             const text = value.to!string;
-        if (text.length > maxBindBytes)
-            throw new ClientException("A string parameter of " ~ text.length.to!string ~ " bytes: at most "
-                    ~ maxBindBytes.to!string ~ " (longer values are LOBs)");
         p.data = cast(immutable(ubyte)[]) text;
         // room for the server's conversion of the UTF-8 text (as other clients size it)
-        p.bufferSize = cast(uint)(text.length * 4 > maxBindBytes ? maxBindBytes : text.length ? text.length * 4 : 4);
+        p.bufferSize = cast(uint)(text.length ? (text.length < 0x1FFF_FFFF ? text.length * 4 : 0x7FFF_FFFF) : 4);
     }
     else static if (is(U == UUID))
     {
@@ -252,9 +254,6 @@ private Parameter make(T)(T value)
     }
     else static if (is(U : const(ubyte)[]))
     {
-        if (value.length > maxBindBytes)
-            throw new ClientException("A binary parameter of " ~ value.length.to!string ~ " bytes: at most "
-                    ~ maxBindBytes.to!string ~ " (longer values are LOBs)");
         p.data = value.idup;
         p.bufferSize = cast(uint)(value.length ? value.length : 1);
     }
@@ -268,6 +267,16 @@ private Parameter make(T)(T value)
         p.data = encodeIntervalDs(value);
     else static if (is(U == MonthInterval))
         p.data = encodeIntervalYm(value);
+    else static if (is(U : Lob))
+    {
+        if (value is null)
+            p.isNull = true;
+        else
+        {
+            p.type = value.type;
+            p.data = value.locator;
+        }
+    }
     if (p.data is null) // an empty string or array: NULL in Oracle
         p.isNull = true;
     return p;
@@ -281,7 +290,7 @@ private Parameter ofVariant(Variant value) @trusted // Variant.get is @system
         return Parameter.nullOf!string();
     static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
             Decimal, string, wstring, dstring, char, ubyte[], immutable(ubyte)[], const(ubyte)[], UUID, Date,
-            DateTime, SysTime, Duration, MonthInterval, Parameter))
+            DateTime, SysTime, Duration, MonthInterval, Parameter, Lob))
         if (value.type == typeid(T))
             return Parameter.of(value.get!T);
     throw new ClientException("Unsupported Variant parameter type " ~ value.type.toString);

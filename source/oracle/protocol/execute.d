@@ -56,6 +56,8 @@ struct ExecuteRequest
     const(bool)[] sendValue;
     /// Ask for the row count of each execution (array DML).
     bool dmlRowCounts;
+    /// Column defines (the DEFINE option): the type each column is to be fetched as.
+    const(ColumnInfo)[] defines;
 }
 
 /// Execute flags (al8i4[9]).
@@ -94,8 +96,16 @@ ubyte[] buildExecute(const ref ExecuteRequest r, ubyte sequence, ubyte fieldVers
     }
     foreach (_; 0 .. 5)
         w.u8(0); // al8app, al8txn, al8txl, al8kv, al8kvl
-    w.u8(0); // defines
-    w.ub(0);
+    if (r.defines.length) // defines
+    {
+        w.u8(1);
+        w.ub(r.defines.length);
+    }
+    else
+    {
+        w.u8(0);
+        w.ub(0);
+    }
     w.ub(0); // registration ID (low 32 bits)
     w.u8(0); // al8objlist
     w.u8(1); // al8objlen pointer
@@ -148,8 +158,47 @@ ubyte[] buildExecute(const ref ExecuteRequest r, ubyte sequence, ubyte fieldVers
     }
     foreach (ref b; r.binds)
         putBindMetadata(w, b, fieldVersion);
+    foreach (ref c; r.defines)
+        putDefineMetadata(w, c, fieldVersion);
     putBindRows(w, r.rows, r.sendValue);
     return w.data;
+}
+
+/// The buffer size of LOB locators in binds and defines.
+enum uint lobLocatorSize = 112;
+
+/// Continuation flag of LOB binds and defines.
+enum ulong lobPrefetchFlag = 0x0200_0000;
+
+/++
+The define of one column: its wire type (`ColumnInfo.wireType`), with LOBs
+fetched as LONG / LONG RAW values or as locators.
++/
+void putDefineMetadata(ref TtcWriter w, const ColumnInfo c, ubyte fieldVersion) @safe pure
+{
+    import oracle.protocol.negotiate : CharsetId;
+
+    const t = c.wireType;
+    const text = t == OracleType.varchar || t == OracleType.char_ || t == OracleType.long_ || t == OracleType.clob;
+    uint size = c.bufferSize;
+    if (t == OracleType.long_ || t == OracleType.longRaw)
+        size = 0x7FFF_FFFF;
+    else if (t == OracleType.clob || t == OracleType.blob)
+        size = lobLocatorSize;
+    w.u8(t);
+    w.u8(0x01); // use indicators
+    w.u8(0); // precision
+    w.u8(0); // scale
+    w.ub(size);
+    w.ub(0); // maximum array elements
+    w.ub(t == OracleType.clob || t == OracleType.blob ? lobPrefetchFlag : 0);
+    w.ub(0); // object type ID
+    w.ub(0); // object type version
+    w.ub(text ? CharsetId.al32utf8 : 0);
+    w.u8(text ? (c.charsetForm ? c.charsetForm : CharsetForm.implicit) : CharsetForm.none);
+    w.ub(0); // LOB prefetch length
+    if (fieldVersion >= TtcFieldVersion.v12_2)
+        w.ub(0); // oaccolid
 }
 
 /// The metadata of one bind.
@@ -163,7 +212,8 @@ void putBindMetadata(ref TtcWriter w, const Parameter b, ubyte fieldVersion) @sa
     w.u8(0); // scale
     w.ub(b.bufferSize);
     w.ub(0); // maximum array elements
-    w.ub(0); // continuation flags
+    const lob = b.type == OracleType.clob || b.type == OracleType.blob;
+    w.ub(lob ? lobPrefetchFlag : 0); // continuation flags
     w.ub(0); // object type ID
     w.ub(0); // object type version
     w.ub(b.isText ? CharsetId.al32utf8 : 0);
@@ -184,16 +234,33 @@ void putBindRows(ref TtcWriter w, const(Parameter[])[] rows, const(bool)[] sendV
         if (!any)
             continue; // no values to send (no binds, or only RETURNING targets): no ROW_DATA
         w.u8(MessageType.rowData);
-        foreach (i, ref p; row)
-        {
-            if (sendValue.length && !sendValue[i])
-                continue;
-            if (p.type == OracleType.cursor)
-                w.bytes([1, 0]); // a NULL cursor
-            else
-                w.clr(p.isNull ? null : p.data);
-        }
+        // values over the 32767-byte limit (LONG binding) come after all the others
+        foreach (pass; 0 .. 2)
+            foreach (i, ref p; row)
+            {
+                if (sendValue.length && !sendValue[i])
+                    continue;
+                if (isLongBind(p) != (pass == 1))
+                    continue;
+                putBindValue(w, p);
+            }
     }
+}
+
+/// Whether a bind is sent as a long value: VARCHAR2 or RAW bigger than 32767 bytes.
+bool isLongBind(const ref Parameter p) @safe pure nothrow
+{
+    return (p.type == OracleType.varchar || p.type == OracleType.raw) && p.bufferSize > 32_767;
+}
+
+private void putBindValue(ref TtcWriter w, const ref Parameter p) @safe pure
+{
+    if (p.type == OracleType.cursor)
+        w.bytes([1, 0]); // a NULL cursor
+    else if (p.type == OracleType.clob || p.type == OracleType.blob || p.type == OracleType.bfile)
+        w.bytesWithLength(p.isNull ? null : p.data); // a locator
+    else
+        w.clr(p.isNull ? null : p.data);
 }
 
 /++
@@ -358,10 +425,11 @@ Throws: `ClientException` for column types this client can't read yet;
 immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size_t maxLength) @safe
 {
     // a column with no size (e.g. a NULL literal) is always NULL and sends nothing
-    if (c.bufferSize == 0 && c.type != OracleType.long_ && c.type != OracleType.longRaw
-            && c.type != OracleType.urowid)
+    const type = c.wireType;
+    if (c.bufferSize == 0 && type != OracleType.long_ && type != OracleType.longRaw && type != OracleType.urowid
+            && !c.isLob)
         return null;
-    switch (c.type)
+    switch (type)
     {
     case OracleType.varchar:
     case OracleType.number:
@@ -386,6 +454,23 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
         return v;
     case OracleType.urowid:
         return r.bytesWithLength();
+    case OracleType.clob:
+    case OracleType.blob:
+        // a locator: its length, the LOB's size and chunk size, the locator; kept as u64be size, u32be chunk, locator
+        const length = r.ub4();
+        if (length == 0)
+            return null;
+        TtcWriter w;
+        const size = r.ub8();
+        w.u32be(cast(uint)(size >> 32));
+        w.u32be(cast(uint) size);
+        w.u32be(r.ub4());
+        w.bytes(r.clr());
+        return (() @trusted => cast(immutable(ubyte)[]) w.data)();
+    case OracleType.bfile:
+        if (r.ub4() == 0)
+            return null;
+        return r.clr();
     case OracleType.rowid:
         // a length byte (0/255: NULL), then block address, partition, a byte, block, slot
         const length = r.u8();
@@ -646,4 +731,31 @@ private string toText(T)(T v) @safe pure
     assert(e.number == 24_381 && e.rowCount == 2 && e.batchErrors.length == 1);
     assert(e.batchErrors[0].offset == 1 && e.batchErrors[0].code == 1);
     assert(e.batchErrors[0].message == "ORA-00001: unique");
+}
+
+// Column defines against python-oracledb's bytes for the same queries (Oracle 26ai)
+@safe unittest
+{
+    ColumnInfo c;
+    c.type = OracleType.clob;
+    c.charsetId = 873;
+    c.charsetForm = CharsetForm.implicit;
+    c.bufferSize = 4000;
+    c.fetchType = OracleType.long_; // contents as values
+    TtcWriter w;
+    putDefineMetadata(w, c, TtcFieldVersion.v19_1_ext1);
+    assert(w.data == [
+        0x08, 0x01, 0, 0, 0x04, 0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0x02, 0x03, 0x69, 0x01, 0, 0
+    ]);
+    c.fetchType = OracleType.clob; // locators
+    w = TtcWriter.init;
+    putDefineMetadata(w, c, TtcFieldVersion.v19_1_ext1);
+    assert(w.data == [
+        0x70, 0x01, 0, 0, 0x01, 0x70, 0, 0x04, 0x02, 0, 0, 0, 0, 0, 0x02, 0x03, 0x69, 0x01, 0, 0
+    ]);
+    c.charsetForm = CharsetForm.nchar; // NCLOB: the same, form 2
+    c.fetchType = OracleType.long_;
+    w = TtcWriter.init;
+    putDefineMetadata(w, c, TtcFieldVersion.v19_1_ext1);
+    assert(w.data[$ - 3] == 0x02);
 }

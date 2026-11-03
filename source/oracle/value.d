@@ -19,7 +19,9 @@ import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 import dbwire.types.interval : MonthInterval;
 import oracle.exception : ClientException;
-import oracle.types.typeinfo : ColumnInfo, OracleType;
+import oracle.connection : Connection;
+import oracle.lob : Lob;
+import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
 
 /// A column value: its metadata and its bytes in the wire form (`null` for NULL).
 struct Value
@@ -36,6 +38,8 @@ struct Value
     Rebindable!(immutable TimeZone) sessionZone;
     /// ditto
     Rebindable!(immutable TimeZone) databaseZone;
+    /// The connection, for reading LOBs fetched as locators.
+    package(oracle) Connection connection;
 
     /// Whether the value is NULL (empty strings are NULL in Oracle).
     @property bool isNull() const @safe pure nothrow
@@ -84,6 +88,11 @@ struct Value
         case OracleType.raw:
         case OracleType.longRaw:
             return hex(bytes);
+        case OracleType.clob:
+            return column.wireType == OracleType.clob ? getLob().readText() : text();
+        case OracleType.blob:
+        case OracleType.bfile:
+            return hex(getBytes());
         case OracleType.rowid:
             return rowidText(bytes);
         case OracleType.urowid:
@@ -288,9 +297,50 @@ struct Value
     {
         if (isNull)
             return null;
+        if (column.isLob && column.wireType != OracleType.long_ && column.wireType != OracleType.longRaw)
+            return column.type == OracleType.clob ? cast(immutable(ubyte)[]) getLob().readText() : getLob().read();
         if (column.charsetForm != 0 && isText)
             return cast(immutable(ubyte)[]) text();
         return bytes;
+    }
+
+    /++
+    The LOB of a CLOB, NCLOB or BLOB column fetched as locators
+    (`ConnectionOptions.lobLocators`), or of a BFILE column; null for NULL.
+
+    Throws: `ClientException` for other columns (LOB contents fetched as values: use `getString`, `getBytes`).
+    +/
+    Lob getLob() const @safe
+    {
+        if (isNull)
+            return null;
+        const t = column.wireType;
+        if (t != OracleType.clob && t != OracleType.blob && t != OracleType.bfile)
+            throw new ClientException("Column " ~ column.name ~ " has no LOB locators (" ~ (column.isLob
+                    ? "LOB contents are fetched as values: set lob_locators for locators)" : "not a LOB)"));
+        if (connection is null)
+            throw new ClientException("No connection to read the LOB with");
+        // CLOB and BLOB values are kept as u64be size, u32be chunk size, locator; BFILE values are the locator
+        const locator = t == OracleType.bfile ? bytes : bytes.length >= 12 ? bytes[12 .. $] : null;
+        return new Lob((() @trusted => cast(Connection) connection)(), column.type, column.charsetForm, locator);
+    }
+
+    /++
+    The size the server reported with a LOB locator (characters or bytes), without a round trip.
+
+    Throws: `ClientException` for values that are not CLOB/NCLOB/BLOB locators.
+    +/
+    ulong getLobSize() const @safe
+    {
+        if (isNull)
+            return 0;
+        const t = column.wireType;
+        if ((t != OracleType.clob && t != OracleType.blob) || bytes.length < 12)
+            throw unsupported("LOB size");
+        ulong size;
+        foreach (b; bytes[0 .. 8])
+            size = (size << 8) | b;
+        return size;
     }
 
     /++
@@ -427,7 +477,7 @@ struct Value
     $(UL
     $(LI NUMBER: `long` for whole-number columns of up to 18 digits
          (`NUMBER(p)`, p ≤ 18), else `Decimal`; BINARY_FLOAT `float`, BINARY_DOUBLE `double`;)
-    $(LI character types, ROWID, UROWID: `string`; RAW, LONG RAW: `ubyte[]`;)
+    $(LI character types, CLOB, NCLOB, ROWID, UROWID: `string`; RAW, LONG RAW, BLOB: `ubyte[]`; BFILE: `Lob`;)
     $(LI DATE: `DateTime`; TIMESTAMP (all kinds): `SysTime` (see `getSysTime`);)
     $(LI INTERVAL YEAR TO MONTH: `MonthInterval`; DAY TO SECOND: `Duration`; BOOLEAN: `bool`.)
     )
@@ -457,6 +507,12 @@ struct Value
         case OracleType.raw:
         case OracleType.longRaw:
             return makeVariant(bytes.dup);
+        case OracleType.clob:
+            return makeVariant(getString());
+        case OracleType.blob:
+            return makeVariant(getBytes().dup);
+        case OracleType.bfile:
+            return makeVariant(getLob());
         case OracleType.date:
             return makeVariant(getDateTime());
         case OracleType.timestamp:

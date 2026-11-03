@@ -68,6 +68,20 @@ struct ColumnInfo
     string typeSchema;
     /// ditto
     string typeName;
+    /// The type the column is fetched as (LOBs: as LONG / LONG RAW values or as locators); none: `type`.
+    package(oracle) OracleType fetchType = cast(OracleType) 0;
+
+    /// The type the values arrive as.
+    @property OracleType wireType() const @safe pure nothrow
+    {
+        return fetchType ? fetchType : type;
+    }
+
+    /// Whether the column is a LOB (CLOB, NCLOB, BLOB, BFILE).
+    @property bool isLob() const @safe pure nothrow
+    {
+        return type == OracleType.clob || type == OracleType.blob || type == OracleType.bfile;
+    }
 
     /// The type's name in SQL, e.g. `NUMBER(10,2)`, `VARCHAR2(30)`.
     string typeText() const @safe pure

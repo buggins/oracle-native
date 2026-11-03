@@ -79,6 +79,12 @@ struct ConnectionOptions
     `Connection.rollback` (DDL statements commit implicitly).
     +/
     bool autoCommit;
+    /++
+    Fetch CLOB, NCLOB and BLOB columns as locators (`Value.getLob`: read,
+    write, trim them piece by piece) instead of their contents. Off by
+    default: their contents come with the rows (`getString`, `getBytes`).
+    +/
+    bool lobLocators;
     /// Rows fetched per round trip (also returned with a query's execution).
     uint fetchSize = 100;
     /++
@@ -312,7 +318,7 @@ struct ConnectionOptions
     `user`, `password`, `secure`/`tcps` (flag), `tls_ca_file`/`ssl_ca`,
     `tls_cert_file`, `tls_key_file`, `tls_server_name`, `tls_skip_verify`,
     `program`, `machine`, `osuser`, `terminal`, `time_zone`, `sdu`,
-    `auto_commit` (flag), `fetch_size`, `statement_cache_size`,
+    `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
     `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`).
@@ -402,6 +408,9 @@ struct ConnectionOptions
                 break;
             case "sdu":
                 o.sdu = parseSdu(value);
+                break;
+            case "lob_locators":
+                o.lobLocators = parseFlag(key, value);
                 break;
             case "statement_cache_size":
                 try

@@ -14,6 +14,13 @@ All notable changes to oracle-native are documented here. The format follows
 
 ### Added
 
+- LOBs and long data (#5): CLOB, NCLOB and BLOB columns fetched with their
+  contents (as LONG / LONG RAW) or, with the `lob_locators` option, as
+  locators; `Lob` (length, read and readText at offsets, write and
+  writeText, trim, free), `Value.getLob`, `getLobSize`; temporary LOBs
+  (`Connection.createLob`) bound as parameters; BFILE reads; strings and
+  bytes of any length bound (values over 32767 bytes are sent after the
+  others, as LONG binds require).
 - Bind variables and statements (#4): `:1`, `:name` and `?` placeholders,
   `Parameter` (D values to Oracle types, NULLs, named binds, `Variant`),
   OUT and IN OUT parameters (`Parameter.output`, `inOut`, `refCursor`),
