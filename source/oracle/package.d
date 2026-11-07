@@ -34,7 +34,7 @@ enum uint oracleVersionMajor = 0;
 /// ditto
 enum uint oracleVersionMinor = 3;
 /// ditto
-enum uint oracleVersionPatch = 0;
+enum uint oracleVersionPatch = 1;
 
 /// Library version as a string, e.g. `"0.1.0"`.
 enum string oracleVersion = versionString(oracleVersionMajor, oracleVersionMinor, oracleVersionPatch);

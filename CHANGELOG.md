@@ -6,6 +6,8 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+## 0.3.1 — 2026-11-07
+
 ### Changed
 
 - dbwire 0.8 (`~>0.8.0`, #38), the same as postgresql-native 0.5 and
