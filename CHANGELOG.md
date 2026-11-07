@@ -4,6 +4,16 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- dbwire 0.8 (`~>0.8.0`, #38), the same as postgresql-native 0.5 and
+  clickhoused 0.9, so they can be used in one build (and in ddbc). With it,
+  `TIMESTAMP WITH TIME ZONE` values with a region name follow the tz
+  database's TZif files (buggins/dbwire#33): the local mean time before a
+  zone's first transition and daylight saving time after 2037.
+
 ## 0.3.0 — 2026-11-03
 
 ### Added
