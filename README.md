@@ -5,7 +5,7 @@ protocols over TCP, written in pure D, for ordinary threads (blocking sockets)
 and vibe.d fibers. No Oracle Instant Client, no OCI, no ODBC, no C libraries at
 build time.
 
-> **Status: 0.3.0.** The API may still change before 1.0;
+> **Status: 0.3.1.** The API may still change before 1.0;
 > the plan is tracked in the
 > [roadmap issue](https://github.com/buggins/oracle-native/issues/10), changes
 > in the [changelog](CHANGELOG.md).
@@ -14,7 +14,7 @@ Add it to your `dub.json`:
 
 ```json
 "dependencies": {
-    "oracle-native": "~>0.3.0"
+    "oracle-native": "~>0.3.1"
 }
 ```
 
