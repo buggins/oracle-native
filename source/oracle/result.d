@@ -39,6 +39,8 @@ final class QueryResult
     package uint cursorId;
     package immutable(ubyte)[][][] batch; // the rows of the last response
     package immutable(ubyte)[][] lastRow; // the last row read, for repeated column values
+    package immutable(ubyte)[][] rowSlab; // the unused part of the arrays the rows' values are kept in
+    package uint prefetch; // the rows fetched with the execution (and the define)
     private size_t index;
     package bool allFetched; // the server reported the end of the rows
     private bool finished; // the connection is released
@@ -48,7 +50,7 @@ final class QueryResult
     package bool child; // an implicit result or REF cursor, not fetching yet
     package bool needsExecuteFetch; // a child's first fetch is an EXECUTE with the fetch option
     package const(Parameter)[] binds; // the binds, in bind order
-    package string[] bindNames; // their placeholder names
+    package const(string)[] bindNames; // their placeholder names (shared with the statement cache)
     package bool[] returning; // which are RETURNING INTO targets
     package immutable(ubyte)[] directions; // from the IO vector: BindDirection per bind
     package immutable(ubyte)[][][] outputData; // OUT values per bind (several rows for RETURNING)
@@ -62,6 +64,7 @@ final class QueryResult
     {
         this.conn = conn;
         lease = conn.lease;
+        prefetch = conn.options.fetchSize;
     }
 
     /// The result columns (none for statements other than queries).
@@ -365,7 +368,7 @@ struct Row
     }
 
     /// ditto
-    double getDouble(size_t i) const @safe pure
+    double getDouble(size_t i) const @safe
     {
         return this[i].getDouble();
     }

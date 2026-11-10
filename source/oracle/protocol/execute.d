@@ -9,6 +9,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.protocol.execute;
 
 import std.conv : to;
+import dbwire.io.buffer : toBigEndian;
 import oracle.exception : ClientException, ProtocolException;
 import oracle.protocol.messages : FunctionCode, functionHeader;
 import oracle.protocol.negotiate : MessageType, TtcFieldVersion;
@@ -506,7 +507,7 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
     case OracleType.intervalYm:
     case OracleType.intervalDs:
     case OracleType.boolean:
-        return r.clr(maxLength);
+        return r.clr(maxLength, true); // a column value: from the arena
     case OracleType.long_:
     case OracleType.longRaw:
         // chunked, then an indicator and a return code
@@ -522,13 +523,16 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
         const length = r.ub4();
         if (length == 0)
             return null;
-        TtcWriter w;
-        const size = r.ub8();
-        w.u32be(cast(uint)(size >> 32));
-        w.u32be(cast(uint) size);
-        w.u32be(r.ub4());
-        w.bytes(r.clr());
-        return (() @trusted => cast(immutable(ubyte)[]) w.data)();
+        static ubyte[12] sizes(ulong size, uint chunk) @safe pure nothrow @nogc
+        {
+            ubyte[12] b;
+            b[0 .. 8] = toBigEndian(size);
+            b[8 .. 12] = toBigEndian(chunk);
+            return b;
+        }
+
+        immutable ubyte[12] lengths = sizes(r.ub8(), r.ub4()); // the LOB's size, then its chunk size
+        return lengths[] ~ r.clr();
     case OracleType.bfile:
         if (r.ub4() == 0)
             return null;
@@ -548,13 +552,13 @@ immutable(ubyte)[] readColumnValue(ref TtcReader r, const ref ColumnInfo c, size
         const length = r.u8();
         if (length == 0 || length == 255)
             return null;
-        TtcWriter w; // kept as ub4 ub2 ub1 ub4 ub2, big-endian, 13 bytes
-        w.u32be(r.ub4());
-        w.u16be(r.ub2());
-        w.u8(r.u8());
-        w.u32be(r.ub4());
-        w.u16be(r.ub2());
-        return (() @trusted => cast(immutable(ubyte)[]) w.data)();
+        ubyte[13] rowid; // kept as ub4 ub2 ub1 ub4 ub2, big-endian
+        rowid[0 .. 4] = toBigEndian(r.ub4());
+        rowid[4 .. 6] = toBigEndian(r.ub2());
+        rowid[6] = r.u8();
+        rowid[7 .. 11] = toBigEndian(r.ub4());
+        rowid[11 .. 13] = toBigEndian(r.ub2());
+        return rowid[].idup;
     default:
         throw new ClientException("Columns of type " ~ c.typeText() ~ " are not supported yet (column "
                 ~ c.name ~ ")");

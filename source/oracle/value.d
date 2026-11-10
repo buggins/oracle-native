@@ -81,7 +81,7 @@ struct Value
     {
         import oracle.protocol.auth : hex;
         import oracle.types.floats : decodeBinaryFloat, floatText;
-        import oracle.types.number : decodeNumber;
+        import oracle.types.number : numberText;
         import oracle.types.rowid : rowidText, urowidText;
         import oracle.types.oson : isOson, osonToText;
         import oracle.types.temporal;
@@ -96,7 +96,7 @@ struct Value
         case OracleType.long_:
             return text();
         case OracleType.number:
-            return decodeNumber(bytes).toString();
+            return numberText(bytes);
         case OracleType.binaryFloat:
         case OracleType.binaryDouble:
             return floatText(decodeBinaryFloat(bytes), column.type == OracleType.binaryFloat);
@@ -234,12 +234,16 @@ struct Value
                 throw new ClientException("'" ~ text() ~ "' is not a boolean (column " ~ column.name ~ ")");
             }
         case OracleType.number:
-            import oracle.types.number : decodeNumber;
+            import oracle.types.number : NumberDigits, parseNumber;
 
-            return decodeNumber(bytes).digits.length != 0;
+            NumberDigits n;
+            parseNumber(bytes, n);
+            return n.length != 0;
         case OracleType.binaryFloat:
         case OracleType.binaryDouble:
-            return getDouble() != 0;
+            import oracle.types.floats : decodeBinaryFloat;
+
+            return decodeBinaryFloat(bytes) != 0;
         default:
             throw unsupported("bool");
         }
@@ -251,7 +255,7 @@ struct Value
 
     Throws: `ClientException` for other types or texts.
     +/
-    double getDouble() const @safe pure
+    double getDouble() const @safe
     {
         import std.conv : ConvException;
         import oracle.types.floats : decodeBinaryFloat;
@@ -288,20 +292,29 @@ struct Value
     Decimal getDecimal() const @safe
     {
         import dbwire.types.wideint : Int256;
-        import oracle.types.number : decodeNumber;
+        import oracle.types.number : NumberDigits, parseNumber;
 
         if (isNull)
             return Decimal.init;
         switch (column.type)
         {
         case OracleType.number:
-            const n = decodeNumber(bytes);
+            NumberDigits n;
+            parseNumber(bytes, n);
             if (n.infinite)
                 throw new ClientException("NUMBER infinity is not a decimal (column " ~ column.name ~ ")");
-            if (n.digits.length == 0)
+            if (n.length == 0)
                 return Decimal.init;
-            return Decimal(Int256.fromString((n.negative ? "-" : "") ~ n.digits),
-                    cast(int) n.digits.length - n.pointPosition);
+            const digits = n.buffer[0 .. n.length];
+            const scale = cast(int) digits.length - n.pointPosition;
+            if (digits.length <= 18) // the unscaled value fits a long: no text
+            {
+                long unscaled;
+                foreach (c; digits)
+                    unscaled = unscaled * 10 + (c - '0');
+                return Decimal(Int256(n.negative ? -unscaled : unscaled), scale);
+            }
+            return Decimal(Int256.fromString((n.negative ? "-" : "") ~ digits), scale);
         case OracleType.binaryFloat:
         case OracleType.binaryDouble:
             import std.math : isFinite;

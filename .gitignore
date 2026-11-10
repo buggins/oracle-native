@@ -34,3 +34,4 @@ dub.selections.json
 /integration-tests-*/integration-tests-*
 /examples/*/oracle-native_example-*
 /examples/*/example-*
+/bench/oracle-native-bench

@@ -312,13 +312,20 @@ struct RowRange(T) if (is(T == struct))
 /// The parameters of the mapped fields of `value`, in field order.
 package Parameter[] fieldParameters(T)(const ref T value)
 {
-    Parameter[] params;
+    auto params = new Parameter[columnNames!T.length];
+    fillFieldParameters(value, params);
+    return params;
+}
+
+/// The parameters of `value`'s mapped fields written into `params` (`columnNames!T.length` of them).
+package void fillFieldParameters(T)(const ref T value, Parameter[] params)
+{
+    size_t i;
     static foreach (name; FieldNameTuple!T)
     {
         static if (!hasUDA!(__traits(getMember, T, name), IgnoreField))
-            params ~= Parameter.of(__traits(getMember, value, name));
+            params[i++] = Parameter.of(__traits(getMember, value, name));
     }
-    return params;
 }
 
 /++

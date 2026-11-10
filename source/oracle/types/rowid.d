@@ -7,6 +7,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.rowid;
 
+import dbwire.io.buffer : fromBigEndian;
 import oracle.exception : ProtocolException;
 
 /++
@@ -20,10 +21,10 @@ string rowidText(scope const(ubyte)[] b) @safe pure
     static immutable alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     if (b.length != 13)
         throw new ProtocolException("Invalid ROWID length");
-    const ulong objectNumber = (cast(uint) b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-    const ulong file = (b[4] << 8) | b[5];
-    const ulong block = (cast(uint) b[7] << 24) | (b[8] << 16) | (b[9] << 8) | b[10];
-    const ulong slot = (b[11] << 8) | b[12];
+    const ulong objectNumber = fromBigEndian!uint(b[0 .. 4][0 .. 4]);
+    const ulong file = fromBigEndian!ushort(b[4 .. 6][0 .. 2]);
+    const ulong block = fromBigEndian!uint(b[7 .. 11][0 .. 4]);
+    const ulong slot = fromBigEndian!ushort(b[11 .. 13][0 .. 2]);
     char[18] s;
     size_t at;
     void put(ulong v, size_t width)

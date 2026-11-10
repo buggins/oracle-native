@@ -26,6 +26,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.types.temporal;
 
 import std.conv : to;
+import dbwire.io.buffer : fromBigEndian;
 import core.time : Duration, days, hnsecs, hours, minutes, nsecs, seconds;
 import std.datetime.date : Date, DateTime, DateTimeException;
 import std.datetime.systime : SysTime;
@@ -65,15 +66,24 @@ struct OracleDateTime
     }
 
     /// `YYYY-MM-DD HH:MI:SS` and, if `fractionDigits` > 0, `.` and that many digits of the fraction.
-    string text(int fractionDigits) const @safe pure
+    string text(int fractionDigits) const @safe pure nothrow
     {
-        import std.format : format;
-
-        auto s = format("%s%04d-%02d-%02d %02d:%02d:%02d", year < 0 ? "-" : "", year < 0 ? -year : year, month,
-                day, hour, minute, second);
-        if (fractionDigits > 0)
-            s ~= "." ~ format("%09d", nanoseconds)[0 .. fractionDigits > 9 ? 9 : fractionDigits];
-        return s;
+        TextBuffer t;
+        if (year < 0)
+            t.put('-');
+        t.number(year < 0 ? -year : year, 4);
+        t.put('-');
+        t.number(month, 2);
+        t.put('-');
+        t.number(day, 2);
+        t.put(' ');
+        t.number(hour, 2);
+        t.put(':');
+        t.number(minute, 2);
+        t.put(':');
+        t.number(second, 2);
+        t.fraction(nanoseconds, fractionDigits);
+        return t.text;
     }
 }
 
@@ -90,14 +100,17 @@ struct OracleZone
     string regionName;
 
     /// `+02:30`, `-08:00`, or the region name.
-    string text() const @safe pure
+    string text() const @safe pure nothrow
     {
-        import std.format : format;
-
         if (isRegion)
             return regionName;
         const m = offsetMinutes < 0 ? -offsetMinutes : offsetMinutes;
-        return format("%s%02d:%02d", offsetMinutes < 0 ? "-" : "+", m / 60, m % 60);
+        TextBuffer t;
+        t.put(offsetMinutes < 0 ? '-' : '+');
+        t.number(m / 60, 2);
+        t.put(':');
+        t.number(m % 60, 2);
+        return t.text;
     }
 
     /++
@@ -248,11 +261,14 @@ struct YearToMonth
     }
 
     /// As SQL writes it: `+02-03`, the years padded to `yearDigits`.
-    string text(int yearDigits) const @safe pure
+    string text(int yearDigits) const @safe pure nothrow
     {
-        import std.format : format;
-
-        return format("%s%0*d-%02d", years < 0 || months < 0 ? "-" : "+", yearDigits, abs(years), abs(months));
+        TextBuffer t;
+        t.put(years < 0 || months < 0 ? '-' : '+');
+        t.number(abs(years), yearDigits);
+        t.put('-');
+        t.number(abs(months), 2);
+        return t.text;
     }
 }
 
@@ -289,16 +305,20 @@ struct DayToSecond
     }
 
     /// As SQL writes it: `+03 04:05:06.789000`, the days padded to `dayDigits`, `fractionDigits` digits of fraction.
-    string text(int dayDigits, int fractionDigits) const @safe pure
+    string text(int dayDigits, int fractionDigits) const @safe pure nothrow
     {
-        import std.format : format;
-
         const negative = days < 0 || hours < 0 || minutes < 0 || seconds < 0 || nanoseconds < 0;
-        auto s = format("%s%0*d %02d:%02d:%02d", negative ? "-" : "+", dayDigits, abs(days), abs(hours),
-                abs(minutes), abs(seconds));
-        if (fractionDigits > 0)
-            s ~= "." ~ format("%09d", abs(nanoseconds))[0 .. fractionDigits > 9 ? 9 : fractionDigits];
-        return s;
+        TextBuffer t;
+        t.put(negative ? '-' : '+');
+        t.number(abs(days), dayDigits);
+        t.put(' ');
+        t.number(abs(hours), 2);
+        t.put(':');
+        t.number(abs(minutes), 2);
+        t.put(':');
+        t.number(abs(seconds), 2);
+        t.fraction(abs(nanoseconds), fractionDigits);
+        return t.text;
     }
 }
 
@@ -328,7 +348,7 @@ DayToSecond decodeDayToSecond(scope const(ubyte)[] b) @safe pure
 
 private uint u32(scope const(ubyte)[] b) @safe pure nothrow @nogc
 {
-    return (cast(uint) b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+    return fromBigEndian!uint(b[0 .. 4][0 .. 4]);
 }
 
 private int abs(int v) @safe pure nothrow @nogc
@@ -369,3 +389,70 @@ private int abs(int v) @safe pure nothrow @nogc
     const neg = decodeDayToSecond([0x7F, 0xFF, 0xFF, 0xFD, 0x38, 0x37, 0x36, 0x50, 0xF8, 0xD0, 0xC0]);
     assert(neg.text(3, 9) == "-003 04:05:06.789000000" && neg.duration < Duration.zero);
 }
+
+/// Text built in a stack buffer of `capacity` characters, copied once (`text`).
+package(oracle) struct TextBufferOf(size_t capacity)
+{
+    char[capacity] buffer = void;
+    size_t length;
+
+    void put(char c) @safe pure nothrow @nogc
+    {
+        buffer[length++] = c;
+    }
+
+    void put(scope const(char)[] s) @safe pure nothrow @nogc
+    {
+        buffer[length .. length + s.length] = s[];
+        length += s.length;
+    }
+
+    // `count` times `c`
+    void fill(char c, size_t count) @safe pure nothrow @nogc
+    {
+        buffer[length .. length + count] = c;
+        length += count;
+    }
+
+    // `v` in decimal, padded with zeros to `width` digits (at most 20)
+    void number(ulong v, int width) @safe pure nothrow @nogc
+    {
+        char[20] digits = void;
+        size_t n;
+        do
+        {
+            digits[$ - ++n] = cast(char)('0' + v % 10);
+            v /= 10;
+        }
+        while (v);
+        foreach (i; n .. (width > 20 ? 20 : width))
+            put('0');
+        buffer[length .. length + n] = digits[$ - n .. $];
+        length += n;
+    }
+
+    // `.` and the first `count` (at most 9) digits of a 9-digit fraction of nanoseconds; nothing for 0 digits
+    void fraction(uint nanoseconds, int count) @safe pure nothrow @nogc
+    {
+        if (count <= 0)
+            return;
+        put('.');
+        char[9] digits = void;
+        foreach_reverse (ref d; digits)
+        {
+            d = cast(char)('0' + nanoseconds % 10);
+            nanoseconds /= 10;
+        }
+        const k = count > 9 ? 9 : count;
+        buffer[length .. length + k] = digits[0 .. k];
+        length += k;
+    }
+
+    @property string text() const @safe pure nothrow
+    {
+        return buffer[0 .. length].idup;
+    }
+}
+
+/// A buffer for the date, time and interval texts (they are short).
+package(oracle) alias TextBuffer = TextBufferOf!96;
