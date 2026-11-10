@@ -8,6 +8,9 @@ All notable changes to oracle-native are documented here. The format follows
 
 ### Changed
 
+- `numberToDouble` (and `Value.getDouble`/`Row.getDouble`) is no longer
+  `pure`: values beyond its exact fast path are read with C's `strtod` (#48).
+
 From the review of attributes and D idioms (#47):
 
 - `@safe` code can pass a `Variant` (e.g. `row.getVariant(0)`) to `exec`,
@@ -30,6 +33,34 @@ From the review of attributes and D idioms (#47):
 
 ### Performance
 
+From the review of allocations (#48; numbers in `doc/benchmarks.md`, from
+the new `bench/` subpackage with an in-memory server):
+
+- Rows: DATA packets are read straight from the socket into the reader's
+  buffer (no copy per packet), values are carved from a shared arena (4 to
+  64 KB buffers; a value kept alive keeps its buffer alive), and the rows'
+  value arrays come from one array per fetch: iterating rows 2.7 times
+  faster, 252 bytes per row instead of 456 for 8 columns.
+- Long values in chunks (LONG, LOBs read as LONG, JSON and VECTOR images)
+  are read into one growing array instead of one per chunk.
+- NUMBER getters without text: `getLong`, `getDouble` (exact for up to 15
+  digits and powers of ten up to ±22, else C's `strtod`, correctly rounded:
+  Phobos's parser was used before and isn't always), `getDecimal` and
+  `getString` (one allocation): 3 to 13 times faster.
+- DATE, TIMESTAMP, time zone and interval texts (also in JSON text) built
+  in a stack buffer instead of `format`: about 10 times faster.
+- `insert`: the parameters of each round trip in one reused array, and
+  positional binds in placeholder order taken over without rearranging them
+  (also `execMany`): 2.4 times faster.
+- Requests: written by index into a growing buffer, sent without being
+  copied into a second one, through one reused packet buffer.
+- `queryRow` and `queryValue` fetch one row with the execution instead of
+  `fetchSize` rows.
+- `Variant` parameters: the type is found by identity (5 times faster);
+  VECTOR images encoded into one array (4.5 times faster) and decoded from
+  one slice (3 times faster); OSON text appends unescaped runs as slices;
+  JSON strings without escapes are slices of the text; `?` placeholders are
+  rewritten without temporary strings.
 - BINARY_FLOAT and BINARY_DOUBLE text (`getString`, `getDecimal`, JSON text
   and JSON binds) from dbwire's `shortestDigits` instead of a loop of
   `snprintf` and `strtod` calls (#46): 4 to 6 times faster, one allocation

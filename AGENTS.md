@@ -52,6 +52,7 @@ dub run :integration-tests-phobos                          # integration tests, 
 dub run :integration-tests-vibe                            # the same tests in vibe.d tasks
 dub run :integration-tests-vibe1                           # ... with vibe-core 1.x
 ORACLE_HOST=localhost:11521 ORACLE_SERVICE=FREEPDB1 ORACLE_PASSWORD=Test_password123 dub run :integration-tests-phobos
+dub run :bench -b release [-- --filter query/]              # benchmarks (doc/benchmarks.md); compare the min column
 sh integration-tests/tls/start-proxy.sh 127.0.0.1:11521 12484   # TLS proxy as a TCPS stand-in, then add:
 ORACLE_TLS_HOST=127.0.0.1:12484 ORACLE_TLS_CA=$PWD/integration-tests/tls/ca.pem
 sh integration-tests/tls/start-proxy.sh 127.0.0.1:11521 12485 oracle-native-tls-client client   # mutual TLS:
@@ -102,6 +103,9 @@ integration-tests/     shared harness (dub subpackage `:integration-tests`); tls
 integration-tests-phobos/, integration-tests-vibe/, integration-tests-vibe1/   runners (vibe1: vibe-core 1.22.6,
                        sharing the vibe runner's sources)
 examples/basic, examples/vibe   dub subpackages :example-basic, :example-vibe (ORACLE_CONNECTION, ORACLE_USER, ORACLE_PASSWORD)
+bench/                 benchmarks (dub subpackage `:bench`, local runs only): fakeserver.d (an in-memory server: TNS ACCEPT,
+                       negotiation, O5LOGON computed with dbwire's crypto, then scripted responses), cases.d, runner.d;
+                       results in doc/benchmarks.md
 ```
 
 ## Protocol behaviour learned from real servers

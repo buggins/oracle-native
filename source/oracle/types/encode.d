@@ -109,12 +109,18 @@ immutable(ubyte)[] encodeBinaryFloat(float v) @safe pure nothrow
 /// The IEEE bits (big-endian) with the sign bit flipped for positive numbers, all bits for negative ones.
 private immutable(ubyte)[] flipped(scope ubyte[] b) @safe pure nothrow
 {
+    flipSortable(b);
+    return b.idup;
+}
+
+/// Turns big-endian IEEE bits into Oracle's sortable form, in place (see `encodeBinaryDouble`).
+package(oracle) void flipSortable(scope ubyte[] b) @safe pure nothrow @nogc
+{
     if (b[0] & 0x80)
         foreach (ref c; b)
             c ^= 0xFF;
     else
         b[0] |= 0x80;
-    return b.idup;
 }
 
 /++

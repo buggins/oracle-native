@@ -398,14 +398,21 @@ private Parameter ofVariant(ref const Variant value) @safe
 {
     import std.meta : AliasSeq;
 
+    alias Types = AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real, Decimal,
+            string, wstring, dstring, char, ubyte[], immutable(ubyte)[], const(ubyte)[], UUID, Date, DateTime, SysTime,
+            Duration, MonthInterval, Parameter, Lob, Vector, float[], double[], JSONValue);
+
     if (!value.hasValue)
         return Parameter.nullOf!string();
-    static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
-            Decimal, string, wstring, dstring, char, ubyte[], immutable(ubyte)[], const(ubyte)[], UUID, Date,
-            DateTime, SysTime, Duration, MonthInterval, Parameter, Lob, Vector, float[], double[], JSONValue))
-        if (sameType(value.type, typeid(T)))
+    const type = value.type;
+    // the same TypeInfo object (a pointer comparison); then equal ones, which other shared libraries may have
+    static foreach (T; Types)
+        if (type is typeid(T))
             return Parameter.of((() @trusted => value.get!T)()); // Variant.get is @system; the type was checked
-    throw new ClientException("Unsupported Variant parameter type " ~ value.type.toString);
+    static foreach (T; Types)
+        if (sameType(type, typeid(T)))
+            return Parameter.of((() @trusted => value.get!T)()); // as above
+    throw new ClientException("Unsupported Variant parameter type " ~ type.toString);
 }
 
 /++
@@ -576,8 +583,6 @@ returned as they are.
 +/
 string rewritePlaceholders(string sql, out size_t count) @safe pure nothrow
 {
-    import std.conv : to;
-
     string result;
     size_t copied, i;
     while (i < sql.length)
@@ -612,8 +617,14 @@ string rewritePlaceholders(string sql, out size_t count) @safe pure nothrow
         }
         if (c == '?')
         {
-            count++;
-            result ~= sql[copied .. i] ~ ":" ~ count.to!string;
+            import std.conv : toChars;
+
+            if (count++ == 0)
+                result.reserve(sql.length + 16);
+            result ~= sql[copied .. i]; // appended in place, no temporary strings
+            result ~= ':';
+            foreach (digit; toChars(count))
+                result ~= digit;
             copied = i + 1;
         }
         i++;

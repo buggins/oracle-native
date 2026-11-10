@@ -23,7 +23,7 @@ import std.conv : to;
 import dbwire.client.hosts : connectFirst, orderHosts;
 import dbwire.client.pool : Poolable;
 import dbwire.io.backend : IoBackend, backendFor;
-import dbwire.io.buffer : BufferedReader;
+import dbwire.io.buffer : BufferedReader, StringArena;
 import dbwire.io.transport : Transport;
 import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
 import core.thread : Thread;
@@ -35,7 +35,8 @@ import oracle.protocol.negotiate;
 import oracle.protocol.tns;
 import oracle.protocol.ttc : TtcReader, TtcWriter;
 import oracle.lob : Lob, LobOperation, LobRequest, LobResponse, buildLobOperation;
-import oracle.mapping : RowRange, columnNames, fieldParameters, fieldPositions, quoteIdentifier, readStruct, readValue;
+import oracle.mapping : RowRange, columnNames, fieldParameters, fieldPositions, fillFieldParameters, quoteIdentifier,
+    readStruct, readValue;
 import oracle.result : BatchResult, QueryResult;
 import oracle.settings : ConnectionOptions, HostPort, Purity, sameDistinguishedName;
 import oracle.pipeline : Pipeline, PipelineOp, PipelineOpKind, PipelineResult;
@@ -150,7 +151,7 @@ final class Connection : Poolable
             transport = t;
             tns = new TnsStream(t);
             tns.largeLengths = true;
-            reader = TtcReader(new BufferedReader(tns));
+            reader = TtcReader(new BufferedReader(tns), new StringArena);
             negotiatedFieldVersion = serverFieldVersion = fieldVersion;
             sessionZone = UTC();
             databaseZone = UTC();
@@ -394,7 +395,7 @@ final class Connection : Poolable
     +/
     RowRange!T query(T, Args...)(string sql, auto ref Args args) if (is(T == struct))
     {
-        return RowRange!T(runArgs(sql, args));
+        return RowRange!T(runArgs(0, sql, args));
     }
 
     /++
@@ -404,7 +405,7 @@ final class Connection : Poolable
     +/
     T queryRow(T, Args...)(string sql, auto ref Args args) if (is(T == struct))
     {
-        auto result = runArgs(sql, args);
+        auto result = runArgs(1, sql, args); // one row is fetched with the execution
         scope (exit)
             result.close();
         const positions = fieldPositions!T(result);
@@ -422,7 +423,7 @@ final class Connection : Poolable
     +/
     T queryValue(T, Args...)(string sql, auto ref Args args)
     {
-        auto result = runArgs(sql, args);
+        auto result = runArgs(1, sql, args); // one row is fetched with the execution
         scope (exit)
             result.close();
         if (result.empty || result.columns.length == 0)
@@ -457,19 +458,41 @@ final class Connection : Poolable
             placeholders ~= ":" ~ (i + 1).to!string;
         }
         const sql = "INSERT INTO " ~ table ~ " (" ~ quoted.join(", ") ~ ") VALUES (" ~ placeholders.join(", ") ~ ")";
-        const(Parameter[])[] batch;
+        // the parameters of up to 1000 rows in one array, reused for each round trip (execMany keeps none of them)
+        import std.range.primitives : hasLength;
+
+        enum batchSize = 1000;
+        static if (hasLength!R)
+            size_t capacity = rows.length < batchSize ? rows.length : batchSize;
+        else
+            size_t capacity = 16; // grows to batchSize
+        auto slab = new Parameter[capacity * columns.length];
+        auto batch = new const(Parameter)[][capacity];
+        size_t n;
         ulong inserted;
         foreach (ref row; rows)
         {
-            batch ~= fieldParameters(row);
-            if (batch.length == 1000)
+            if (n == capacity) // a range without a length: grow (the rows so far move along)
+            {
+                capacity = capacity * 2 < batchSize ? capacity * 2 : batchSize;
+                auto grown = new Parameter[capacity * columns.length];
+                grown[0 .. slab.length] = slab[];
+                slab = grown;
+                batch.length = capacity;
+                foreach (i; 0 .. n)
+                    batch[i] = slab[i * columns.length .. (i + 1) * columns.length];
+            }
+            auto params = slab[n * columns.length .. (n + 1) * columns.length];
+            fillFieldParameters(row, params);
+            batch[n++] = params;
+            if (n == batchSize)
             {
                 inserted += execMany(sql, batch).rowCount;
-                batch = null;
+                n = 0;
             }
         }
-        if (batch.length)
-            inserted += execMany(sql, batch).rowCount;
+        if (n)
+            inserted += execMany(sql, batch[0 .. n]).rowCount;
         return inserted;
     }
 
@@ -481,12 +504,13 @@ final class Connection : Poolable
         return insert(table, only(row));
     }
 
-    private QueryResult runArgs(Args...)(string sql, auto ref Args args)
+    // `run` with arguments; `prefetch`: the rows a query fetches with its execution (0: `fetchSize`)
+    private QueryResult runArgs(Args...)(uint prefetch, string sql, auto ref Args args)
     {
         static if (Args.length)
-            return run(sql, parameters(args));
+            return run(sql, parameters(args), prefetch);
         else
-            return run(sql, null);
+            return run(sql, null, prefetch);
     }
 
     /++
@@ -758,18 +782,26 @@ final class Connection : Poolable
     positional or named parameters.
     +/
     private Parameter[] arrangeBinds(const ref Placeholders ph, StatementKind kind,
-            const(Parameter)[] params, out string[] names) @safe
+            const(Parameter)[] params, out const(string)[] names) @safe
     {
-        import oracle.params : asNumberBoolean, asTextVector, asWireJson;
 
         import std.algorithm.searching : countUntil;
         import std.uni : toUpper;
 
-        auto byName = new Parameter[ph.names.length];
         size_t named;
         foreach (ref p; params)
             if (p.name.length)
                 named++;
+        if (!named && params.length == ph.names.length && positionalInOrder(ph, kind))
+        {
+            // the parameters are the binds, in this order
+            names = ph.names; // shared: never changed
+            auto binds = new Parameter[params.length];
+            foreach (i, ref p; params)
+                binds[i] = wireBind(p);
+            return binds;
+        }
+        auto byName = new Parameter[ph.names.length];
         if (named && named != params.length)
             throw new ClientException("Parameters must be all positional or all named");
         if (named)
@@ -796,20 +828,32 @@ final class Connection : Poolable
                         ~ params.length.to!string ~ " arguments were given");
             byName[] = params[];
         }
-        names = (kind == StatementKind.plsql ? ph.names : ph.occurrences).dup;
+        names = kind == StatementKind.plsql ? ph.names : ph.occurrences;
         auto binds = new Parameter[names.length];
-        const nativeBoolean = negotiatedFieldVersion >= TtcFieldVersion.v23_1;
-        const nativeVector = negotiatedFieldVersion >= TtcFieldVersion.v23_4;
         foreach (i, n; names)
-        {
-            binds[i] = byName[ph.names.countUntil(n)];
-            if (!nativeBoolean)
-                binds[i] = asNumberBoolean(binds[i]);
-            if (!nativeVector)
-                binds[i] = asTextVector(binds[i]);
-            binds[i] = asWireJson(binds[i], negotiatedFieldVersion);
-        }
+            binds[i] = wireBind(byName[ph.names.countUntil(n)]);
         return binds;
+    }
+
+    // A parameter as this server takes it: BOOLEAN as NUMBER before 23ai, VECTOR as text before 23.4, JSON as OSON.
+    private Parameter wireBind(Parameter p) @safe
+    {
+        import oracle.params : asNumberBoolean, asTextVector, asWireJson;
+
+        if (negotiatedFieldVersion < TtcFieldVersion.v23_1)
+            p = asNumberBoolean(p);
+        if (negotiatedFieldVersion < TtcFieldVersion.v23_4)
+            p = asTextVector(p);
+        return asWireJson(p, negotiatedFieldVersion);
+    }
+
+    /++
+    Whether positional parameters are the binds as they are: each placeholder
+    occurs once, in order (the usual `VALUES (:1, :2, ...)`).
+    +/
+    private static bool positionalInOrder(const ref Placeholders ph, StatementKind kind) @safe pure nothrow
+    {
+        return kind == StatementKind.plsql || ph.occurrences == ph.names;
     }
 
     /// Whether binds can be sent with the metadata of a parsed cursor: same types, values that fit.
@@ -828,7 +872,7 @@ final class Connection : Poolable
     }
 
     /// Runs one statement; see `query`.
-    private QueryResult run(string sql, const(Parameter)[] params) @safe
+    private QueryResult run(string sql, const(Parameter)[] params, uint prefetch = 0) @safe
     {
         checkReady();
         Prepared p;
@@ -842,6 +886,7 @@ final class Connection : Poolable
             scope (failure)
                 if (state == State.busy)
                     state = State.ready;
+            result.prefetch = prefetch ? prefetch : options.fetchSize;
             auto e = executeStatement(stmt, result, binds, send);
             if (e.number != 0 && e.number != noMoreRows)
             {
@@ -959,7 +1004,8 @@ final class Connection : Poolable
                 else
                 {
                     const commit = options.autoCommit && prepared[i].stmt.kind != StatementKind.query;
-                    const r = parseRequest(prepared[i].stmt, prepared[i].binds, prepared[i].send, commit);
+                    const r = parseRequest(prepared[i].stmt, prepared[i].binds, prepared[i].send, commit,
+                        options.fetchSize);
                     w.bytes(buildExecute(r, nextSequence(), negotiatedFieldVersion));
                 }
                 requests[i] = w.data;
@@ -1096,16 +1142,18 @@ final class Connection : Poolable
         }
         else
             stmt = statementFor(text, kind);
-        string[] names;
+        const(string)[] names;
         auto binds = arrangeBinds(stmt.placeholders, kind, params, names);
         auto result = new QueryResult(this);
         result.isQuery = kind == StatementKind.query;
         result.isPlsql = kind == StatementKind.plsql;
         result.bindNames = names;
-        result.returning = new bool[binds.length];
-        auto send = new bool[binds.length];
-        send[] = true;
-        if (kind == StatementKind.dml)
+        bool[] send; // empty: every value is sent
+        if (kind == StatementKind.dml && stmt.placeholders.returning.length)
+        {
+            result.returning = new bool[binds.length];
+            send = new bool[binds.length];
+            send[] = true;
             foreach (i, n; names)
                 if (stmt.placeholders.returning.canFind(n))
                 {
@@ -1115,6 +1163,7 @@ final class Connection : Poolable
                     binds[i].bufferSize = binds[i].type == OracleType.varchar || binds[i].type == OracleType.raw
                         ? cast(uint) maxBindBytes : binds[i].bufferSize;
                 }
+        }
         result.binds = binds;
         return Prepared(stmt, result, binds, send);
     }
@@ -1132,11 +1181,20 @@ final class Connection : Poolable
         {
             // a re-execution sends no values for OUT parameters (the first execution sends NULLs);
             // in PL/SQL the server's IO vector says which ones are OUT
-            auto values = send.dup;
+            bool[] outValues; // a copy of `send` with the OUT parameters left out, made only when there are some
             foreach (i, ref b; binds)
                 if ((i < stmt.directions.length ? stmt.directions[i] : b.direction) == BindDirection.output)
-                    values[i] = false;
-            call(seq => buildReexecute(stmt.cursorId, kind == StatementKind.query, options.fetchSize, commit, [
+                {
+                    if (outValues is null)
+                    {
+                        outValues = send.length ? send.dup : new bool[binds.length];
+                        if (!send.length)
+                            outValues[] = true;
+                    }
+                    outValues[i] = false;
+                }
+            const values = outValues is null ? send : outValues;
+            call(seq => buildReexecute(stmt.cursorId, kind == StatementKind.query, result.prefetch, commit, [
                 binds
             ],
             values, seq, negotiatedFieldVersion));
@@ -1157,7 +1215,7 @@ final class Connection : Poolable
         }
         else if (stmt.cursorId)
             uncache(stmt); // other bind types: parse it again
-        const r = parseRequest(stmt, binds, send, commit);
+        const r = parseRequest(stmt, binds, send, commit, result.prefetch);
         call(seq => buildExecute(r, seq, negotiatedFieldVersion));
         auto e = readResponse(result);
         result.cursorId = e.cursorId;
@@ -1179,7 +1237,8 @@ final class Connection : Poolable
     }
 
     /// The EXECUTE that parses and runs `stmt` with `binds` (fetching the first rows of a query).
-    private ExecuteRequest parseRequest(CachedStatement stmt, Parameter[] binds, bool[] send, bool commit) @safe
+    private ExecuteRequest parseRequest(CachedStatement stmt, Parameter[] binds, bool[] send, bool commit,
+            uint prefetch) @safe
     {
         const kind = stmt.kind;
         ExecuteRequest r;
@@ -1203,7 +1262,7 @@ final class Connection : Poolable
         if (kind == StatementKind.query)
         {
             r.options |= ExecuteOption.fetch;
-            r.prefetchRows = options.fetchSize;
+            r.prefetchRows = prefetch;
             r.isQuery = true;
         }
         else
@@ -1244,8 +1303,8 @@ final class Connection : Poolable
         ExecuteRequest r;
         r.cursorId = result.cursorId;
         r.options = ExecuteOption.define | ExecuteOption.notPlsql;
-        r.executions = options.fetchSize;
-        r.prefetchRows = options.fetchSize;
+        r.executions = result.prefetch;
+        r.prefetchRows = result.prefetch;
         r.isQuery = true;
         r.defines = result.columnInfo;
         call(seq => buildExecute(r, seq, negotiatedFieldVersion));
@@ -1363,11 +1422,28 @@ final class Connection : Poolable
         auto stmt = statementFor(text, kind);
         if (stmt.placeholders.returning.length)
             throw new ClientException("execMany doesn't support RETURNING INTO");
-        Parameter[][] arranged;
-        foreach (row; rows)
+        // the binds of each row; positional ones in placeholder order are taken over into one array
+        auto arranged = new Parameter[][rows.length];
+        const width = stmt.placeholders.names.length;
+        const inOrder = positionalInOrder(stmt.placeholders, kind);
+        auto slab = inOrder ? new Parameter[rows.length * width] : null;
+        foreach (r, row; rows)
         {
-            string[] names;
-            arranged ~= arrangeBinds(stmt.placeholders, kind, row, names);
+            bool positional = inOrder && row.length == width;
+            foreach (ref p; row)
+                positional = positional && p.name.length == 0;
+            if (positional)
+            {
+                auto binds = slab[r * width .. (r + 1) * width];
+                foreach (i, ref p; row)
+                    binds[i] = wireBind(p);
+                arranged[r] = binds;
+            }
+            else
+            {
+                const(string)[] names;
+                arranged[r] = arrangeBinds(stmt.placeholders, kind, row, names);
+            }
         }
         // one type per bind (NULLs take the others' type), the largest size
         auto binds = arranged[0].dup;
@@ -1444,6 +1520,7 @@ final class Connection : Poolable
     private void loadDatabaseZone() @safe
     {
         auto zone = new QueryResult(this);
+        zone.prefetch = 1;
         ExecuteRequest r;
         r.sql = "SELECT DBTIMEZONE FROM dual";
         r.options = ExecuteOption.parse | ExecuteOption.execute | ExecuteOption.fetch | ExecuteOption.notPlsql;
@@ -1544,18 +1621,27 @@ final class Connection : Poolable
     {
         import core.atomic : atomicLoad;
 
-        TtcWriter w;
-        if (cursorsToClose.length && !sessionReleased) // released: the cursors may belong to another session
+        const closeCursors = cursorsToClose.length && !sessionReleased; // released: they may be another session's
+        ubyte[] request;
+        if (closeCursors || endToEnd.changed)
         {
-            putCloseCursors(w, cursorsToClose, nextSequence(), negotiatedFieldVersion);
-            cursorsToClose = null;
+            // the piggybacks first (they take the sequence numbers before the call's)
+            TtcWriter w;
+            if (closeCursors)
+            {
+                putCloseCursors(w, cursorsToClose, nextSequence(), negotiatedFieldVersion);
+                cursorsToClose = null;
+            }
+            if (endToEnd.changed)
+            {
+                putEndToEnd(w, endToEnd, nextSequence(), negotiatedFieldVersion);
+                endToEnd.changed = 0;
+            }
+            w.bytes(build(nextSequence()));
+            request = w.data;
         }
-        if (endToEnd.changed)
-        {
-            putEndToEnd(w, endToEnd, nextSequence(), negotiatedFieldVersion);
-            endToEnd.changed = 0;
-        }
-        w.bytes(build(nextSequence()));
+        else
+            request = build(nextSequence()); // sent as built
         for (;;)
         {
             // a cancel sent between two calls is answered first; checked under the lock cancel() takes, so
@@ -1565,7 +1651,7 @@ final class Connection : Poolable
             {
                 scope (exit)
                     writeLock.unlock();
-                tns.sendData(w.data);
+                tns.sendData(request);
                 return;
             }
             writeLock.unlock();
@@ -1723,7 +1809,7 @@ final class Connection : Poolable
             result.outputCursors = new QueryResult[result.binds.length];
         foreach (i, ref b; result.binds)
         {
-            const isReturning = result.returning[i];
+            const isReturning = i < result.returning.length && result.returning[i];
             if (!isReturning && !(i < result.directions.length && (result.directions[i] & BindDirection.output)))
                 continue;
             const count = isReturning ? reader.ub4() : 1;
@@ -1774,7 +1860,17 @@ final class Connection : Poolable
         if ((previous !is null && previous.length != columns.length)
                 || (result.lastRow !is null && result.lastRow.length != columns.length))
             throw new ProtocolException("A row with another number of columns than the result's");
-        auto row = new immutable(ubyte)[][columns.length];
+        // the rows' value arrays come from one slab per fetch, the batch is sized for a fetch (of the rows a
+        // response brings: `prefetch` with the execution, `fetchSize` later)
+        const width = columns.length;
+        const fetched = result.lastRow is null && result.prefetch ? result.prefetch : options.fetchSize;
+        const rows = fetched ? fetched : 1;
+        if (result.batch.length == 0)
+            result.batch.reserve(rows);
+        if (result.rowSlab.length < width)
+            result.rowSlab = new immutable(ubyte)[][](width * rows);
+        auto row = result.rowSlab[0 .. width];
+        result.rowSlab = result.rowSlab[width .. $];
         foreach (i, ref c; columns)
         {
             if (columnSent(bitVector, i))
@@ -2045,7 +2141,7 @@ final class Connection : Poolable
             if (attempt == 9)
                 throw new ConnectionException("Too many redirects from the listener");
         }
-        reader = TtcReader(new BufferedReader(tns));
+        reader = TtcReader(new BufferedReader(tns), new StringArena); // values share the arena's buffers
 
         // negotiation
         tns.sendData(buildProtocolMessage(oracleClientName));

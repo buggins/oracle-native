@@ -16,6 +16,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.types.vector;
 
 import std.conv : to;
+import dbwire.io.buffer : fromBigEndian;
 import oracle.exception : ClientException, ProtocolException;
 
 /// The largest VECTOR image this client sends or fetches.
@@ -152,8 +153,11 @@ struct Vector
     {
         import oracle.types.floats : decimalPoint;
 
+        import std.conv : toChars;
+
         const point = format == VectorFormat.float32 || format == VectorFormat.float64 ? decimalPoint() : ".";
         string values = "[";
+        values.reserve(2 + length * (format == VectorFormat.float64 ? 24 : format == VectorFormat.float32 ? 16 : 4));
         foreach (i; 0 .. length)
         {
             if (i)
@@ -161,16 +165,18 @@ struct Vector
             final switch (format)
             {
             case VectorFormat.float32:
-                values ~= elementText(float32s[i], 9, point);
+                putElement(values, float32s[i], 9, point);
                 break;
             case VectorFormat.float64:
-                values ~= elementText(float64s[i], 17, point);
+                putElement(values, float64s[i], 17, point);
                 break;
             case VectorFormat.int8:
-                values ~= to!string(int8s[i]);
+                foreach (c; toChars(cast(int) int8s[i]))
+                    values ~= c;
                 break;
             case VectorFormat.binary:
-                values ~= to!string(binary[i]);
+                foreach (c; toChars(cast(uint) binary[i]))
+                    values ~= c;
                 break;
             }
         }
@@ -192,7 +198,7 @@ versions or formats this client doesn't know.
 +/
 Vector decodeVector(const(ubyte)[] image) @safe pure
 {
-    import oracle.types.floats : decodeBinaryFloat;
+    import oracle.types.floats : fromSortable;
 
     size_t pos;
     const(ubyte)[] take(size_t n)
@@ -206,8 +212,7 @@ Vector decodeVector(const(ubyte)[] image) @safe pure
 
     uint u32()
     {
-        const b = take(4);
-        return (cast(uint) b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+        return fromBigEndian!uint(take(4)[0 .. 4]);
     }
 
     if (take(1)[0] != 0xDB)
@@ -216,7 +221,7 @@ Vector decodeVector(const(ubyte)[] image) @safe pure
     if (ver > 2)
         throw new ClientException("VECTOR image version " ~ to!string(ver) ~ " is not supported");
     const f = take(2);
-    const flags = (f[0] << 8) | f[1];
+    const flags = fromBigEndian!ushort(f[0 .. 2]);
     Vector v;
     const format = take(1)[0];
     if (format < VectorFormat.float32 || format > VectorFormat.binary)
@@ -230,7 +235,7 @@ Vector decodeVector(const(ubyte)[] image) @safe pure
     {
         v.sparse = true;
         const n = take(2);
-        count = (n[0] << 8) | n[1];
+        count = fromBigEndian!ushort(n[0 .. 2]);
         v.indices = new uint[count];
         foreach (ref index; v.indices)
         {
@@ -246,13 +251,15 @@ Vector decodeVector(const(ubyte)[] image) @safe pure
     {
     case VectorFormat.float32:
         v.float32s = new float[count];
-        foreach (ref x; v.float32s)
-            x = cast(float) decodeBinaryFloat(take(4));
+        const floats = take(4 * count);
+        foreach (i, ref x; v.float32s)
+            x = fromSortable!float(floats[4 * i .. 4 * i + 4][0 .. 4]);
         break;
     case VectorFormat.float64:
         v.float64s = new double[count];
-        foreach (ref x; v.float64s)
-            x = decodeBinaryFloat(take(8));
+        const doubles = take(8 * count);
+        foreach (i, ref x; v.float64s)
+            x = fromSortable!double(doubles[8 * i .. 8 * i + 8][0 .. 8]);
         break;
     case VectorFormat.int8:
         v.int8s = cast(byte[]) take(count).dup;
@@ -273,18 +280,14 @@ Throws: `ClientException` for inconsistent vectors.
 +/
 immutable(ubyte)[] encodeVector(const Vector v) @safe pure
 {
-    import oracle.types.encode : encodeBinaryDouble, encodeBinaryFloat;
+    import std.array : uninitializedArray;
+    import dbwire.io.buffer : toBigEndian;
+    import oracle.types.encode : flipSortable;
 
     const n = v.length;
     if (v.sparse ? v.indices.length != n || n > ushort.max : v.format == VectorFormat.binary
             ? v.dimensions != n * 8 : v.dimensions != n)
         throw new ClientException("The VECTOR's dimensions don't match its elements");
-    ubyte[] b;
-    void u32(uint x)
-    {
-        b ~= [cast(ubyte)(x >> 24), cast(ubyte)(x >> 16), cast(ubyte)(x >> 8), cast(ubyte) x];
-    }
-
     ushort flags = 0x0010; // space for the norm
     ubyte ver = 0;
     if (v.sparse)
@@ -296,64 +299,83 @@ immutable(ubyte)[] encodeVector(const Vector v) @safe pure
         ver = 1;
     else
         flags |= 0x0002;
-    b ~= [0xDB, ver, cast(ubyte)(flags >> 8), cast(ubyte) flags, v.format];
-    u32(v.dimensions);
-    b ~= new ubyte[8];
+    const width = v.format == VectorFormat.float64 ? 8 : v.format == VectorFormat.float32 ? 4 : 1;
+    // the whole image at once: header, dimensions, norm, sparse indexes, values
+    auto b = uninitializedArray!(ubyte[])(5 + 4 + 8 + (v.sparse ? 2 + 4 * n : 0) + width * n); // all written below
+    size_t at;
+    void put(scope const(ubyte)[] bytes)
+    {
+        b[at .. at + bytes.length] = bytes[];
+        at += bytes.length;
+    }
+
+    put([0xDB, ver, cast(ubyte)(flags >> 8), cast(ubyte) flags, v.format]);
+    put(toBigEndian(v.dimensions)[]);
+    b[at .. at + 8] = 0; // the norm
+    at += 8;
     if (v.sparse)
     {
-        b ~= [cast(ubyte)(n >> 8), cast(ubyte) n];
+        put([cast(ubyte)(n >> 8), cast(ubyte) n]);
         foreach (index; v.indices)
         {
             if (index >= v.dimensions)
                 throw new ClientException("A sparse VECTOR index is out of range");
-            u32(index);
+            put(toBigEndian(index)[]);
         }
     }
     final switch (v.format)
     {
     case VectorFormat.float32:
         foreach (x; v.float32s)
-            b ~= encodeBinaryFloat(x);
+        {
+            auto bits = toBigEndian(x);
+            flipSortable(bits[]); // as BINARY_FLOAT values are
+            put(bits[]);
+        }
         break;
     case VectorFormat.float64:
         foreach (x; v.float64s)
-            b ~= encodeBinaryDouble(x);
+        {
+            auto bits = toBigEndian(x);
+            flipSortable(bits[]);
+            put(bits[]);
+        }
         break;
     case VectorFormat.int8:
-        b ~= cast(const(ubyte)[]) v.int8s;
+        put(cast(const(ubyte)[]) v.int8s);
         break;
     case VectorFormat.binary:
-        b ~= v.binary;
+        put(v.binary);
         break;
     }
-    return (() @trusted => cast(immutable(ubyte)[]) b)();
+    assert(at == b.length);
+    return (() @trusted => cast(immutable(ubyte)[]) b)(); // unique: allocated here, no other reference remains
 }
 
 /++
-An element as the server writes it: `1.5E+000`, `1.00000001E-001`, `0`.
+Appends an element as the server writes it: `1.5E+000`, `1.00000001E-001`, `0`.
 The server refuses NaN and infinities in vectors; a `Vector` made by the
 client may hold them: `Nan`, `Inf`, `-Inf` (as BINARY_DOUBLE text).
 `point`: the C locale's decimal point, which `snprintf` writes.
 +/
-private string elementText(double x, int digits, string point) @safe
+private void putElement(ref string values, double x, int digits, string point) @safe
 {
     import core.stdc.stdio : snprintf;
     import std.array : replace;
     import std.math : isInfinity, isNaN;
     import std.string : indexOf;
 
-    if (isNaN(x))
-        return "Nan";
-    if (isInfinity(x))
-        return x < 0 ? "-Inf" : "Inf";
-    if (x == 0)
-        return "0";
+    if (isNaN(x) || isInfinity(x) || x == 0)
+    {
+        values ~= isNaN(x) ? "Nan" : x == 0 ? "0" : x < 0 ? "-Inf" : "Inf";
+        return;
+    }
     char[64] buffer;
     // at most 17 digits, a sign, a point and an exponent: fits; snprintf writes only into the buffer
     const n = (() @trusted => snprintf(buffer.ptr, buffer.length, "%.*E", digits - 1, x))();
     if (n <= 0 || n >= buffer.length)
         throw new ClientException("Can't format a vector element");
-    auto s = buffer[0 .. n].idup; // d.ddddE±xx
+    const(char)[] s = buffer[0 .. n]; // d.ddddE±xx
     if (point != ".") // the C locale's decimal point: "," after setlocale(LC_NUMERIC, "de_DE"), for example
         s = s.replace(point, ".");
     const e = s.indexOf('E');
@@ -362,10 +384,13 @@ private string elementText(double x, int digits, string point) @safe
     auto mantissa = s[0 .. e];
     while (mantissa.length > 3 && mantissa[$ - 1] == '0' && mantissa[$ - 2] != '.')
         mantissa = mantissa[0 .. $ - 1];
-    auto exponent = s[e + 2 .. $];
-    while (exponent.length < 3)
-        exponent = "0" ~ exponent;
-    return mantissa ~ "E" ~ s[e + 1] ~ exponent;
+    const exponent = s[e + 2 .. $];
+    values ~= mantissa;
+    values ~= 'E';
+    values ~= s[e + 1];
+    foreach (i; exponent.length .. 3)
+        values ~= '0';
+    values ~= exponent;
 }
 
 @safe unittest

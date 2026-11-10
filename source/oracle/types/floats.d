@@ -20,16 +20,30 @@ Throws: `ProtocolException` for other lengths.
 +/
 double decodeBinaryFloat(scope const(ubyte)[] b) @safe pure
 {
-    if (b.length != 4 && b.length != 8)
-        throw new ProtocolException("Invalid BINARY_FLOAT/BINARY_DOUBLE length");
-    ubyte[8] x;
-    x[0 .. b.length] = b[];
-    if (x[0] & 0x80)
-        x[0] &= 0x7F; // positive
+    if (b.length == 4)
+        return fromSortable!float(b[0 .. 4]);
+    if (b.length == 8)
+        return fromSortable!double(b[0 .. 8]);
+    throw new ProtocolException("Invalid BINARY_FLOAT/BINARY_DOUBLE length");
+}
+
+/// A `float` or `double` from Oracle's sortable form (see `decodeBinaryFloat`).
+package(oracle) T fromSortable(T)(const ubyte[T.sizeof] sortable) if (is(T == float) || is(T == double))
+{
+    ubyte[T.sizeof] b = sortable;
+    if (b[0] & 0x80)
+        b[0] &= 0x7F; // positive
     else
-        foreach (ref c; x[0 .. b.length])
-            c ^= 0xFF; // negative
-    return b.length == 4 ? fromBigEndian!float(x[0 .. 4]) : fromBigEndian!double(x);
+        b[] ^= 0xFF; // negative
+    return fromBigEndian!T(b);
+}
+
+@safe pure nothrow @nogc unittest
+{
+    assert(fromSortable!float([0xBF, 0xC0, 0x00, 0x00]) == 1.5f && fromSortable!double([
+        0x3F, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF
+    ]) == -2.25);
 }
 
 /++
@@ -225,7 +239,7 @@ rounded on every platform (Phobos's parser isn't where `real` is 64 bits,
 such as macOS on ARM and Windows with LDC), whatever the C locale's decimal
 point (`LC_NUMERIC`: "." unless the application called `setlocale`).
 +/
-package(oracle) double parseDouble(string s) @safe
+package(oracle) double parseDouble(scope const(char)[] s) @safe
 {
     return parseC!double(s);
 }

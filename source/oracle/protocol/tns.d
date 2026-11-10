@@ -13,6 +13,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.protocol.tns;
 
 import std.conv : to;
+import dbwire.io.buffer : fromBigEndian, toBigEndian;
 import core.time : Duration;
 import dbwire.io.transport : Transport;
 import oracle.exception : ConnectionException, ProtocolException;
@@ -162,12 +163,12 @@ Accept parseAccept(scope const(ubyte)[] p) @safe pure
         throw new ProtocolException("Truncated ACCEPT packet");
     uint u16(size_t at)
     {
-        return (p[at] << 8) | p[at + 1];
+        return fromBigEndian!ushort(p[at .. at + 2][0 .. 2]);
     }
 
     uint u32(size_t at)
     {
-        return (p[at] << 24) | (p[at + 1] << 16) | (p[at + 2] << 8) | p[at + 3];
+        return fromBigEndian!uint(p[at .. at + 4][0 .. 4]);
     }
 
     Accept a;
@@ -194,7 +195,7 @@ int parseRefuse(scope const(ubyte)[] p, out string text) @safe pure
 
     if (p.length >= 12)
     {
-        const n = (p[10] << 8) | p[11];
+        const n = fromBigEndian!ushort(p[10 .. 12][0 .. 2]);
         const end = 12 + n < p.length ? 12 + n : p.length;
         text = (cast(const(char)[]) p[12 .. end]).idup;
     }
@@ -221,7 +222,7 @@ void parseRedirect(scope const(ubyte)[] p, scope const(ubyte)[] following, out s
 
     if (p.length < 10)
         throw new ProtocolException("Truncated REDIRECT packet");
-    const n = (p[8] << 8) | p[9];
+    const n = fromBigEndian!ushort(p[8 .. 10][0 .. 2]);
     const(ubyte)[] data;
     if ((p[5] & PacketFlags.redirect) || p.length < 10 + n)
     {
@@ -252,7 +253,7 @@ bool redirectDataFollows(scope const(ubyte)[] p) @safe pure nothrow @nogc
 {
     if (p.length < 10)
         return false;
-    const n = (p[8] << 8) | p[9];
+    const n = fromBigEndian!ushort(p[8 .. 10][0 .. 2]);
     return (p[5] & PacketFlags.redirect) != 0 || p.length < 10 + n;
 }
 
@@ -285,7 +286,8 @@ final class TnsStream : Transport
     /// Whether a pipeline's responses are read: MARKER packets are skipped (no reset handshake).
     bool inPipeline;
 
-    private immutable(ubyte)[] payload; // the unread part of the current DATA packet
+    private size_t payloadLeft; // bytes of the current DATA packet not read yet (they are still in the transport)
+    private ubyte[] packetBuffer; // DATA packets are built here (the transport doesn't keep them)
     private bool responseEnded; // a packet with END_OF_RESPONSE was read completely
     private bool breakPending; // a break/reset happened in the current response
 
@@ -299,11 +301,23 @@ final class TnsStream : Transport
     Packet readPacket() @safe
     {
         ubyte[packetHeaderSize] header;
+        const length = readHeader(header);
+        return readRest(header, length);
+    }
+
+    // Reads a packet header; returns the packet's length.
+    private size_t readHeader(ref ubyte[packetHeaderSize] header) @safe
+    {
         readFully(header[]);
-        const length = largeLengths ? (header[0] << 24) | (header[1] << 16) | (
-                header[2] << 8) | header[3] : (header[0] << 8) | header[1];
+        const length = largeLengths ? fromBigEndian!uint(header[0 .. 4]) : fromBigEndian!ushort(header[0 .. 2]);
         if (length < packetHeaderSize || length > maxSdu + 64)
             throw new ProtocolException("Invalid TNS packet length " ~ to!string(length));
+        return length;
+    }
+
+    // The rest of the packet whose header was read.
+    private Packet readRest(const ref ubyte[packetHeaderSize] header, size_t length) @safe
+    {
         auto bytes = new ubyte[length];
         bytes[0 .. packetHeaderSize] = header[];
         readFully(bytes[packetHeaderSize .. $]);
@@ -324,7 +338,10 @@ final class TnsStream : Transport
         do
         {
             const n = data.length < room ? data.length : room;
-            ubyte[] p = new ubyte[dataHeaderSize + n];
+            if (packetBuffer.length < dataHeaderSize + n) // one buffer for all packets
+                packetBuffer = new ubyte[dataHeaderSize + n < 8192 ? 8192 : dataHeaderSize + n];
+            auto p = packetBuffer[0 .. dataHeaderSize + n];
+            p[0 .. dataHeaderSize] = 0;
             putLength(p);
             p[4] = PacketType.data;
             const f = n == data.length ? flags | lastPacketFlags : flags;
@@ -371,22 +388,25 @@ final class TnsStream : Transport
     /// Bytes of the current DATA packet not read yet.
     @property size_t unread() const @safe pure nothrow @nogc
     {
-        return payload.length;
+        return payloadLeft;
     }
 
     /// Whether the current DATA payload is consumed and the server marked the response as ended.
     @property bool atEndOfResponse() const @safe pure nothrow @nogc
     {
-        return responseEnded && payload.length == 0;
+        return responseEnded && payloadLeft == 0;
     }
 
+    /// Reads from the current DATA packet's payload, straight from the transport into `buffer` (no copy of the packet).
     override size_t read(scope ubyte[] buffer) @safe
     {
-        while (payload.length == 0)
+        while (payloadLeft == 0)
             nextDataPacket();
-        const n = buffer.length < payload.length ? buffer.length : payload.length;
-        buffer[0 .. n] = payload[0 .. n];
-        payload = payload[n .. $];
+        const want = buffer.length < payloadLeft ? buffer.length : payloadLeft;
+        const n = transport.read(buffer[0 .. want]);
+        if (n == 0)
+            throw new ConnectionException("Connection closed by the server");
+        payloadLeft -= n;
         return n;
     }
 
@@ -397,7 +417,7 @@ final class TnsStream : Transport
 
     override bool dataAvailable() @safe
     {
-        return payload.length > 0 || transport.dataAvailable();
+        return payloadLeft > 0 || transport.dataAvailable();
     }
 
     override void close() @safe nothrow
@@ -415,26 +435,36 @@ final class TnsStream : Transport
         transport.setTimeouts(receive, send);
     }
 
-    /// Reads packets until a DATA packet with payload arrives, handling markers and control packets.
+    /++
+    Reads packets until a DATA packet with payload arrives, handling markers
+    and control packets. The payload stays in the transport: `read` takes it
+    from there.
+    +/
     private void nextDataPacket() @safe
     {
         for (;;)
         {
-            const p = readPacket();
-            switch (p.type)
+            ubyte[packetHeaderSize] header;
+            const length = readHeader(header);
+            if (header[4] == PacketType.data)
             {
-            case PacketType.data:
-                if (p.bytes.length < dataHeaderSize)
+                if (length < dataHeaderSize)
                     throw new ProtocolException("Truncated DATA packet");
-                const flags = (p.bytes[8] << 8) | p.bytes[9];
+                ubyte[dataHeaderSize - packetHeaderSize] dataFlags;
+                readFully(dataFlags[]);
+                const flags = fromBigEndian!ushort(dataFlags);
                 if (flags & DataFlags.eof)
                     throw new ConnectionException("The server closed the session");
-                payload = p.bytes[dataHeaderSize .. $];
+                payloadLeft = length - dataHeaderSize;
                 if (flags & DataFlags.endOfResponse)
                     responseEnded = true;
-                if (payload.length)
+                if (payloadLeft)
                     return;
-                break;
+                continue;
+            }
+            const p = readRest(header, length);
+            switch (p.type)
+            {
             case PacketType.marker:
                 if (!inPipeline) // in a pipeline the error follows without the reset handshake
                     reset(p.bytes.length >= 11 ? p.bytes[10] : 0);
@@ -463,17 +493,17 @@ final class TnsStream : Transport
                 markerType = p.bytes[10];
         }
         breakPending = true;
-        payload = null;
+        payloadLeft = 0;
     }
 
     private void control(scope const(ubyte)[] p) @safe
     {
         if (p.length < 10)
             throw new ProtocolException("Truncated CONTROL packet");
-        const type = (p[8] << 8) | p[9];
+        const type = fromBigEndian!ushort(p[8 .. 10][0 .. 2]);
         if (type == 8 && p.length >= 18) // in-band notification: an error number
         {
-            const error = (p[14] << 24) | (p[15] << 16) | (p[16] << 8) | p[17];
+            const error = fromBigEndian!uint(p[14 .. 18][0 .. 4]);
             if (error == 12_572 || error == 2396)
                 throw new ConnectionException("The server ended the session (TNS-" ~ to!string(error) ~ ")");
         }
@@ -483,17 +513,9 @@ final class TnsStream : Transport
     {
         const n = p.length;
         if (largeLengths)
-        {
-            p[0] = cast(ubyte)(n >> 24);
-            p[1] = cast(ubyte)(n >> 16);
-            p[2] = cast(ubyte)(n >> 8);
-            p[3] = cast(ubyte) n;
-        }
+            p[0 .. 4] = toBigEndian(cast(uint) n);
         else
-        {
-            p[0] = cast(ubyte)(n >> 8);
-            p[1] = cast(ubyte) n;
-        }
+            p[0 .. 2] = toBigEndian(cast(ushort) n);
     }
 
     private void readFully(scope ubyte[] dst) @safe

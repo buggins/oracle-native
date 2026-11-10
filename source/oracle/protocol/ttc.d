@@ -10,7 +10,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 module oracle.protocol.ttc;
 
 import std.conv : to;
-import dbwire.io.buffer : BufferedReader;
+import dbwire.io.buffer : BufferedReader, StringArena;
 import oracle.exception : ProtocolException;
 
 /// CLR length byte values with a special meaning.
@@ -28,37 +28,86 @@ enum size_t clrChunkSize = 32_767;
 /// Builds a TTC request in memory.
 struct TtcWriter
 {
+    private ubyte[] buffer; // grows by doubling; written by index
+    private size_t used;
+
     /// The bytes written so far.
-    ubyte[] data;
+    @property ubyte[] data() @safe pure nothrow @nogc
+    {
+        return buffer[0 .. used];
+    }
+
+    // Room for `n` more bytes.
+    private void reserve(size_t n) @safe pure nothrow
+    {
+        import std.array : uninitializedArray;
+
+        if (buffer.length - used >= n)
+            return;
+        // double, or exactly what a large value needs
+        size_t size = buffer.length ? buffer.length * 2 : 256;
+        if (size < used + n)
+            size = used + n;
+        auto grown = uninitializedArray!(ubyte[])(size); // written before it is read
+        grown[0 .. used] = buffer[0 .. used];
+        buffer = grown;
+    }
 
     /// Appends one byte.
     void u8(ubyte b) @safe pure nothrow
     {
-        data ~= b;
+        reserve(1);
+        buffer[used++] = b;
     }
 
     /// Appends raw bytes.
     void bytes(scope const(ubyte)[] b) @safe pure nothrow
     {
-        data ~= b;
+        reserve(b.length);
+        buffer[used .. used + b.length] = b[];
+        used += b.length;
     }
 
     /// Appends a big-endian u16.
     void u16be(uint v) @safe pure nothrow
     {
-        data ~= [cast(ubyte)(v >> 8), cast(ubyte) v];
+        reserve(2);
+        buffer[used] = cast(ubyte)(v >> 8);
+        buffer[used + 1] = cast(ubyte) v;
+        used += 2;
     }
 
     /// Appends a little-endian u16 (a few negotiation fields are little-endian).
     void u16le(uint v) @safe pure nothrow
     {
-        data ~= [cast(ubyte) v, cast(ubyte)(v >> 8)];
+        reserve(2);
+        buffer[used] = cast(ubyte) v;
+        buffer[used + 1] = cast(ubyte)(v >> 8);
+        used += 2;
     }
 
     /// Appends a big-endian u32.
     void u32be(uint v) @safe pure nothrow
     {
-        data ~= [cast(ubyte)(v >> 24), cast(ubyte)(v >> 16), cast(ubyte)(v >> 8), cast(ubyte) v];
+        reserve(4);
+        foreach (i; 0 .. 4)
+            buffer[used + i] = cast(ubyte)(v >> (8 * (3 - i)));
+        used += 4;
+    }
+
+    /// Appends `n` zero bytes (room filled in later, see `setU32be`).
+    void zeros(size_t n) @safe pure nothrow
+    {
+        reserve(n);
+        buffer[used .. used + n] = 0;
+        used += n;
+    }
+
+    /// Overwrites the four bytes at `at` (written before) with a big-endian u32.
+    void setU32be(size_t at, uint v) @safe pure nothrow @nogc
+    {
+        foreach (i; 0 .. 4)
+            buffer[at + i] = cast(ubyte)(v >> (8 * (3 - i)));
     }
 
     /// Appends a universal unsigned integer (`ub2`/`ub4`/`ub8`): a length byte, then 0, 1, 2, 4 or 8 big-endian bytes.
@@ -67,9 +116,10 @@ struct TtcWriter
         if (v == 0)
             return u8(0);
         const n = v <= 0xFF ? 1 : v <= 0xFFFF ? 2 : v <= 0xFFFF_FFFF ? 4 : 8;
-        u8(cast(ubyte) n);
+        reserve(1 + n);
+        buffer[used++] = cast(ubyte) n;
         foreach_reverse (i; 0 .. n)
-            u8(cast(ubyte)(v >> (8 * i)));
+            buffer[used++] = cast(ubyte)(v >> (8 * i));
     }
 
     /// Appends a universal signed integer (`sb*`): the sign in the high bit of the length byte.
@@ -95,6 +145,7 @@ struct TtcWriter
             u8(cast(ubyte) v.length);
             return bytes(v);
         }
+        reserve(2 + v.length + (v.length / clrChunkSize + 1) * 5); // the chunks and their lengths at once
         u8(clrChunked);
         while (v.length)
         {
@@ -129,6 +180,13 @@ struct TtcReader
 {
     /// The byte stream (the payloads of the DATA packets of a response).
     BufferedReader reader;
+    /++
+    Where column values are carved from, when set (`value`): they share the
+    arena's buffers instead of one allocation each (a value kept alive keeps
+    its buffer of up to 64 KB alive, so metadata, which may live long, isn't
+    taken from it).
+    +/
+    StringArena* arena;
 
     /// Reads one byte.
     ubyte u8() @safe
@@ -136,17 +194,26 @@ struct TtcReader
         return reader.readFixed!ubyte();
     }
 
-    /// Reads `n` raw bytes (a copy).
-    immutable(ubyte)[] bytes(size_t n) @safe
+    /// Reads `n` raw bytes (a copy; `fromArena`: from `arena` when set).
+    immutable(ubyte)[] bytes(size_t n, bool fromArena = false) @safe
     {
+        if (fromArena && arena !is null)
+            return cast(immutable(ubyte)[]) reader.readExactString(n, *arena);
         return reader.readExactBytes(n);
     }
 
     /// Skips `n` bytes.
     void skip(size_t n) @safe
     {
-        if (n)
-            reader.readExactBytes(n);
+        if (n > reader.maxStringLength) // a length from the server that can't be right
+            throw new ProtocolException("Invalid length " ~ to!string(n));
+        ubyte[256] discard = void;
+        while (n)
+        {
+            const k = n < discard.length ? n : discard.length;
+            reader.readExact(discard[0 .. k]);
+            n -= k;
+        }
     }
 
     /// Reads a big-endian u16.
@@ -217,18 +284,20 @@ struct TtcReader
     /++
     Reads a CLR; `null` for NULL. Values longer than `maxLength` bytes are
     refused; the default suits names, messages and locators (column values
-    pass `ConnectionOptions.maxValueLength`).
+    pass `ConnectionOptions.maxValueLength`). `fromArena`: short values come
+    from `arena` (column values).
 
     Throws: `ProtocolException` for malformed or too long values.
     +/
-    immutable(ubyte)[] clr(size_t maxLength = metadataLimit) @safe
+    immutable(ubyte)[] clr(size_t maxLength = metadataLimit, bool fromArena = false) @safe
     {
         const n = u8();
         if (n == clrNull || n == clrNull2)
             return null;
         if (n != clrChunked)
-            return bytes(n);
-        immutable(ubyte)[] result;
+            return bytes(n, fromArena);
+        // the chunks read into one array that grows (in place when the GC can: no array per chunk)
+        ubyte[] result;
         for (;;)
         {
             const chunk = ub4();
@@ -236,9 +305,12 @@ struct TtcReader
                 break;
             if (result.length + chunk > maxLength)
                 throw new ProtocolException("A value longer than " ~ to!string(maxLength) ~ " bytes");
-            result ~= bytes(chunk);
+            const used = result.length;
+            result.length = used + chunk;
+            reader.readExact(result[used .. $]);
         }
-        return result;
+        // unique: allocated here, and no other reference to it remains
+        return (() @trusted => cast(immutable(ubyte)[]) result)();
     }
 
     /// Reads a value with two lengths: `ub4` total length (0 = none), then a CLR (at most `maxLength` bytes).
@@ -318,4 +390,18 @@ struct TtcReader
     t.feed([0xFE, 0x04, 0x00, 0x10, 0x00, 0x01]); // chunked: one chunk of 1 MiB + 1 bytes, none sent
     auto r = TtcReader(new BufferedReader(t));
     assertThrown!ProtocolException(r.clr());
+}
+
+// skip refuses a length no value can have (a corrupt length from the server) instead of reading on
+@safe unittest
+{
+    import std.exception : assertThrown;
+    import dbwire.io.mock : MockTransport;
+
+    auto t = new MockTransport;
+    t.feed([1, 2, 3]);
+    auto r = TtcReader(new BufferedReader(t));
+    assertThrown!ProtocolException(r.skip(0xFFFF_FFF0));
+    r.skip(2);
+    assert(r.u8() == 3);
 }
