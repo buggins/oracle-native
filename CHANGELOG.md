@@ -6,6 +6,13 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+## 0.4.0 — 2026-11-10
+
+The fixes and improvements from a code review: robustness, security and
+thread safety (#45), float text (#46), attributes, D idioms and dip1000
+(#47), performance (#48), PBKDF2 iteration counts (#42); and dbwire 0.9
+(#43, #53).
+
 ### Changed
 
 - `numberToDouble` (and `Value.getDouble`/`Row.getDouble`) is no longer
