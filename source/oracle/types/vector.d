@@ -149,6 +149,9 @@ struct Vector
     +/
     string toString() const @safe
     {
+        import oracle.types.floats : decimalPoint;
+
+        const point = format == VectorFormat.float32 || format == VectorFormat.float64 ? decimalPoint() : ".";
         string values = "[";
         foreach (i; 0 .. length)
         {
@@ -157,10 +160,10 @@ struct Vector
             final switch (format)
             {
             case VectorFormat.float32:
-                values ~= elementText(float32s[i], 9);
+                values ~= elementText(float32s[i], 9, point);
                 break;
             case VectorFormat.float64:
-                values ~= elementText(float64s[i], 17);
+                values ~= elementText(float64s[i], 17, point);
                 break;
             case VectorFormat.int8:
                 values ~= toText(int8s[i]);
@@ -329,10 +332,12 @@ immutable(ubyte)[] encodeVector(const Vector v) @safe
 An element as the server writes it: `1.5E+000`, `1.00000001E-001`, `0`.
 The server refuses NaN and infinities in vectors; a `Vector` made by the
 client may hold them: `Nan`, `Inf`, `-Inf` (as BINARY_DOUBLE text).
+`point`: the C locale's decimal point, which `snprintf` writes.
 +/
-private string elementText(double x, int digits) @safe
+private string elementText(double x, int digits, string point) @safe
 {
     import core.stdc.stdio : snprintf;
+    import std.array : replace;
     import std.math : isInfinity, isNaN;
     import std.string : indexOf;
 
@@ -348,6 +353,8 @@ private string elementText(double x, int digits) @safe
     if (n <= 0 || n >= buffer.length)
         throw new ClientException("Can't format a vector element");
     auto s = buffer[0 .. n].idup; // d.ddddE±xx
+    if (point != ".") // the C locale's decimal point: "," after setlocale(LC_NUMERIC, "de_DE"), for example
+        s = s.replace(point, ".");
     const e = s.indexOf('E');
     if (e < 0 || e + 2 >= s.length)
         throw new ClientException("Can't format a vector element");
@@ -407,4 +414,21 @@ private string toText(T)(T v) @safe pure
 {
     assert(Vector.of([float.nan, float.infinity, -float.infinity]).toString() == "[Nan,Inf,-Inf]");
     assert(Vector.of([double.nan, 1.5]).toString() == "[Nan,1.5E+000]");
+}
+
+// The text is independent of the C locale (with a decimal comma, where the system has such a locale)
+@system unittest
+{
+    import core.stdc.locale : LC_NUMERIC, setlocale;
+    import std.string : fromStringz, toStringz;
+
+    const saved = fromStringz(setlocale(LC_NUMERIC, null)).idup;
+    scope (exit)
+        setlocale(LC_NUMERIC, saved.toStringz);
+    foreach (name; ["de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "German_Germany.1252"])
+        if (setlocale(LC_NUMERIC, name.toStringz) !is null)
+        {
+            assert(Vector.of([1.5f, 0.1f]).toString() == "[1.5E+000,1.00000001E-001]");
+            break;
+        }
 }
