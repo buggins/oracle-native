@@ -127,15 +127,13 @@ T readValue(T)(const Value v)
         {
             // the member's name, or its value in decimal (as `insert` writes enums)
             const text = v.getString();
+            static foreach (member; __traits(allMembers, U)) // names compared without std.conv (no exceptions)
+                if (text == member)
+                    return __traits(getMember, U, member);
             try
-                return text.to!T;
+                n = text.to!long;
             catch (ConvException)
-            {
-                try
-                    n = text.to!long;
-                catch (ConvException)
-                    throw new ClientException("'" ~ text ~ "' is not a value of " ~ T.stringof);
-            }
+                throw new ClientException("'" ~ text ~ "' is not a value of " ~ T.stringof);
         }
         else
             n = v.getLong();
@@ -158,7 +156,12 @@ T readValue(T)(const Value v)
     else static if (isSomeString!U)
         return v.getString().to!T;
     else static if (is(U : const(ubyte)[]))
-        return cast(T) v.getBytes();
+    {
+        static if (is(immutable(ubyte)[] : T))
+            return v.getBytes();
+        else
+            return v.getBytes().dup; // a mutable copy: the row's bytes are immutable
+    }
     else static if (is(U == Decimal))
         return v.getDecimal();
     else static if (is(U == Date))
@@ -322,7 +325,7 @@ package Parameter[] fieldParameters(T)(const ref T value)
 `name` as an identifier in SQL: as it is when it is a plain name (Oracle
 compares those case-insensitively), else in double quotes (case-sensitive).
 +/
-package string quoteIdentifier(string name) @safe pure
+package string quoteIdentifier(string name) @safe pure nothrow
 {
     import std.ascii : isAlpha, isAlphaNum;
 

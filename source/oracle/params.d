@@ -92,7 +92,7 @@ struct Parameter
     BINARY_DOUBLE has it; a `Decimal` with more than 40 digits, dates outside
     -4712 to 9999).
     +/
-    static Parameter of(T)(T value)
+    static Parameter of(T)(auto ref T value)
     {
         alias U = Unqual!T;
         static if (is(U == Parameter))
@@ -108,7 +108,7 @@ struct Parameter
     }
 
     /// A NULL of the Oracle type for D type `T`.
-    static Parameter nullOf(T)() @safe
+    static Parameter nullOf(T)()
     {
         auto p = typeOf!(Unqual!T)();
         p.isNull = true;
@@ -132,7 +132,7 @@ struct Parameter
     `RETURNING ... INTO` target) of the Oracle type for D type `T`; its
     value after the call is in the result's `outputs`.
     +/
-    static Parameter output(T)() @safe
+    static Parameter output(T)()
     {
         auto p = nullOf!T();
         p.direction = BindDirection.output;
@@ -144,7 +144,7 @@ struct Parameter
     An OUT parameter receiving a REF cursor (`SYS_REFCURSOR`); its rows are
     read through `Output.cursor` of the result's `outputs`.
     +/
-    static Parameter refCursor() @safe
+    static Parameter refCursor() @safe pure nothrow
     {
         Parameter p;
         p.type = OracleType.cursor;
@@ -278,7 +278,7 @@ package Parameter asNumberBoolean(Parameter p) @safe
 }
 
 /// The type of parameters of D type `T`.
-private Parameter typeOf(T)() @safe
+private Parameter typeOf(T)()
 {
     static if (is(T == bool))
         return typed(OracleType.boolean, 4); // NUMBER for servers before 23ai (`asNumberBoolean`)
@@ -388,7 +388,13 @@ private Parameter make(T)(T value)
     return p;
 }
 
-private Parameter ofVariant(Variant value) @trusted // Variant.get is @system
+// TypeInfo.opEquals is @system (it compares names and flags; nothing unsafe).
+private bool sameType(const TypeInfo a, const TypeInfo b) @trusted
+{
+    return a == b;
+}
+
+private Parameter ofVariant(ref const Variant value) @safe
 {
     import std.meta : AliasSeq;
 
@@ -397,8 +403,8 @@ private Parameter ofVariant(Variant value) @trusted // Variant.get is @system
     static foreach (T; AliasSeq!(bool, byte, ubyte, short, ushort, int, uint, long, ulong, float, double, real,
             Decimal, string, wstring, dstring, char, ubyte[], immutable(ubyte)[], const(ubyte)[], UUID, Date,
             DateTime, SysTime, Duration, MonthInterval, Parameter, Lob, Vector, float[], double[], JSONValue))
-        if (value.type == typeid(T))
-            return Parameter.of(value.get!T);
+        if (sameType(value.type, typeid(T)))
+            return Parameter.of((() @trusted => value.get!T)()); // Variant.get is @system; the type was checked
     throw new ClientException("Unsupported Variant parameter type " ~ value.type.toString);
 }
 
@@ -406,14 +412,14 @@ private Parameter ofVariant(Variant value) @trusted // Variant.get is @system
 The parameters for `args`, each converted with `Parameter.of`; a single
 `Parameter[]` argument is taken as the parameters themselves.
 +/
-const(Parameter)[] parameters(Args...)(Args args)
+const(Parameter)[] parameters(Args...)(auto ref Args args)
 {
     static if (Args.length == 1 && is(Args[0] : const(Parameter)[]) && !is(Args[0] == typeof(null)))
         return args[0];
     else
     {
         auto result = new Parameter[Args.length];
-        foreach (i, arg; args)
+        foreach (i, ref arg; args)
             result[i] = Parameter.of(arg);
         return result;
     }
@@ -434,7 +440,7 @@ struct Placeholders
 Finds the placeholders of `sql`, skipping string literals (also `q'[...]'`),
 quoted identifiers, comments, and `:=`.
 +/
-Placeholders findPlaceholders(scope const(char)[] sql) @safe pure
+Placeholders findPlaceholders(scope const(char)[] sql) @safe pure nothrow
 {
     import std.algorithm.searching : canFind;
     import std.ascii : isAlpha, isAlphaNum, isDigit, toUpper;
@@ -505,10 +511,7 @@ Placeholders findPlaceholders(scope const(char)[] sql) @safe pure
                 const start = j;
                 while (j < sql.length && (isAlphaNum(sql[j]) || sql[j] == '_' || sql[j] == '$' || sql[j] == '#'))
                     j++;
-                char[] upper = sql[start .. j].dup;
-                foreach (ref ch; upper)
-                    ch = toUpper(ch);
-                name = (() @trusted => cast(string) upper)(); // unique: built here
+                name = asciiUpper(sql[start .. j]); // the unique result of a pure function converts to string
             }
             if (name.length)
             {
@@ -524,6 +527,16 @@ Placeholders findPlaceholders(scope const(char)[] sql) @safe pure
         i++;
     }
     return p;
+}
+
+private char[] asciiUpper(scope const(char)[] s) @safe pure nothrow
+{
+    import std.ascii : toUpper;
+
+    auto r = s.dup;
+    foreach (ref c; r)
+        c = toUpper(c);
+    return r;
 }
 
 /// The index after the string literal starting at `i` (`'...'` with `''` escapes, or `q'X...X'`).
@@ -561,7 +574,7 @@ Rewrites `?` placeholders as `:1`, `:2`, ... (outside literals, quoted
 identifiers and comments) and counts them. Statements without `?` are
 returned as they are.
 +/
-string rewritePlaceholders(string sql, out size_t count) @safe pure
+string rewritePlaceholders(string sql, out size_t count) @safe pure nothrow
 {
     import std.conv : to;
 

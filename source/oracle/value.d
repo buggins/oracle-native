@@ -10,11 +10,13 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.value;
 
+import std.conv : to;
 import core.time : Duration;
 import std.datetime.date : Date, DateTime, TimeOfDay;
 import std.datetime.systime : SysTime;
 import std.datetime.timezone : TimeZone, UTC;
 import std.typecons : Rebindable;
+import std.traits : hasElaborateCopyConstructor, hasElaborateDestructor;
 import std.variant : Variant;
 import dbwire.types.decimal : Decimal;
 import dbwire.types.interval : MonthInterval;
@@ -147,7 +149,7 @@ struct Value
     +/
     long getLong() const @safe
     {
-        import std.conv : ConvException, to;
+        import std.conv : ConvException;
         import std.math : isFinite;
         import oracle.types.floats : decodeBinaryFloat;
         import oracle.types.number : numberToLong;
@@ -188,7 +190,7 @@ struct Value
     {
         const v = getLong();
         if (v < int.min || v > int.max)
-            throw new ClientException("Value " ~ toText(v) ~ " does not fit in an int (column " ~ column.name ~ ")");
+            throw new ClientException("Value " ~ to!string(v) ~ " does not fit in an int (column " ~ column.name ~ ")");
         return cast(int) v;
     }
 
@@ -198,9 +200,9 @@ struct Value
 
     Throws: `ClientException` for other types or texts.
     +/
-    bool getBool() const @safe
+    bool getBool() const @safe pure
     {
-        import std.uni : toUpper;
+        import std.ascii : toUpper;
 
         if (isNull)
             return false;
@@ -210,7 +212,13 @@ struct Value
             return bytes.length && bytes[$ - 1] != 0;
         case OracleType.varchar:
         case OracleType.char_:
-            switch (trimmed().toUpper)
+            // upper case in a stack buffer (the words are ASCII; longer texts match none)
+            const t = trimmed();
+            char[5] upper;
+            const n = t.length <= upper.length ? t.length : 0;
+            foreach (i; 0 .. n)
+                upper[i] = toUpper(t[i]);
+            switch (upper[0 .. n])
             {
             case "TRUE":
             case "1":
@@ -243,9 +251,9 @@ struct Value
 
     Throws: `ClientException` for other types or texts.
     +/
-    double getDouble() const @safe
+    double getDouble() const @safe pure
     {
-        import std.conv : ConvException, to;
+        import std.conv : ConvException;
         import oracle.types.floats : decodeBinaryFloat;
         import oracle.types.number : numberToDouble;
 
@@ -333,7 +341,7 @@ struct Value
 
     Throws: `ClientException` for other columns (LOB contents fetched as values: use `getString`, `getBytes`).
     +/
-    Lob getLob() const @safe
+    Lob getLob() const @safe pure
     {
         if (isNull)
             return null;
@@ -345,6 +353,7 @@ struct Value
             throw new ClientException("No connection to read the LOB with");
         // CLOB and BLOB values are kept as u64be size, u32be chunk size, locator; BFILE values are the locator
         const locator = t == OracleType.bfile ? bytes : bytes.length >= 12 ? bytes[12 .. $] : null;
+        // const only because the value is: no Connection is ever immutable, so the reference may be mutable again
         return new Lob((() @trusted => cast(Connection) connection)(), lease, column.type, column.charsetForm, locator);
     }
 
@@ -353,7 +362,7 @@ struct Value
 
     Throws: `ClientException` for values that are not CLOB/NCLOB/BLOB locators.
     +/
-    ulong getLobSize() const @safe
+    ulong getLobSize() const @safe pure
     {
         if (isNull)
             return 0;
@@ -442,7 +451,7 @@ struct Value
 
     Throws: `ClientException` for other types.
     +/
-    int getNanoseconds() const @safe
+    int getNanoseconds() const @safe pure
     {
         import oracle.types.temporal;
 
@@ -468,7 +477,7 @@ struct Value
 
     Throws: `ClientException` for other types, or intervals beyond about 10.7 million days.
     +/
-    Duration getDuration() const @safe
+    Duration getDuration() const @safe pure
     {
         import oracle.types.temporal : decodeDayToSecond;
 
@@ -489,7 +498,7 @@ struct Value
 
     Throws: `ClientException` for other types, or intervals beyond `int.max` months.
     +/
-    MonthInterval getMonthInterval() const @safe
+    MonthInterval getMonthInterval() const @safe pure
     {
         import oracle.types.temporal : decodeYearToMonth;
 
@@ -531,7 +540,7 @@ struct Value
 
     Throws: `ClientException` for other types.
     +/
-    Vector getVector() const @safe
+    Vector getVector() const @safe pure
     {
         import oracle.types.vector : decodeVector;
 
@@ -640,7 +649,7 @@ struct Value
     The text of a character value: UTF-8 (the client's character set) or, for
     national character data in AL16UTF16, UTF-16 big-endian.
     +/
-    private string text() const @safe
+    private string text() const @safe pure
     {
         import std.utf : UTFException, validate;
         import dbwire.charset.utf16 : decodeUtf16be;
@@ -660,7 +669,7 @@ struct Value
         return s;
     }
 
-    private string trimmed() const @safe
+    private string trimmed() const @safe pure
     {
         import std.string : strip;
 
@@ -678,17 +687,15 @@ private immutable(TimeZone) zoneOrUtc(const Rebindable!(immutable TimeZone) zone
     return zone is null ? UTC() : zone.get;
 }
 
-/// Wraps a value in a `Variant`.
-Variant makeVariant(T)(T value) @trusted
+/++
+Wraps a value in a `Variant`: memory-safe, but `std.variant` is not annotated
+`@safe`. Only for types whose copy and destruction are plain (the attribute
+would hide a `@system` postblit, copy constructor or destructor of `T`).
++/
+package(oracle) Variant makeVariant(T)(T value) @trusted
+        if (!hasElaborateCopyConstructor!T && !hasElaborateDestructor!T)
 {
-    return Variant(value); // Variant's constructor is @system; copying these value types is safe
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
+    return Variant(value);
 }
 
 ///

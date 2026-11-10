@@ -33,15 +33,9 @@ class ServerException : DbException
 
 private string codeText(int code) @safe pure nothrow
 {
-    char[] s;
-    uint v = code < 0 ? 0 : code;
-    do
-    {
-        s = cast(char)('0' + v % 10) ~ s;
-        v /= 10;
-    }
-    while (v);
-    return (() @trusted => cast(string) s)();
+    import std.conv : to;
+
+    return (code < 0 ? 0 : code).to!string;
 }
 
 ///

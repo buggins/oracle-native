@@ -100,7 +100,7 @@ struct ColumnInfo
     }
 
     /// The type's name in SQL, e.g. `NUMBER(10,2)`, `VARCHAR2(30)`.
-    string typeText() const @safe pure
+    string typeText() const @safe pure nothrow
     {
         import std.conv : to;
 

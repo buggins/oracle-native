@@ -15,6 +15,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.vector;
 
+import std.conv : to;
 import oracle.exception : ClientException, ProtocolException;
 
 /// The largest VECTOR image this client sends or fetches.
@@ -130,7 +131,7 @@ struct Vector
 
     Throws: `ClientException` for BINARY vectors.
     +/
-    double[] toDoubles() const @safe
+    double[] toDoubles() const @safe pure
     {
         if (format == VectorFormat.binary)
             throw new ClientException("A BINARY vector has bits, not numbers");
@@ -166,10 +167,10 @@ struct Vector
                 values ~= elementText(float64s[i], 17, point);
                 break;
             case VectorFormat.int8:
-                values ~= toText(int8s[i]);
+                values ~= to!string(int8s[i]);
                 break;
             case VectorFormat.binary:
-                values ~= toText(binary[i]);
+                values ~= to!string(binary[i]);
                 break;
             }
         }
@@ -178,8 +179,8 @@ struct Vector
             return values;
         string list = "[";
         foreach (i, index; indices)
-            list ~= (i ? "," : "") ~ toText(index);
-        return "[" ~ toText(dimensions) ~ "," ~ list ~ "]," ~ values ~ "]";
+            list ~= (i ? "," : "") ~ to!string(index);
+        return "[" ~ to!string(dimensions) ~ "," ~ list ~ "]," ~ values ~ "]";
     }
 }
 
@@ -189,7 +190,7 @@ Decodes a VECTOR image.
 Throws: `ProtocolException` for malformed images; `ClientException` for
 versions or formats this client doesn't know.
 +/
-Vector decodeVector(const(ubyte)[] image) @safe
+Vector decodeVector(const(ubyte)[] image) @safe pure
 {
     import oracle.types.floats : decodeBinaryFloat;
 
@@ -213,13 +214,13 @@ Vector decodeVector(const(ubyte)[] image) @safe
         throw new ProtocolException("Not a VECTOR image");
     const ver = take(1)[0];
     if (ver > 2)
-        throw new ClientException("VECTOR image version " ~ toText(ver) ~ " is not supported");
+        throw new ClientException("VECTOR image version " ~ to!string(ver) ~ " is not supported");
     const f = take(2);
     const flags = (f[0] << 8) | f[1];
     Vector v;
     const format = take(1)[0];
     if (format < VectorFormat.float32 || format > VectorFormat.binary)
-        throw new ClientException("VECTOR format " ~ toText(format) ~ " is not supported");
+        throw new ClientException("VECTOR format " ~ to!string(format) ~ " is not supported");
     v.format = cast(VectorFormat) format;
     v.dimensions = u32();
     if (flags & (0x0002 | 0x0010))
@@ -270,7 +271,7 @@ The image of `v`, as clients send it (with space for the norm).
 
 Throws: `ClientException` for inconsistent vectors.
 +/
-immutable(ubyte)[] encodeVector(const Vector v) @safe
+immutable(ubyte)[] encodeVector(const Vector v) @safe pure
 {
     import oracle.types.encode : encodeBinaryDouble, encodeBinaryFloat;
 
@@ -365,13 +366,6 @@ private string elementText(double x, int digits, string point) @safe
     while (exponent.length < 3)
         exponent = "0" ~ exponent;
     return mantissa ~ "E" ~ s[e + 1] ~ exponent;
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 @safe unittest

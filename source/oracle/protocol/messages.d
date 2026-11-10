@@ -8,6 +8,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.protocol.messages;
 
+import std.conv : to;
 import oracle.exception : ProtocolException;
 import oracle.protocol.negotiate : MessageType, TtcFieldVersion;
 import oracle.protocol.ttc : TtcReader, TtcWriter;
@@ -34,7 +35,7 @@ enum FunctionCode : ubyte
 }
 
 /// Writes the header of a function call: message type, function code, sequence number.
-void functionHeader(ref TtcWriter w, FunctionCode code, ubyte sequence, ubyte fieldVersion) @safe pure
+void functionHeader(ref TtcWriter w, FunctionCode code, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     w.u8(MessageType.function_);
     w.u8(code);
@@ -55,7 +56,7 @@ struct KeyValue
 }
 
 /// Writes a key/value pair as authentication messages send them.
-void keyValue(ref TtcWriter w, string key, scope const(char)[] value, uint flags = 0) @safe pure
+void keyValue(ref TtcWriter w, string key, scope const(char)[] value, uint flags = 0) @safe pure nothrow
 {
     w.textWithLength(key);
     w.textWithLength(value);
@@ -303,20 +304,13 @@ SessionReturn readServerPiggyback(ref TtcReader r) @safe
         r.ub8();
         break;
     default:
-        throw new ProtocolException("Unknown server piggyback " ~ toText(opcode));
+        throw new ProtocolException("Unknown server piggyback " ~ to!string(opcode));
     }
     return ret;
 }
 
 /// Session flag of a session return: another session was attached.
 private enum uint sessionChanged = 4;
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
-}
 
 ///
 @safe unittest
@@ -336,7 +330,7 @@ private string toText(T)(T v) @safe pure
 struct EndToEnd
 {
     /// The attributes, in `EndToEndAttribute` order; null clears one.
-    string[5] values;
+    string[__traits(allMembers, EndToEndAttribute).length] values;
     /// Which attributes changed (bit `1 << EndToEndAttribute`).
     uint changed;
 }
@@ -352,9 +346,11 @@ enum EndToEndAttribute
 }
 
 /// The piggyback that sends the changed end-to-end attributes before a call.
-void putEndToEnd(ref TtcWriter w, const ref EndToEnd e, ubyte sequence, ubyte fieldVersion) @safe pure
+void putEndToEnd(ref TtcWriter w, const ref EndToEnd e, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
-    static immutable uint[5] flagBits = [0x0001, 0x0008, 0x0010, 0x0100, 0x0200];
+    static immutable uint[__traits(allMembers, EndToEndAttribute).length] flagBits = [
+        0x0001, 0x0008, 0x0010, 0x0100, 0x0200
+    ];
     w.u8(MessageType.piggyback);
     w.u8(FunctionCode.setEndToEnd);
     w.u8(sequence);
@@ -403,7 +399,7 @@ enum PipelineMode : ubyte
 }
 
 /// The piggyback that begins a pipeline (before its first call).
-void putBeginPipeline(ref TtcWriter w, PipelineMode mode, ubyte sequence, ubyte fieldVersion) @safe pure
+void putBeginPipeline(ref TtcWriter w, PipelineMode mode, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     w.u8(MessageType.piggyback);
     w.u8(FunctionCode.pipelineBegin);
@@ -416,7 +412,7 @@ void putBeginPipeline(ref TtcWriter w, PipelineMode mode, ubyte sequence, ubyte 
 }
 
 /// The call that ends a pipeline (after its last call).
-ubyte[] buildEndPipeline(ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildEndPipeline(ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.pipelineEnd, sequence, fieldVersion);
@@ -435,7 +431,7 @@ enum SessionReleaseMode : uint
 The one-way call that hands the DRCP session back to the server's pool. The
 server doesn't answer it; the next call attaches a session again.
 +/
-ubyte[] buildSessionRelease(SessionReleaseMode mode, ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildSessionRelease(SessionReleaseMode mode, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     w.u8(MessageType.oneWayFunction);

@@ -25,6 +25,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.temporal;
 
+import std.conv : to;
 import core.time : Duration, days, hnsecs, hours, minutes, nsecs, seconds;
 import std.datetime.date : Date, DateTime, DateTimeException;
 import std.datetime.systime : SysTime;
@@ -125,7 +126,7 @@ Throws: `ProtocolException` for malformed values.
 OracleDateTime decodeDateTime(scope const(ubyte)[] b) @safe pure
 {
     if (b.length != 7 && b.length != 11 && b.length != 13)
-        throw new ProtocolException("Invalid date/time length " ~ toText(b.length));
+        throw new ProtocolException("Invalid date/time length " ~ to!string(b.length));
     OracleDateTime d;
     d.year = (b[0] - 100) * 100 + (b[1] - 100);
     d.month = b[2];
@@ -150,7 +151,7 @@ region ID this client doesn't know (a newer time zone file).
 OracleZone decodeZone(scope const(ubyte)[] b) @safe pure
 {
     if (b.length != 13)
-        throw new ProtocolException("Invalid TIMESTAMP WITH TIME ZONE length " ~ toText(b.length));
+        throw new ProtocolException("Invalid TIMESTAMP WITH TIME ZONE length " ~ to!string(b.length));
     OracleZone z;
     if (b[11] & 0x80)
     {
@@ -158,7 +159,7 @@ OracleZone decodeZone(scope const(ubyte)[] b) @safe pure
         z.regionId = cast(ushort)(((b[11] & 0x7F) << 6) | (b[12] >> 2));
         z.regionName = regionName(z.regionId);
         if (z.regionName is null)
-            throw new ClientException("Unknown time zone region ID " ~ toText(
+            throw new ClientException("Unknown time zone region ID " ~ to!string(
                     z.regionId)
                     ~ " (from a newer time zone file than this client knows)");
     }
@@ -263,7 +264,7 @@ Throws: `ProtocolException` for malformed values.
 YearToMonth decodeYearToMonth(scope const(ubyte)[] b) @safe pure
 {
     if (b.length != 5)
-        throw new ProtocolException("Invalid INTERVAL YEAR TO MONTH length " ~ toText(b.length));
+        throw new ProtocolException("Invalid INTERVAL YEAR TO MONTH length " ~ to!string(b.length));
     const years = cast(long) u32(b[0 .. 4]) - 0x8000_0000L;
     const months = b[4] - 60;
     if (months < -11 || months > 11 || years < -999_999_999 || years > 999_999_999)
@@ -309,7 +310,7 @@ Throws: `ProtocolException` for malformed values.
 DayToSecond decodeDayToSecond(scope const(ubyte)[] b) @safe pure
 {
     if (b.length != 11)
-        throw new ProtocolException("Invalid INTERVAL DAY TO SECOND length " ~ toText(b.length));
+        throw new ProtocolException("Invalid INTERVAL DAY TO SECOND length " ~ to!string(b.length));
     DayToSecond d;
     const days = cast(long) u32(b[0 .. 4]) - 0x8000_0000L;
     const ns = cast(long) u32(b[7 .. 11]) - 0x8000_0000L;
@@ -333,13 +334,6 @@ private uint u32(scope const(ubyte)[] b) @safe pure nothrow @nogc
 private int abs(int v) @safe pure nothrow @nogc
 {
     return v < 0 ? -v : v;
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///

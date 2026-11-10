@@ -59,7 +59,7 @@ struct LobRequest
 }
 
 /// The LOB_OP message.
-ubyte[] buildLobOperation(const ref LobRequest q, ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildLobOperation(scope const ref LobRequest q, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.lobOp, sequence, fieldVersion);
@@ -279,7 +279,7 @@ final class Lob
         run(q);
     }
 
-    private LobResponse run(ref LobRequest q) @safe
+    private LobResponse run(scope ref LobRequest q) @safe
     {
         if (freed)
             throw new ClientException("The temporary LOB was freed");
@@ -322,8 +322,7 @@ final class Lob
 
         if (!utf16())
             return cast(immutable(ubyte)[]) text.idup;
-        auto bytes = littleEndian() ? encodeUtf16le(text) : encodeUtf16be(text);
-        return (() @trusted => cast(immutable(ubyte)[]) bytes)(); // unique: just encoded
+        return littleEndian() ? encodeUtf16le(text) : encodeUtf16be(text); // unique results of pure functions
     }
 }
 

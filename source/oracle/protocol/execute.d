@@ -8,6 +8,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.protocol.execute;
 
+import std.conv : to;
 import oracle.exception : ClientException, ProtocolException;
 import oracle.protocol.messages : FunctionCode, functionHeader;
 import oracle.protocol.negotiate : MessageType, TtcFieldVersion;
@@ -68,7 +69,7 @@ enum ExecuteFlag : uint
 }
 
 /// The EXECUTE message.
-ubyte[] buildExecute(const ref ExecuteRequest r, ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildExecute(const ref ExecuteRequest r, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.execute, sequence, fieldVersion);
@@ -176,7 +177,7 @@ public import oracle.types.vector : vectorMaxLength;
 The define of one column: its wire type (`ColumnInfo.wireType`), with LOBs
 fetched as LONG / LONG RAW values or as locators.
 +/
-void putDefineMetadata(ref TtcWriter w, const ColumnInfo c, ubyte fieldVersion) @safe pure
+void putDefineMetadata(ref TtcWriter w, const ColumnInfo c, ubyte fieldVersion) @safe pure nothrow
 {
     import oracle.protocol.negotiate : CharsetId;
 
@@ -209,7 +210,7 @@ void putDefineMetadata(ref TtcWriter w, const ColumnInfo c, ubyte fieldVersion) 
 }
 
 /// The metadata of one bind.
-void putBindMetadata(ref TtcWriter w, const Parameter b, ubyte fieldVersion) @safe pure
+void putBindMetadata(ref TtcWriter w, const Parameter b, ubyte fieldVersion) @safe pure nothrow
 {
     import oracle.protocol.negotiate : CharsetId;
 
@@ -232,7 +233,7 @@ void putBindMetadata(ref TtcWriter w, const Parameter b, ubyte fieldVersion) @sa
 }
 
 /// The bind values: a ROW_DATA message per execution.
-void putBindRows(ref TtcWriter w, const(Parameter[])[] rows, const(bool)[] sendValue) @safe pure
+void putBindRows(ref TtcWriter w, const(Parameter[])[] rows, const(bool)[] sendValue) @safe pure nothrow
 {
     foreach (row; rows)
     {
@@ -261,7 +262,7 @@ bool isLongBind(const ref Parameter p) @safe pure nothrow
     return (p.type == OracleType.varchar || p.type == OracleType.raw) && p.bufferSize > 32_767;
 }
 
-private void putBindValue(ref TtcWriter w, const ref Parameter p) @safe pure
+private void putBindValue(ref TtcWriter w, const ref Parameter p) @safe pure nothrow
 {
     if (p.type == OracleType.cursor)
         w.bytes([1, 0]); // a NULL cursor
@@ -307,7 +308,7 @@ ubyte[] buildReexecute(uint cursorId, bool query, uint prefetchRows, bool commit
 }
 
 /// The FETCH message: `rows` more rows of `cursorId`.
-ubyte[] buildFetch(uint cursorId, uint rows, ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildFetch(uint cursorId, uint rows, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.fetch, sequence, fieldVersion);
@@ -317,7 +318,7 @@ ubyte[] buildFetch(uint cursorId, uint rows, ubyte sequence, ubyte fieldVersion)
 }
 
 /// A call without arguments (COMMIT, ROLLBACK, PING, LOGOFF).
-ubyte[] buildBareCall(FunctionCode code, ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildBareCall(FunctionCode code, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, code, sequence, fieldVersion);
@@ -325,7 +326,8 @@ ubyte[] buildBareCall(FunctionCode code, ubyte sequence, ubyte fieldVersion) @sa
 }
 
 /// The close-cursors piggyback, sent before another call.
-void putCloseCursors(ref TtcWriter w, scope const uint[] cursorIds, ubyte sequence, ubyte fieldVersion) @safe pure
+void putCloseCursors(ref TtcWriter w, scope const uint[] cursorIds, ubyte sequence, ubyte fieldVersion) @safe
+pure nothrow
 {
     w.u8(MessageType.piggyback);
     w.u8(FunctionCode.closeCursors);
@@ -355,7 +357,7 @@ ColumnInfo[] readDescribeBody(ref TtcReader r, ubyte fieldVersion) @safe
     r.ub4(); // maximum row size
     const count = r.ub4();
     if (count > 1000)
-        throw new ProtocolException("Invalid column count " ~ toText(count));
+        throw new ProtocolException("Invalid column count " ~ to!string(count));
     auto columns = new ColumnInfo[count];
     if (count)
         r.u8();
@@ -415,7 +417,7 @@ private immutable(string[2])[] readAnnotations(ref TtcReader r) @safe
     r.u8();
     const count = r.ub4();
     if (count > 10_000)
-        throw new ProtocolException("Invalid annotation count " ~ toText(count));
+        throw new ProtocolException("Invalid annotation count " ~ to!string(count));
     r.u8();
     auto result = new string[2][count];
     foreach (ref a; result)
@@ -649,13 +651,6 @@ ChildCursor readRefCursor(ref TtcReader r, ubyte fieldVersion) @safe
     c.columns = readDescribeBody(r, fieldVersion);
     c.cursorId = r.ub2();
     return c;
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///

@@ -8,6 +8,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.floats;
 
+import dbwire.io.buffer : fromBigEndian;
 import oracle.exception : ProtocolException;
 import dbwire.types.floattext : ShortestDigits;
 import oracle.types.number : DecodedNumber;
@@ -21,20 +22,14 @@ double decodeBinaryFloat(scope const(ubyte)[] b) @safe pure
 {
     if (b.length != 4 && b.length != 8)
         throw new ProtocolException("Invalid BINARY_FLOAT/BINARY_DOUBLE length");
-    ulong bits;
-    foreach (x; b)
-        bits = (bits << 8) | x;
-    const signBit = 1UL << (8 * b.length - 1);
-    if (bits & signBit)
-        bits &= ~signBit; // positive
+    ubyte[8] x;
+    x[0 .. b.length] = b[];
+    if (x[0] & 0x80)
+        x[0] &= 0x7F; // positive
     else
-        bits = ~bits & (b.length == 4 ? 0xFFFF_FFFFUL : ulong.max); // negative
-    if (b.length == 4)
-    {
-        const uint u = cast(uint) bits;
-        return (() @trusted => *cast(const float*)&u)(); // reinterprets the IEEE bits
-    }
-    return (() @trusted => *cast(const double*)&bits)(); // reinterprets the IEEE bits
+        foreach (ref c; x[0 .. b.length])
+            c ^= 0xFF; // negative
+    return b.length == 4 ? fromBigEndian!float(x[0 .. 4]) : fromBigEndian!double(x);
 }
 
 /++

@@ -85,14 +85,14 @@ final class Pipeline
     }
 
     /// Adds a statement (DML, DDL, PL/SQL) with arguments bound as in `Connection.exec`.
-    Pipeline exec(Args...)(string sql, Args args)
+    Pipeline exec(Args...)(string sql, auto ref Args args)
     {
         ops ~= PipelineOp(PipelineOpKind.exec, sql, parameters(args));
         return this;
     }
 
     /// Adds a query, with arguments bound as in `Connection.query`; all its rows are read.
-    Pipeline query(Args...)(string sql, Args args)
+    Pipeline query(Args...)(string sql, auto ref Args args)
     {
         ops ~= PipelineOp(PipelineOpKind.query, sql, parameters(args));
         return this;

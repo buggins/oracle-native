@@ -6,6 +6,28 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+From the review of attributes and D idioms (#47):
+
+- `@safe` code can pass a `Variant` (e.g. `row.getVariant(0)`) to `exec`,
+  `query`, `queryRow`, `queryValue`, `Parameter.of` and pipelines: arguments
+  are taken by `auto ref` (a `Variant` copy is `@system`). `insert(table,
+  row)` with one struct is `@safe` too (it sliced a pointer).
+- `readValue!(ubyte[])` (and `ubyte[]` fields of `query!T`/`queryRow!T`)
+  returns a copy: it cast the row's immutable bytes to mutable, which made
+  those calls `@system`. `immutable(ubyte)[]` and `const(ubyte)[]` fields
+  share the bytes as before.
+- `makeVariant` is no longer public (it is `package(oracle)`, constrained to
+  types without elaborate copies or destructors): a public `@trusted`
+  template that copies a `T` hid `@system` postblits.
+- Fewer `@trusted` blocks (dbwire's `fromBigEndian`/`toBigEndian` for the
+  BINARY_FLOAT/DOUBLE bits, file functions that are `@safe` in Phobos,
+  values built as `string`/`immutable` instead of cast), more `pure` and
+  `nothrow` (request builders, `Value`/`Row` getters, `QueryResult.close`),
+  enum names parsed without `std.conv`, specific exception types caught.
+  CI runs the unit tests with `-preview=dip1000` on the latest compilers.
+
 ### Performance
 
 - BINARY_FLOAT and BINARY_DOUBLE text (`getString`, `getDecimal`, JSON text

@@ -19,6 +19,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.connection;
 
+import std.conv : to;
 import dbwire.client.hosts : connectFirst, orderHosts;
 import dbwire.client.pool : Poolable;
 import dbwire.io.backend : IoBackend, backendFor;
@@ -185,7 +186,7 @@ final class Connection : Poolable
     /// The server version, e.g. `"23.26.3.0.0"`.
     @property string serverVersion() const @safe pure
     {
-        import std.conv : ConvException, to;
+        import std.conv : ConvException;
         import std.format : format;
 
         uint v;
@@ -351,7 +352,7 @@ final class Connection : Poolable
     }
 
     /// ditto
-    ulong exec(Args...)(string sql, Args args) if (Args.length > 0)
+    ulong exec(Args...)(string sql, auto ref Args args) if (Args.length > 0)
     {
         return execResult(run(sql, parameters(args)));
     }
@@ -379,7 +380,7 @@ final class Connection : Poolable
     }
 
     /// ditto
-    QueryResult query(Args...)(string sql, Args args) if (Args.length > 0)
+    QueryResult query(Args...)(string sql, auto ref Args args) if (Args.length > 0)
     {
         return run(sql, parameters(args));
     }
@@ -391,7 +392,7 @@ final class Connection : Poolable
 
     Throws: `ClientException` if a field has no column; as `query`.
     +/
-    RowRange!T query(T, Args...)(string sql, Args args) if (is(T == struct))
+    RowRange!T query(T, Args...)(string sql, auto ref Args args) if (is(T == struct))
     {
         return RowRange!T(runArgs(sql, args));
     }
@@ -401,7 +402,7 @@ final class Connection : Poolable
 
     Throws: `ClientException` if there is no row or a field has no column; as `query`.
     +/
-    T queryRow(T, Args...)(string sql, Args args) if (is(T == struct))
+    T queryRow(T, Args...)(string sql, auto ref Args args) if (is(T == struct))
     {
         auto result = runArgs(sql, args);
         scope (exit)
@@ -419,7 +420,7 @@ final class Connection : Poolable
 
     Throws: `ClientException` if there is no row, or the value can't be converted; as `query`.
     +/
-    T queryValue(T, Args...)(string sql, Args args)
+    T queryValue(T, Args...)(string sql, auto ref Args args)
     {
         auto result = runArgs(sql, args);
         scope (exit)
@@ -445,7 +446,6 @@ final class Connection : Poolable
     ulong insert(R)(string table, R rows) if (isInputRange!R && is(ElementType!R == struct))
     {
         import std.array : join;
-        import std.conv : to;
 
         alias E = ElementType!R;
         enum columns = columnNames!E;
@@ -476,10 +476,12 @@ final class Connection : Poolable
     /// ditto
     ulong insert(T)(string table, T row) if (is(T == struct) && !isInputRange!T)
     {
-        return insert(table, (&row)[0 .. 1]);
+        import std.range : only;
+
+        return insert(table, only(row));
     }
 
-    private QueryResult runArgs(Args...)(string sql, Args args)
+    private QueryResult runArgs(Args...)(string sql, auto ref Args args)
     {
         static if (Args.length)
             return run(sql, parameters(args));
@@ -761,7 +763,6 @@ final class Connection : Poolable
         import oracle.params : asNumberBoolean, asTextVector, asWireJson;
 
         import std.algorithm.searching : countUntil;
-        import std.conv : to;
         import std.uni : toUpper;
 
         auto byName = new Parameter[ph.names.length];
@@ -1261,7 +1262,7 @@ final class Connection : Poolable
     Runs a LOB operation (see `oracle.lob`). Allowed while a query result is
     open: LOBs are read while their rows are.
     +/
-    package LobResponse lobOperation(const ref LobRequest q, ulong lobLease) @safe
+    package LobResponse lobOperation(scope const ref LobRequest q, ulong lobLease) @safe
     {
         if (state == State.closed)
             throw new ClientException("The connection is closed");
@@ -1283,7 +1284,7 @@ final class Connection : Poolable
                 case MessageType.lobData:
                     if (response.data.length >= options.maxValueLength)
                         throw new ProtocolException(
-                            "A LOB value longer than " ~ toText(options.maxValueLength)
+                            "A LOB value longer than " ~ to!string(options.maxValueLength)
                             ~ " bytes");
                     const piece = reader.clr(options.maxValueLength - response.data.length);
                     response.data = response.data.length ? response.data ~ piece : piece;
@@ -1315,7 +1316,7 @@ final class Connection : Poolable
                     throwIfError(e);
                     return;
                 default:
-                    throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " in a LOB response");
+                    throw new ProtocolException("Unexpected message type " ~ to!string(type) ~ " in a LOB response");
                 }
             }
         });
@@ -1350,8 +1351,6 @@ final class Connection : Poolable
     /// Array DML; see `execMany`.
     private BatchResult runMany(string sql, const(Parameter[])[] rows, bool batchErrors) @safe
     {
-        import std.conv : to;
-
         checkReady();
         size_t questionMarks;
         const text = rewritePlaceholders(sql, questionMarks);
@@ -1610,7 +1609,7 @@ final class Connection : Poolable
             else if (type == MessageType.warning)
                 skipWarning(reader);
             else
-                throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " after a cancel");
+                throw new ProtocolException("Unexpected message type " ~ to!string(type) ~ " after a cancel");
         }
     }
 
@@ -1695,7 +1694,7 @@ final class Connection : Poolable
                 checkResponseEnd();
                 return atomicLoad(cancelPending) ? finishCancel(e, true) : e;
             default:
-                throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " in the server's response");
+                throw new ProtocolException("Unexpected message type " ~ to!string(type) ~ " in the server's response");
             }
         }
     }
@@ -1758,7 +1757,7 @@ final class Connection : Poolable
         {
             const type = reader.u8();
             if (type != MessageType.endOfResponse)
-                throw new ProtocolException("Expected the end of the response, not message type " ~ toText(type));
+                throw new ProtocolException("Expected the end of the response, not message type " ~ to!string(type));
         }
         if (reader.reader.buffered != 0 || tns.unread != 0)
             throw new ProtocolException("The server's response continues after its end");
@@ -1881,8 +1880,6 @@ final class Connection : Poolable
     +/
     private void serverPiggyback() @safe
     {
-        import std.conv : to;
-
         const ret = readServerPiggyback(reader);
         if (!ret.present)
             return;
@@ -1917,7 +1914,7 @@ final class Connection : Poolable
 
     private uint sessionNumber(string key) const @safe pure
     {
-        import std.conv : ConvException, to;
+        import std.conv : ConvException;
 
         try
             return sessionValue(key).to!uint;
@@ -2014,7 +2011,7 @@ final class Connection : Poolable
             {
                 const a = parseAccept(p.bytes);
                 if (a.tnsVersion < TnsVersion.minAccepted)
-                    throw new ConnectionException("The server's protocol version " ~ toText(
+                    throw new ConnectionException("The server's protocol version " ~ to!string(
                             a.tnsVersion)
                             ~ " is too old (Oracle Database 12.1 or later is needed)");
                 if (a.flags0 & nsiNaRequired)
@@ -2034,7 +2031,7 @@ final class Connection : Poolable
                 throw new ConnectionException(refuseMessage(code, text));
             }
             if (p.type != PacketType.redirect)
-                throw new ProtocolException("Unexpected TNS packet type " ~ toText(p.type) ~ " from the listener");
+                throw new ProtocolException("Unexpected TNS packet type " ~ to!string(p.type) ~ " from the listener");
             immutable(ubyte)[] following;
             if (redirectDataFollows(p.bytes))
                 following = tns.readPacket().bytes;
@@ -2057,7 +2054,7 @@ final class Connection : Poolable
             .compileCaps[Cap.fieldVersion] : 0;
         negotiatedFieldVersion = serverFieldVersion < clientFieldVersion ? serverFieldVersion : clientFieldVersion;
         if (negotiatedFieldVersion < TtcFieldVersion.v12_1)
-            throw new ConnectionException("The server's TTC field version " ~ toText(
+            throw new ConnectionException("The server's TTC field version " ~ to!string(
                     serverFieldVersion)
                     ~ " is too old (Oracle Database 12.1 or later is needed)");
         tns.sendData(buildDataTypesMessage(tns.endOfResponse));
@@ -2075,7 +2072,7 @@ final class Connection : Poolable
         details.terminal = options.terminal;
         details.program = program;
         details.machine = machine;
-        details.pid = toText(processId());
+        details.pid = to!string(processId());
         details.osUser = osUser;
         string login, proxyClient;
         options.loginUsers(login, proxyClient);
@@ -2127,7 +2124,7 @@ final class Connection : Poolable
                     throw new ServerException(e.number, e.message, e.position);
                 return values;
             default:
-                throw new ProtocolException("Unexpected message type " ~ toText(type) ~ " in the login response");
+                throw new ProtocolException("Unexpected message type " ~ to!string(type) ~ " in the login response");
             }
         }
     }
@@ -2137,7 +2134,7 @@ final class Connection : Poolable
 private immutable(TimeZone) zoneOf(string setting) @safe
 {
     import core.time : minutes;
-    import std.conv : ConvException, to;
+    import std.conv : ConvException;
     import std.datetime.timezone : SimpleTimeZone, UTC;
     import dbwire.types.timezone : resolveTimeZone;
 
@@ -2180,7 +2177,7 @@ package final class CachedStatement
 /// The host and port of a REDIRECT address (`(ADDRESS=(PROTOCOL=tcp)(HOST=h)(PORT=p))`).
 private HostPort redirectEndpoint(string address, HostPort current) @safe
 {
-    import std.conv : ConvException, to;
+    import std.conv : ConvException;
     import oracle.settings : DescriptorNode;
 
     DescriptorNode node;
@@ -2276,18 +2273,11 @@ private string userName() @safe nothrow
         return "unknown";
 }
 
-private uint processId() @trusted nothrow
+private uint processId() @safe nothrow
 {
     import std.process : thisProcessID;
 
-    return cast(uint) thisProcessID; // reads the process id
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
+    return cast(uint) thisProcessID;
 }
 
 // --- tests over a scripted transport (oracle.protocol.scripted) ---
@@ -2363,7 +2353,7 @@ version (unittest)
     private ubyte[] errorResponse(uint number, uint cursorId = 1) @safe
     {
         TtcWriter w;
-        putError(w, number, cursorId, "ORA-" ~ toText(number) ~ ": scripted");
+        putError(w, number, cursorId, "ORA-" ~ to!string(number) ~ ": scripted");
         return dataPacket(w.data);
     }
 }
@@ -2620,4 +2610,66 @@ version (unittest)
     conn.owner = new Thread(&nothing);
     conn.close();
     assert(!conn.isOpen && t.written.length == 0 && t.connected);
+}
+
+// What @safe code can call (attribute inference of the templates, locked in): struct mapping, single-row insert,
+// ubyte[] fields, Variant arguments (lvalues too); a field type with a @system copy keeps a call @system
+unittest
+{
+    import oracle.mapping : ignore;
+    import oracle.result : Row;
+    import std.variant : Variant;
+
+    static struct Plain
+    {
+        int id;
+        string name;
+    }
+
+    static struct WithBytes
+    {
+        int id;
+        ubyte[] data;
+    }
+
+    static struct EvilCopy
+    {
+        int x;
+        this(this) @system
+        {
+        }
+    }
+
+    static struct WithEvilCopy
+    {
+        int id;
+        @ignore EvilCopy e;
+    }
+
+    static assert(__traits(compiles, (Connection c) @safe { c.insert("t", [Plain(1)]); }));
+    static assert(__traits(compiles, (Connection c) @safe { c.insert("t", Plain(1)); }));
+    static assert(__traits(compiles, (Connection c) @safe {
+            foreach (r; c.query!Plain("q"))
+            {
+            }
+        }));
+    static assert(__traits(compiles, (Connection c) @safe { auto r = c.queryRow!Plain("q", 1); }));
+    static assert(__traits(compiles, (Connection c) @safe { auto r = c.queryValue!long("q"); }));
+    static assert(__traits(compiles, (Connection c) @safe { auto r = c.queryRow!WithBytes("q"); }));
+    static assert(__traits(compiles, (Connection c) @safe { c.exec("q", 1, "a"); }));
+    static assert(__traits(compiles, (Connection c, ref Variant v) @safe { c.query("q", v); }));
+    static assert(__traits(compiles, (Connection c, Row r) @safe { c.exec("q", r.getVariant(0)); }));
+    static assert(__traits(compiles, (Pipeline p) @safe { p.query("q", 1); }));
+    static Parameter ofIsPure() @safe pure
+    {
+        return Parameter.of(1);
+    }
+
+    static Parameter[2] nullAndOutputArePureNothrow() @safe pure nothrow
+    {
+        return [Parameter.nullOf!int(), Parameter.output!string()];
+    }
+
+    static assert(__traits(compiles, ofIsPure()) && __traits(compiles, nullAndOutputArePureNothrow()));
+    static assert(!__traits(compiles, (Connection c) @safe { c.insert("t", WithEvilCopy(1)); }));
 }

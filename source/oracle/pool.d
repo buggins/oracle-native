@@ -149,7 +149,7 @@ struct PooledConnection
         release();
     }
 
-    private this(PoolLease lease) @trusted
+    private this(PoolLease lease) @safe
     {
         import std.algorithm.mutation : move;
 
