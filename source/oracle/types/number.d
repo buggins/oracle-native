@@ -44,7 +44,7 @@ struct DecodedNumber
 package(oracle) string plainText(bool negative, scope const(char)[] digits, int pointPosition) @safe pure nothrow
 {
     import std.array : replicate;
-    import oracle.types.temporal : TextBufferOf;
+    import dbwire.types.text : TextBuffer;
 
     if (digits.length == 0)
         return "0";
@@ -59,7 +59,7 @@ package(oracle) string plainText(bool negative, scope const(char)[] digits, int 
             return s ~ digits ~ "0".replicate(pointPosition - digits.length);
         return s ~ digits[0 .. pointPosition] ~ "." ~ digits[pointPosition .. $];
     }
-    TextBufferOf!400 t; // NUMBERs need at most 175 characters, doubles 343
+    TextBuffer!400 t; // NUMBERs need at most 175 characters, doubles 343
     if (negative)
         t.put('-');
     if (pointPosition <= 0)

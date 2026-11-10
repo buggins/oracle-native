@@ -145,6 +145,14 @@ From the code review (#45):
   character set conversions, fewer allocations).
 - `connect_timeout=0` (`ConnectionOptions.connectTimeout = Duration.zero`)
   means no time limit. With dbwire 0.8 connecting failed at once.
+- dbwire `~>0.9.3` (#53): a `?password=` or `wallet_password=` in a connection
+  string is masked in error messages; a tiny positive timeout no longer
+  means "no limit"; large values announced by the server (CLOB/BLOB chunks)
+  are read as the data arrives instead of being allocated up front; faster
+  decoding of AL16UTF16 text; float text 4 to 5 times faster outside about
+  1e-20…1e35, without allocating. The float text layout (`formatDigits`) and
+  the date/interval text buffer (`TextBuffer`) now come from dbwire (the
+  same text).
 
 ## 0.3.1 — 2026-11-07
 

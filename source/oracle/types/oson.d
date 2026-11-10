@@ -340,7 +340,7 @@ private struct OsonDecoder
 
     void dateTime(scope const(ubyte)[] b, bool zoned) @safe
     {
-        import oracle.types.temporal : TextBuffer, decodeDateTime, decodeZone, hasLocalTime, localDateTime;
+        import oracle.types.temporal : TextBuffer, decodeDateTime, decodeZone, hasLocalTime, localDateTime, putFraction;
 
         auto d = decodeDateTime(b);
         string suffix;
@@ -370,7 +370,7 @@ private struct OsonDecoder
         t.put(':');
         t.number(d.second, 2);
         if (b.length > 7)
-            t.fraction(d.nanoseconds, 6);
+            t.putFraction(d.nanoseconds, 6);
         if (suffix.length <= t.buffer.length - t.length)
         {
             t.put(suffix);
@@ -382,7 +382,7 @@ private struct OsonDecoder
 
     void dayToSecond(scope const(ubyte)[] b) @safe
     {
-        import oracle.types.temporal : TextBuffer, decodeDayToSecond;
+        import oracle.types.temporal : TextBuffer, decodeDayToSecond, putFraction;
 
         const d = decodeDayToSecond(b);
         const negative = d.days < 0 || d.hours < 0 || d.minutes < 0 || d.seconds < 0 || d.nanoseconds < 0;
@@ -402,7 +402,7 @@ private struct OsonDecoder
         t.number(abs(d.minutes), 1);
         t.put('M');
         t.number(abs(d.seconds), 1);
-        t.fraction(abs(d.nanoseconds), 6);
+        t.putFraction(abs(d.nanoseconds), 6);
         t.put('S');
         quoted(t.buffer[0 .. t.length]);
     }
