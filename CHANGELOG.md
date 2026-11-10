@@ -6,6 +6,16 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- dbwire 0.9 (`~>0.9.0`, #43), like clickhoused and postgresql-native:
+  the fixes from its code review (huge TZif counts rejected before
+  allocating, the next address tried when a socket can't be created, a
+  `ClientException` instead of an `assert` for 0 PBKDF2 iterations, faster
+  character set conversions, fewer allocations).
+- `connect_timeout=0` (`ConnectionOptions.connectTimeout = Duration.zero`)
+  means no time limit. With dbwire 0.8 connecting failed at once.
+
 ## 0.3.1 — 2026-11-07
 
 ### Changed
