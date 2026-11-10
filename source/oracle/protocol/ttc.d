@@ -9,6 +9,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.protocol.ttc;
 
+import std.conv : to;
 import dbwire.io.buffer : BufferedReader;
 import oracle.exception : ProtocolException;
 
@@ -173,7 +174,7 @@ struct TtcReader
         if (n == 0)
             return 0;
         if ((n & 0x80) || n > limit)
-            throw new ProtocolException("Invalid TTC integer length " ~ toText(n));
+            throw new ProtocolException("Invalid TTC integer length " ~ to!string(n));
         ulong v;
         foreach (_; 0 .. n)
             v = (v << 8) | u8();
@@ -206,7 +207,7 @@ struct TtcReader
             return 0;
         const len = n & 0x7F;
         if (len > limit)
-            throw new ProtocolException("Invalid TTC integer length " ~ toText(len));
+            throw new ProtocolException("Invalid TTC integer length " ~ to!string(len));
         ulong v;
         foreach (_; 0 .. len)
             v = (v << 8) | u8();
@@ -227,17 +228,17 @@ struct TtcReader
             return null;
         if (n != clrChunked)
             return bytes(n);
-        ubyte[] result;
+        immutable(ubyte)[] result;
         for (;;)
         {
             const chunk = ub4();
             if (chunk == 0)
                 break;
             if (result.length + chunk > maxLength)
-                throw new ProtocolException("A value longer than " ~ toText(maxLength) ~ " bytes");
+                throw new ProtocolException("A value longer than " ~ to!string(maxLength) ~ " bytes");
             result ~= bytes(chunk);
         }
-        return (() @trusted => cast(immutable(ubyte)[]) result)(); // unique: built here
+        return result;
     }
 
     /// Reads a value with two lengths: `ub4` total length (0 = none), then a CLR (at most `maxLength` bytes).
@@ -255,7 +256,7 @@ struct TtcReader
     /// Reads a NUL-terminated string.
     string cstring(size_t maxLength = 4096) @safe
     {
-        char[] s;
+        string s;
         for (;;)
         {
             const c = u8();
@@ -265,15 +266,8 @@ struct TtcReader
                 throw new ProtocolException("Unterminated string");
             s ~= cast(char) c;
         }
-        return (() @trusted => cast(string) s)(); // unique: built here
+        return s;
     }
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///

@@ -31,7 +31,7 @@ struct TnsNames
 
     Throws: `ClientException` if the file has no such entry.
     +/
-    string lookup(string name) const @safe
+    string lookup(string name) const @safe pure
     {
         import std.uni : toUpper;
 
@@ -64,7 +64,7 @@ string findConfigDir(string configDir = null) @safe
             candidates ~= buildPath(home, "network", "admin");
     }
     foreach (dir; candidates)
-        if ((()@trusted => exists(buildPath(dir, "tnsnames.ora")))())
+        if (exists(buildPath(dir, "tnsnames.ora")))
             return dir;
     return null;
 }
@@ -90,6 +90,7 @@ private void readInto(ref TnsNames t, string file, ref string[] reading) @safe
     import std.algorithm.searching : canFind;
     import std.file : FileException, readText;
     import std.path : absolutePath, buildNormalizedPath, buildPath, dirName, isAbsolute;
+    import std.utf : UTFException;
     import std.string : split, splitLines, strip;
     import std.uni : toUpper;
 
@@ -104,10 +105,10 @@ private void readInto(ref TnsNames t, string file, ref string[] reading) @safe
         reading = reading[0 .. $ - 1];
     string text;
     try
-        text = (() @trusted => readText(file))();
+        text = readText(file);
     catch (FileException e)
         throw new ClientException("Cannot read " ~ file ~ ": " ~ e.msg);
-    catch (Exception e) // invalid UTF-8
+    catch (UTFException e)
         throw new ClientException("Cannot read " ~ file ~ ": " ~ e.msg);
     foreach (entry; parseTnsNames(text))
     {
@@ -266,20 +267,17 @@ IFILE = "more.ora"
     import std.string : indexOf;
 
     const dir = buildPath(tempDir, "oracle-native-tnsnames-test");
-    (() @trusted {
-        mkdirRecurse(buildPath(dir, "sub"));
-        write(buildPath(dir, "tnsnames.ora"),
-            "main = (DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=m)))\nIFILE=sub/x.ora\n");
-        write(buildPath(dir, "sub", "x.ora"), "Other, o2 = h:1/o\n");
-    })();
+    mkdirRecurse(buildPath(dir, "sub"));
+    write(buildPath(dir, "tnsnames.ora"), "main = (DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=m)))\nIFILE=sub/x.ora\n");
+    write(buildPath(dir, "sub", "x.ora"), "Other, o2 = h:1/o\n");
     scope (exit)
-        (() @trusted => rmdirRecurse(dir))();
+        rmdirRecurse(dir);
     const t = readTnsNames(dir);
     assert(t.lookup("main") == "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=m)))");
     assert(t.lookup("OTHER") == "h:1/o" && t.lookup("o2") == "h:1/o");
     assertThrown!ClientException(t.lookup("missing"));
     assert(findConfigDir(dir) == dir && findConfigDir(buildPath(dir, "sub")) is null);
-    (() @trusted => write(buildPath(dir, "sub", "x.ora"), "IFILE=../tnsnames.ora\n"))();
+    write(buildPath(dir, "sub", "x.ora"), "IFILE=../tnsnames.ora\n");
     auto e = collectException!ClientException(readTnsNames(dir)); // includes itself, through a relative path
     assert(e !is null && e.msg.indexOf("includes itself") >= 0, e.msg);
 }

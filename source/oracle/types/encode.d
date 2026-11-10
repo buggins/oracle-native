@@ -7,11 +7,13 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.encode;
 
+import std.conv : to;
 import core.time : Duration;
 import std.datetime.date : DateTime;
 import std.datetime.systime : SysTime;
 import dbwire.types.decimal : Decimal;
 import dbwire.types.interval : MonthInterval;
+import dbwire.io.buffer : toBigEndian;
 import oracle.exception : ClientException;
 
 /++
@@ -48,7 +50,8 @@ immutable(ubyte)[] encodeNumber(bool negative, scope const(char)[] digits, int p
     const exponent = pointPosition / 2 - 1; // the power of 100 of the first pair
     if (exponent < -65 || exponent > 62)
         throw new ClientException("Value out of NUMBER's range");
-    auto b = new ubyte[1 + d.length / 2 + (negative && d.length < 40 ? 1 : 0)];
+    ubyte[22] buffer; // an exponent, 20 base-100 digits, the terminator of negative numbers
+    auto b = buffer[0 .. 1 + d.length / 2 + (negative && d.length < 40 ? 1 : 0)];
     const ubyte exponentByte = cast(ubyte)(0xC1 + exponent);
     b[0] = negative ? cast(ubyte)(~cast(int) exponentByte) : exponentByte;
     foreach (i; 0 .. d.length / 2)
@@ -58,14 +61,12 @@ immutable(ubyte)[] encodeNumber(bool negative, scope const(char)[] digits, int p
     }
     if (negative && d.length < 40)
         b[$ - 1] = 102;
-    return (() @trusted => cast(immutable(ubyte)[]) b)(); // unique: built here
+    return b.idup;
 }
 
 /// A NUMBER from an integer.
 immutable(ubyte)[] encodeNumber(long v) @safe pure
 {
-    import std.conv : to;
-
     if (v == long.min)
         return encodeNumber(true, "9223372036854775808", 19);
     const s = (v < 0 ? -v : v).to!string;
@@ -75,8 +76,6 @@ immutable(ubyte)[] encodeNumber(long v) @safe pure
 /// ditto
 immutable(ubyte)[] encodeUnsignedNumber(ulong v) @safe pure
 {
-    import std.conv : to;
-
     const s = v.to!string;
     return encodeNumber(false, s, cast(int) s.length);
 }
@@ -88,8 +87,6 @@ Throws: `ClientException` if it has more than 40 significant digits.
 +/
 immutable(ubyte)[] encodeNumber(const Decimal v) @safe pure
 {
-    import std.conv : to;
-
     string s = v.unscaled.toString();
     const negative = s.length && s[0] == '-';
     if (negative)
@@ -100,26 +97,24 @@ immutable(ubyte)[] encodeNumber(const Decimal v) @safe pure
 /// A BINARY_DOUBLE (8 bytes) or BINARY_FLOAT (4 bytes).
 immutable(ubyte)[] encodeBinaryDouble(double v) @safe pure nothrow
 {
-    const ulong raw = (() @trusted => *cast(const ulong*)&v)(); // reinterprets the IEEE bits
-    return flipped(raw, 8);
+    return flipped(toBigEndian(v));
 }
 
 /// ditto
 immutable(ubyte)[] encodeBinaryFloat(float v) @safe pure nothrow
 {
-    const uint raw = (() @trusted => *cast(const uint*)&v)(); // reinterprets the IEEE bits
-    return flipped(raw, 4);
+    return flipped(toBigEndian(v));
 }
 
-private immutable(ubyte)[] flipped(ulong bits, size_t n) @safe pure nothrow
+/// The IEEE bits (big-endian) with the sign bit flipped for positive numbers, all bits for negative ones.
+private immutable(ubyte)[] flipped(scope ubyte[] b) @safe pure nothrow
 {
-    const sign = 1UL << (8 * n - 1);
-    const mask = n == 8 ? ulong.max : (1UL << (8 * n)) - 1;
-    bits = (bits & sign) ? ~bits & mask : bits | sign;
-    auto b = new ubyte[n];
-    foreach (i; 0 .. n)
-        b[i] = cast(ubyte)(bits >> (8 * (n - 1 - i)));
-    return (() @trusted => cast(immutable(ubyte)[]) b)(); // unique: built here
+    if (b[0] & 0x80)
+        foreach (ref c; b)
+            c ^= 0xFF;
+    else
+        b[0] |= 0x80;
+    return b.idup;
 }
 
 /++
@@ -143,8 +138,9 @@ private immutable(ubyte)[] encodeDateTime(const DateTime dt, uint ns, bool withF
 {
     const year = dt.year <= 0 ? dt.year - 1 : dt.year; // Oracle has no year 0
     if (year < -4712 || year > 9999)
-        throw new ClientException("Year " ~ toText(year) ~ " is outside Oracle's dates (-4712 to 9999)");
-    auto b = new ubyte[withFraction ? 11 : 7];
+        throw new ClientException("Year " ~ to!string(year) ~ " is outside Oracle's dates (-4712 to 9999)");
+    ubyte[11] buffer;
+    auto b = buffer[0 .. withFraction ? 11 : 7];
     b[0] = cast(ubyte)(year / 100 + 100);
     b[1] = cast(ubyte)(year % 100 + 100);
     b[2] = dt.month;
@@ -155,7 +151,7 @@ private immutable(ubyte)[] encodeDateTime(const DateTime dt, uint ns, bool withF
     if (withFraction)
         foreach (i; 0 .. 4)
             b[7 + i] = cast(ubyte)(ns >> (8 * (3 - i)));
-    return (() @trusted => cast(immutable(ubyte)[]) b)(); // unique: built here
+    return b.idup;
 }
 
 /++
@@ -183,23 +179,23 @@ immutable(ubyte)[] encodeIntervalDs(const Duration d) @safe pure
     const parts = d.split!("days", "hours", "minutes", "seconds", "hnsecs")();
     const days = parts.days;
     if (days > 999_999_999 || days < -999_999_999)
-        throw new ClientException("Interval out of range: " ~ toText(days) ~ " days");
-    auto b = new ubyte[11];
+        throw new ClientException("Interval out of range: " ~ to!string(days) ~ " days");
+    ubyte[11] b;
     putBiased(b[0 .. 4], days);
     b[4] = cast(ubyte)(parts.hours + 60);
     b[5] = cast(ubyte)(parts.minutes + 60);
     b[6] = cast(ubyte)(parts.seconds + 60);
     putBiased(b[7 .. 11], parts.hnsecs * 100);
-    return (() @trusted => cast(immutable(ubyte)[]) b)(); // unique: built here
+    return b[].idup;
 }
 
 /// An INTERVAL YEAR TO MONTH (5 bytes).
-immutable(ubyte)[] encodeIntervalYm(const MonthInterval m) @safe pure
+immutable(ubyte)[] encodeIntervalYm(const MonthInterval m) @safe pure nothrow
 {
-    auto b = new ubyte[5];
+    ubyte[5] b;
     putBiased(b[0 .. 4], m.years);
     b[4] = cast(ubyte)(m.monthsPart + 60);
-    return (() @trusted => cast(immutable(ubyte)[]) b)(); // unique: built here
+    return b[].idup;
 }
 
 /// A signed value + 2³¹ as a big-endian u32.
@@ -208,13 +204,6 @@ private void putBiased(scope ubyte[] b, long v) @safe pure nothrow @nogc
     const u = cast(uint)(v + 0x8000_0000L);
     foreach (i; 0 .. 4)
         b[i] = cast(ubyte)(u >> (8 * (3 - i)));
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///
@@ -229,7 +218,7 @@ private string toText(T)(T v) @safe pure
     assert(encodeNumber(-42L) == [0x3E, 0x3B, 0x66]);
     assert(encodeNumber(100L) == [0xC2, 0x02] && encodeNumber(1234L) == [0xC2, 0x0D, 0x23]);
     foreach (long v; [long.max, long.min, 1, -1, 99, 101, 10_000_000_000, -123_456_789])
-        assert(decodeNumber(encodeNumber(v)).toString == toText(v));
+        assert(decodeNumber(encodeNumber(v)).toString == to!string(v));
     assert(decodeNumber(encodeUnsignedNumber(ulong.max)).toString == "18446744073709551615");
     foreach (s; [
         "0.5", "-12.345", "0.001", "1234567890123456789012345678.0123456789", "-0.000000012"

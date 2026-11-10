@@ -22,6 +22,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.protocol.auth;
 
+import std.conv : to;
 import dbwire.crypto.aes : Aes, aesBlockSize, cbcDecrypt, cbcEncrypt, pkcs7Pad;
 import oracle.exception : ClientException, ProtocolException;
 import oracle.protocol.messages : FunctionCode, KeyValue, functionHeader, keyValue;
@@ -58,7 +59,7 @@ struct ClientDetails
 }
 
 /// The phase 1 message.
-ubyte[] buildPhase1(string user, const ClientDetails details, ubyte sequence, ubyte fieldVersion) @safe pure
+ubyte[] buildPhase1(string user, const ClientDetails details, ubyte sequence, ubyte fieldVersion) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.authPhase1, sequence, fieldVersion);
@@ -130,9 +131,7 @@ Phase2Keys deriveKeys(const KeyValue[] phase1, scope const(char)[] password,
     {
     case Verifier.v12c:
         const iterations = toCount("AUTH_PBKDF2_VGEN_COUNT", get("AUTH_PBKDF2_VGEN_COUNT"));
-        passwordKey = (() @trusted => cast(immutable(ubyte)[]) pbkdf2!SHA512(pw, salt ~ cast(
-                const(ubyte)[]) "AUTH_PBKDF2_SPEEDY_KEY",
-                iterations, 64))();
+        passwordKey = pbkdf2!SHA512(pw, salt ~ cast(const(ubyte)[]) "AUTH_PBKDF2_SPEEDY_KEY", iterations, 64);
         passwordHash = digest!SHA512(passwordKey ~ salt)[0 .. 32].dup;
         break;
     case Verifier.v11g:
@@ -171,13 +170,13 @@ Phase2Keys deriveKeys(const KeyValue[] phase1, scope const(char)[] password,
                 toCount("AUTH_PBKDF2_SDER_COUNT", get("AUTH_PBKDF2_SDER_COUNT")), 32);
     }
     else
-        throw new ProtocolException("Invalid server session key length " ~ toText(serverKey.length));
+        throw new ProtocolException("Invalid server session key length " ~ to!string(serverKey.length));
 
     const comboAes = Aes(combo);
     k.password = hex(cbcEncrypt(comboAes, zero, pkcs7Pad(random(16) ~ pw)));
     if (passwordKey.length)
         k.speedyKey = hex(cbcEncrypt(comboAes, zero, pkcs7Pad(random(16) ~ passwordKey))[0 .. 80]);
-    k.comboKey = (() @trusted => cast(immutable(ubyte)[]) combo)();
+    k.comboKey = combo.idup;
     return k;
 }
 
@@ -186,7 +185,7 @@ The phase 2 message; `proxyClient`: the user of a proxy session (empty:
 none); `connectionClass` and `purity` (1 new, 2 self; 0: not sent): DRCP.
 +/
 ubyte[] buildPhase2(string user, string proxyClient, const Phase2Keys keys, string driverName, string timeZone,
-        ubyte sequence, ubyte fieldVersion, string connectionClass = null, ubyte purity = 0) @safe pure
+        ubyte sequence, ubyte fieldVersion, string connectionClass = null, ubyte purity = 0) @safe pure nothrow
 {
     TtcWriter w;
     functionHeader(w, FunctionCode.authPhase2, sequence, fieldVersion);
@@ -225,7 +224,7 @@ bytes 16 to 32 are "SERVER_TO_CLIENT".
 
 Throws: `ProtocolException` if the server did not prove that it knows the password verifier.
 +/
-void checkServerResponse(const KeyValue[] phase2, const Phase2Keys keys) @safe
+void checkServerResponse(const KeyValue[] phase2, const Phase2Keys keys) @safe pure
 {
     foreach (kv; phase2)
         if (kv.key == "AUTH_SVR_RESPONSE")
@@ -246,14 +245,9 @@ void checkServerResponse(const KeyValue[] phase2, const Phase2Keys keys) @safe
 /// Upper-case hexadecimal text of `b`.
 string hex(scope const(ubyte)[] b) @safe pure nothrow
 {
-    static immutable digits = "0123456789ABCDEF";
-    auto s = new char[2 * b.length];
-    foreach (i, x; b)
-    {
-        s[2 * i] = digits[x >> 4];
-        s[2 * i + 1] = digits[x & 15];
-    }
-    return (() @trusted => cast(string) s)();
+    import std.digest : LetterCase, toHexString;
+
+    return toHexString!(LetterCase.upper)(b);
 }
 
 /// The bytes of hexadecimal text.
@@ -289,7 +283,7 @@ enum uint maxPbkdf2Iterations = 1_000_000;
 // An iteration count from the server: 1 to maxPbkdf2Iterations.
 private uint toCount(string key, string s) @safe pure
 {
-    import std.conv : ConvException, to;
+    import std.conv : ConvException;
 
     uint n;
     try
@@ -299,7 +293,7 @@ private uint toCount(string key, string s) @safe pure
     if (n == 0 || n > maxPbkdf2Iterations)
         throw new ProtocolException(
                 "The server asked for " ~ s ~ " PBKDF2 iterations (" ~ key ~ "), not 1 to "
-                ~ toText(
+                ~ to!string(
                     maxPbkdf2Iterations));
     return n;
 }
@@ -309,13 +303,6 @@ private string hexNumber(uint v) @safe pure
     import std.format : format;
 
     return format("%X", v);
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///
@@ -398,7 +385,6 @@ private string toText(T)(T v) @safe pure
 // PBKDF2 iteration counts from the server: 1 to maxPbkdf2Iterations (#42)
 @safe unittest
 {
-    import std.conv : to;
     import std.exception : assertThrown;
 
     ubyte[] none(size_t n) @safe

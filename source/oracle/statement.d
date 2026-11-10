@@ -18,7 +18,7 @@ enum StatementKind
 }
 
 /// The kind of `sql`, from its first keyword (after comments, white space and opening parentheses).
-StatementKind classify(scope const(char)[] sql) @safe pure
+StatementKind classify(scope const(char)[] sql) @safe pure nothrow @nogc
 {
     import std.ascii : isAlpha, toUpper;
 

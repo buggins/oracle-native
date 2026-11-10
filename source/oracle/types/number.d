@@ -13,6 +13,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.number;
 
+import std.conv : to;
 import oracle.exception : ClientException, ProtocolException;
 
 /// A NUMBER decoded into sign, decimal digits and the position of the decimal point.
@@ -28,7 +29,7 @@ struct DecodedNumber
     int pointPosition;
 
     /// The value as text: `-12.5`, `0.001`, `100`, `0`; infinity is `~` or `-~`.
-    string toString() const @safe pure
+    string toString() const @safe pure nothrow
     {
         import std.array : replicate;
 
@@ -56,7 +57,7 @@ DecodedNumber decodeNumber(scope const(ubyte)[] b) @safe pure
 {
     DecodedNumber n;
     if (b.length == 0 || b.length > 22)
-        throw new ProtocolException("Invalid NUMBER length " ~ toText(b.length));
+        throw new ProtocolException("Invalid NUMBER length " ~ to!string(b.length));
     if (b.length == 1 && b[0] == 0x80)
         return n; // zero
     if (b.length == 1 && b[0] == 0x00)
@@ -141,22 +142,13 @@ Throws: `ProtocolException` if the bytes are not a valid NUMBER.
 +/
 double numberToDouble(scope const(ubyte)[] b) @safe pure
 {
-    import std.conv : to;
-
     const n = decodeNumber(b);
     if (n.infinite)
         return n.negative ? -double.infinity : double.infinity;
     if (n.digits.length == 0)
         return 0.0;
-    const text = (n.negative ? "-0." : "0.") ~ n.digits ~ "e" ~ toText(n.pointPosition);
+    const text = (n.negative ? "-0." : "0.") ~ n.digits ~ "e" ~ to!string(n.pointPosition);
     return text.to!double;
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///

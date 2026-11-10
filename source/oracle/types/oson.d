@@ -31,6 +31,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.types.oson;
 
+import std.conv : to;
 import oracle.exception : ClientException, ProtocolException;
 
 /// The largest JSON value sent or fetched (as an OSON image), in bytes.
@@ -64,7 +65,7 @@ private struct OsonDecoder
     size_t fieldIdWidth;
     string[] names;
     bool scalar;
-    char[] output;
+    string output;
     uint depth;
     size_t visits; // child nodes visited: each has its own offset in its parent, unless containers are shared
 
@@ -80,7 +81,7 @@ private struct OsonDecoder
         pos = 3;
         const ver = u8();
         if (ver != 1 && ver != 3)
-            throw new ClientException("OSON version " ~ toText(ver) ~ " is not supported");
+            throw new ClientException("OSON version " ~ to!string(ver) ~ " is not supported");
         const flags = u16();
         relativeOffsets = (flags & 0x01) != 0;
         if (flags & 0x10) // a scalar: just the tree size before the node
@@ -161,7 +162,7 @@ private struct OsonDecoder
     string text() @safe
     {
         node();
-        return (() @trusted => cast(string) output)();
+        return output;
     }
 
     void node() @safe
@@ -208,7 +209,7 @@ private struct OsonDecoder
             const extended = u8();
             if (extended == 0x01)
                 return vector(take(u32()));
-            throw new ClientException("OSON extended type " ~ toText(extended) ~ " is not supported yet");
+            throw new ClientException("OSON extended type " ~ to!string(extended) ~ " is not supported yet");
         case 0x3D:
             return yearToMonth(take(5));
         default:
@@ -220,7 +221,7 @@ private struct OsonDecoder
             return number(take(type & 0x0F));
         if ((type & 0xE0) == 0) // a string up to 31 bytes, its length in the type
             return quoted(cast(string) take(type));
-        throw new ClientException("OSON node type " ~ toText(type) ~ " is not supported yet");
+        throw new ClientException("OSON node type " ~ to!string(type) ~ " is not supported yet");
     }
 
     void container(ubyte type) @safe
@@ -261,7 +262,7 @@ private struct OsonDecoder
                 const id = fieldIdWidth == 1 ? u8() : fieldIdWidth == 2 ? u16() : u32();
                 fieldIds = pos;
                 if (id == 0 || id > names.length)
-                    throw new ProtocolException("Invalid OSON field ID " ~ toText(id));
+                    throw new ProtocolException("Invalid OSON field ID " ~ to!string(id));
                 quoted(names[id - 1]);
                 put(":");
             }
@@ -380,22 +381,17 @@ private struct OsonDecoder
         const months = ym.months < 0 ? -ym.months : ym.months;
         string s = negative ? "-P" : "P";
         if (years || !months)
-            s ~= toText(years) ~ "Y";
+            s ~= to!string(years) ~ "Y";
         if (months)
-            s ~= toText(months) ~ "M";
+            s ~= to!string(months) ~ "M";
         quoted(s);
     }
 
     void hex(scope const(ubyte)[] b) @safe
     {
-        static immutable digits = "0123456789ABCDEF";
-        auto s = new char[b.length * 2];
-        foreach (i, x; b)
-        {
-            s[2 * i] = digits[x >> 4];
-            s[2 * i + 1] = digits[x & 15];
-        }
-        quoted((() @trusted => cast(string) s)());
+        import std.digest : LetterCase, toHexString;
+
+        quoted(toHexString!(LetterCase.upper)(b));
     }
 
     void vector(immutable(ubyte)[] b) @safe
@@ -495,7 +491,7 @@ private struct DecimalParts
 }
 
 /// Splits a decimal number in JSON syntax (`-12.5e3`, also C's `1e+02`) into its sign and digits.
-private DecimalParts parseDecimal(string text) @safe pure
+private DecimalParts parseDecimal(string text) @safe pure nothrow
 {
     DecimalParts p;
     size_t i;
@@ -542,7 +538,7 @@ private DecimalParts parseDecimal(string text) @safe pure
 A number as `JSON_SERIALIZE` writes it: plain with up to 40 digits before
 and after the point (`-0.015`, `1000`), else `1.5E-40`.
 +/
-private string decimalText(bool negative, scope const(char)[] digits, long point) @safe pure
+private string decimalText(bool negative, scope const(char)[] digits, long point) @safe pure nothrow
 {
     import std.array : replicate;
 
@@ -560,7 +556,7 @@ private string decimalText(bool negative, scope const(char)[] digits, long point
     }
     const exponent = point - 1;
     return sign ~ digits[0 .. 1].idup ~ (n > 1 ? "." ~ digits[1 .. $].idup : "") ~ "E" ~ (exponent < 0 ? "-" : "+")
-        ~ toText(exponent < 0 ? -exponent : exponent);
+        ~ to!string(exponent < 0 ? -exponent : exponent);
 }
 
 @safe unittest
@@ -701,7 +697,6 @@ private JsonNode numberNode(string text) @safe
 private JsonNode fromJsonValue(const JSONValue v, uint depth) @safe
 {
     import std.algorithm.sorting : sort;
-    import std.conv : to;
     import std.json : JSONType;
     import std.math : isFinite;
     import oracle.types.encode : encodeBinaryDouble;
@@ -736,13 +731,13 @@ private JsonNode fromJsonValue(const JSONValue v, uint depth) @safe
     case JSONType.array:
         JsonNode n;
         n.kind = JsonNode.Kind.array;
-        foreach (ref e; (()@trusted => v.array)())
+        foreach (ref e; v.arrayNoRef)
             n.children ~= fromJsonValue(e, depth + 1);
         return n;
     case JSONType.object:
         JsonNode n;
         n.kind = JsonNode.Kind.object;
-        const members = (() @trusted => v.object)();
+        const members = v.objectNoRef;
         auto keys = (() @trusted => members.keys)(); // @system for a const AA before frontend 2.098
         sort(keys);
         foreach (k; keys)
@@ -886,10 +881,8 @@ private struct JsonParser
 
     string str() @safe
     {
-        import std.utf : encode;
-
         pos++; // "
-        char[] result;
+        string result;
         for (;;)
         {
             if (pos >= text.length)
@@ -943,13 +936,13 @@ private struct JsonParser
                 }
                 else if (u >= 0xDC00 && u <= 0xDFFF)
                     fail("unpaired surrogate");
-                encode(result, u);
+                result ~= u; // encoded as UTF-8 (surrogates were refused above)
                 break;
             default:
                 fail("invalid escape");
             }
         }
-        return (() @trusted => cast(string) result)(); // unique: built here
+        return result;
     }
 
     dchar hex4() @safe
@@ -1005,7 +998,7 @@ private struct JsonParser
 
     void fail(string what) @safe
     {
-        throw new ClientException("Invalid JSON text at offset " ~ toText(pos) ~ ": " ~ what);
+        throw new ClientException("Invalid JSON text at offset " ~ to!string(pos) ~ ": " ~ what);
     }
 }
 
@@ -1259,13 +1252,6 @@ private immutable(ubyte)[] encodeTree(const JsonNode root, bool longFieldNames) 
     return (() @trusted => cast(immutable(ubyte)[]) image.data)(); // unique: built here
 }
 
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
-}
-
 @safe unittest
 {
     import std.exception : assertThrown;
@@ -1344,7 +1330,7 @@ private string toText(T)(T v) @safe pure
     // many names and a big tree: 16-bit field IDs, 32-bit sizes
     string many = "{";
     foreach (i; 0 .. 3000)
-        many ~= (i ? "," : "") ~ `"field` ~ toText(i) ~ `":"` ~ "v".replicate(30) ~ `"`;
+        many ~= (i ? "," : "") ~ `"field` ~ to!string(i) ~ `":"` ~ "v".replicate(30) ~ `"`;
     many ~= "}";
     assert(parseJSON(osonToText(encodeOson(many, false))) == parseJSON(many));
 }

@@ -6,6 +6,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.result;
 
+import std.conv : to;
 import core.time : Duration;
 import std.datetime.date : Date, DateTime, TimeOfDay;
 import std.datetime.systime : SysTime;
@@ -131,7 +132,7 @@ final class QueryResult
     {
         auto all = outputs;
         if (index >= all.length)
-            throw new ClientException("No output parameter " ~ toText(index));
+            throw new ClientException("No output parameter " ~ to!string(index));
         return all[index].value;
     }
 
@@ -150,7 +151,7 @@ final class QueryResult
 
     Throws: `ClientException` if there is no such column.
     +/
-    size_t columnIndex(string name) const @safe
+    size_t columnIndex(string name) const @safe pure
     {
         import std.uni : icmp;
 
@@ -206,7 +207,7 @@ final class QueryResult
     closed with the next call (or kept for the statement cache). Calling it
     again does nothing.
     +/
-    void close() @safe
+    void close() @safe nothrow
     {
         index = batch.length;
         allFetched = true;
@@ -214,7 +215,7 @@ final class QueryResult
     }
 
     /// Releases the connection while keeping the rows (all of them are here).
-    package void release() @safe
+    package void release() @safe nothrow
     {
         finish();
     }
@@ -250,7 +251,7 @@ final class QueryResult
         rowCounts = null;
     }
 
-    private void finish() @safe
+    private void finish() @safe nothrow
     {
         if (finished)
             return;
@@ -325,9 +326,10 @@ struct Row
     Value opIndex(size_t i) const @safe pure
     {
         if (i >= values.length)
-            throw new ClientException("Column index " ~ toText(i) ~ " out of range");
+            throw new ClientException("Column index " ~ to!string(i) ~ " out of range");
         auto v = Value(columnInfo[i], values[i], sessionZone, databaseZone);
-        v.connection = (() @trusted => cast(Connection) connection)(); // a reference kept for LOB reads
+        // a reference kept for LOB reads; const only because the row is: no Connection is ever immutable
+        v.connection = (() @trusted => cast(Connection) connection)();
         v.lease = lease;
         return v;
     }
@@ -357,13 +359,13 @@ struct Row
     }
 
     /// ditto
-    bool getBool(size_t i) const @safe
+    bool getBool(size_t i) const @safe pure
     {
         return this[i].getBool();
     }
 
     /// ditto
-    double getDouble(size_t i) const @safe
+    double getDouble(size_t i) const @safe pure
     {
         return this[i].getDouble();
     }
@@ -405,19 +407,19 @@ struct Row
     }
 
     /// ditto
-    int getNanoseconds(size_t i) const @safe
+    int getNanoseconds(size_t i) const @safe pure
     {
         return this[i].getNanoseconds();
     }
 
     /// ditto
-    Duration getDuration(size_t i) const @safe
+    Duration getDuration(size_t i) const @safe pure
     {
         return this[i].getDuration();
     }
 
     /// ditto
-    MonthInterval getMonthInterval(size_t i) const @safe
+    MonthInterval getMonthInterval(size_t i) const @safe pure
     {
         return this[i].getMonthInterval();
     }
@@ -429,7 +431,7 @@ struct Row
     }
 
     /// ditto
-    Lob getLob(size_t i) const @safe
+    Lob getLob(size_t i) const @safe pure
     {
         return this[i].getLob();
     }
@@ -441,17 +443,10 @@ struct Row
     }
 
     /// ditto
-    Vector getVector(size_t i) const @safe
+    Vector getVector(size_t i) const @safe pure
     {
         return this[i].getVector();
     }
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 ///

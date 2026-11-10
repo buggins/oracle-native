@@ -86,7 +86,7 @@ struct ServerInfo
 }
 
 /// The protocol message: protocol version 6 (8.1 and later), then the driver name.
-ubyte[] buildProtocolMessage(string driverName) @safe pure
+ubyte[] buildProtocolMessage(string driverName) @safe pure nothrow
 {
     TtcWriter w;
     w.bytes([MessageType.protocol, 6, 0]);
@@ -154,7 +154,7 @@ pipelining.
 +/
 immutable(ubyte)[] clientCompileCaps(bool endOfResponse = false) @safe pure nothrow
 {
-    auto c = new ubyte[55];
+    ubyte[55] c;
     c[Cap.sqlVersion] = 6;
     c[Cap.logonTypes] = 0x08 | 0x02 | 0x20 | 0x40 | 0x80; // O5LOGON, O5LOGON_NP, O7LOGON, long identifiers and passwords
     c[Cap.fieldVersion] = clientFieldVersion;
@@ -183,16 +183,16 @@ immutable(ubyte)[] clientCompileCaps(bool endOfResponse = false) @safe pure noth
         c[Cap.ttc5] |= 0x04 | 0x10; // pipelining, breaks in pipelines
     }
     c[Cap.vectorFeatures] = 0x01 | 0x02; // BINARY and sparse vectors
-    return (() @trusted => cast(immutable(ubyte)[]) c)();
+    return c[].idup;
 }
 
 /// The client's run-time capabilities.
 immutable(ubyte)[] clientRuntimeCaps() @safe pure nothrow
 {
-    auto c = new ubyte[13];
+    ubyte[13] c;
     c[0] = 2; // compatible with 8.1
     c[6] = 0x01 | 0x04; // zero copy, 32 KB strings
-    return (() @trusted => cast(immutable(ubyte)[]) c)();
+    return c[].idup;
 }
 
 /// The internal type of column describe information (user-defined structure).
@@ -296,7 +296,7 @@ private immutable Conversion[] conversions = [
 ];
 
 /// The data-type message: character sets (AL32UTF8 for both), capabilities, data types.
-ubyte[] buildDataTypesMessage(bool endOfResponse = false) @safe pure
+ubyte[] buildDataTypesMessage(bool endOfResponse = false) @safe pure nothrow
 {
     TtcWriter w;
     w.u8(MessageType.dataTypes);

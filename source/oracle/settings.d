@@ -12,6 +12,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.settings;
 
+import std.conv : to;
 public import dbwire.client.hosts : HostPort, HostSelection;
 import core.time : Duration, seconds;
 import dbwire.client.dsn : Dsn, parseEnumValue, parseFlag, parseQuery, parseSeconds, redactPassword;
@@ -74,9 +75,11 @@ struct ConnectionOptions
     /// Whether the connection uses DRCP (`serverType` `pooled`).
     @property bool usesDrcp() const @safe pure nothrow
     {
-        import std.uni : sicmp;
+        import std.ascii : toLower;
+        import std.algorithm.comparison : equal;
+        import std.utf : byCodeUnit;
 
-        return sicmp(serverType, "pooled") == 0;
+        return serverType.byCodeUnit.equal!((a, b) => toLower(a) == b)("pooled".byCodeUnit);
     }
     /++
     User name. `proxy[target]` logs in as `proxy` (with `proxy`'s password)
@@ -163,27 +166,35 @@ struct ConnectionOptions
 
     private TlsOptions walletTls() const @safe
     {
-        import std.file : exists, readText;
+        import std.file : FileException, exists, readText;
         import std.path : buildPath;
         import std.string : indexOf;
+        import std.utf : UTFException;
         import std.uni : toUpper;
 
-        // a copy (the cast drops const from this struct value; its one array is duplicated)
-        TlsOptions t = (() @trusted => cast() tls)();
-        t.alpn = tls.alpn.dup;
+        TlsOptions t; // a copy: arrays of strings duplicated, the other fields have no mutable indirections
+        foreach (i, ref field; t.tupleof)
+        {
+            static if (is(typeof(field) == string[]))
+                field = tls.tupleof[i].dup;
+            else
+                field = tls.tupleof[i];
+        }
         if (serverCertDn.length)
             t.skipNameCheck = true;
         if (walletLocation.length == 0 || walletLocation.toUpper == "SYSTEM")
             return t;
         const pem = buildPath(walletLocation, "ewallet.pem");
-        if (!(()@trusted => exists(pem))())
+        if (!exists(pem))
             throw new ClientException("No wallet file " ~ pem ~ " (a PEM wallet is needed: orapki wallet pem_asn1)");
         if (t.caFile.length == 0)
             t.caFile = pem;
         string text;
         try
-            text = (() @trusted => readText(pem))();
-        catch (Exception e)
+            text = readText(pem);
+        catch (FileException e)
+            throw new ClientException("Cannot read the wallet " ~ pem ~ ": " ~ e.msg);
+        catch (UTFException e)
             throw new ClientException("Cannot read the wallet " ~ pem ~ ": " ~ e.msg);
         if (t.certFile.length == 0 && text.indexOf("PRIVATE KEY-----") >= 0)
         {
@@ -266,7 +277,6 @@ struct ConnectionOptions
     // `name: value` of each field of `value`, without the secrets.
     private static string fieldsText(T)(const ref T value)
     {
-        import std.conv : to;
         import std.traits : isDelegate;
 
         string s;
@@ -443,7 +453,7 @@ struct ConnectionOptions
     +/
     static ConnectionOptions fromDescriptor(string text) @safe
     {
-        import std.conv : ConvException, to;
+        import std.conv : ConvException;
         import std.string : toLower;
 
         const root = DescriptorNode.parse(text);
@@ -552,7 +562,7 @@ struct ConnectionOptions
     /// Sets the options named in `params` (as `fromParams` reads them), keeping the others.
     void applyParams(const string[string] params) @safe
     {
-        import std.conv : ConvException, to;
+        import std.conv : ConvException;
         import std.string : toLower;
 
         alias o = this;
@@ -715,7 +725,7 @@ struct ConnectionOptions
     }
 
     /// The hosts to try, with effective ports.
-    HostPort[] endpoints() const @safe
+    HostPort[] endpoints() const @safe pure nothrow
     {
         auto list = hosts.length ? hosts.dup : [HostPort(host, port)];
         foreach (ref h; list)
@@ -729,8 +739,6 @@ struct ConnectionOptions
     +/
     string connectDescriptor(HostPort endpoint, string clientProgram, string clientHost, string clientUser) const @safe
     {
-        import std.conv : to;
-
         string data = "(CONNECT_DATA=";
         if (serviceName.length)
             data ~= "(SERVICE_NAME=" ~ quoteValue(serviceName) ~ ")";
@@ -808,13 +816,13 @@ final class DescriptorNode
             throw new ClientException("The connect descriptor is nested too deeply");
         skipSpace(s, pos);
         if (pos >= s.length || s[pos] != '(')
-            throw new ClientException("Expected '(' in the connect descriptor at position " ~ toText(pos));
+            throw new ClientException("Expected '(' in the connect descriptor at position " ~ to!string(pos));
         pos++;
         const keyStart = pos;
         while (pos < s.length && s[pos] != '=' && s[pos] != ')' && s[pos] != '(')
             pos++;
         if (pos >= s.length || s[pos] != '=')
-            throw new ClientException("Expected '=' in the connect descriptor at position " ~ toText(pos));
+            throw new ClientException("Expected '=' in the connect descriptor at position " ~ to!string(pos));
         auto node = new DescriptorNode;
         node.key = s[keyStart .. pos].strip.toUpper;
         pos++;
@@ -848,7 +856,7 @@ final class DescriptorNode
             node.text = s[start .. pos].strip;
         }
         if (pos >= s.length || s[pos] != ')')
-            throw new ClientException("Expected ')' in the connect descriptor at position " ~ toText(pos));
+            throw new ClientException("Expected ')' in the connect descriptor at position " ~ to!string(pos));
         pos++;
         return node;
     }
@@ -864,7 +872,7 @@ private bool isOn(string v) @safe pure
 
 private uint parseSdu(string v) @safe
 {
-    import std.conv : ConvException, to;
+    import std.conv : ConvException;
 
     uint n;
     try
@@ -910,13 +918,6 @@ private string quoteValue(string v) @safe pure
         return '"' ~ v.replace("\"", "") ~ '"';
     }
     return v;
-}
-
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
 }
 
 // toString hides the passwords; errors about the connection string too
@@ -1005,13 +1006,11 @@ private string toText(T)(T v) @safe pure
     import std.path : buildPath;
 
     const dir = buildPath(tempDir, "oracle-native-alias-test");
-    (() @trusted {
-        mkdirRecurse(dir);
-        write(buildPath(dir, "tnsnames.ora"), "sales = (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=db1)(PORT=1522))"
+    mkdirRecurse(dir);
+    write(buildPath(dir, "tnsnames.ora"), "sales = (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=db1)(PORT=1522))"
             ~ "(CONNECT_DATA=(SERVICE_NAME=SALES)))\nhr = db2/HR?fetch_size=50\n");
-    })();
     scope (exit)
-        (() @trusted => rmdirRecurse(dir))();
+        rmdirRecurse(dir);
     auto o = ConnectionOptions.parse("SALES?config_dir=" ~ dir ~ "&fetch_size=7");
     assert(o.hosts == [HostPort("db1", 1522)] && o.serviceName == "SALES" && o.fetchSize == 7 && o.configDir == dir);
     o = ConnectionOptions.parse("hr?config_dir=" ~ dir);
@@ -1196,17 +1195,15 @@ private string[2][] dnPairs(string dn) @safe pure
     o.serverCertDn = null;
 
     const dir = buildPath(tempDir, "oracle-native-wallet-test");
-    (() @trusted {
-        mkdirRecurse(dir);
-        write(buildPath(dir, "ewallet.pem"), "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n");
-    })();
+    mkdirRecurse(dir);
+    write(buildPath(dir, "ewallet.pem"), "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n");
     scope (exit)
-        (() @trusted => rmdirRecurse(dir))();
+        rmdirRecurse(dir);
     o = ConnectionOptions.parse("oracle://db/S?secure=true&wallet_location=" ~ dir ~ "&ssl_server_cert_dn=CN%3Ddb");
     auto t = o.effectiveTls();
     assert(t.caFile == buildPath(dir, "ewallet.pem") && t.certFile is null && t.skipNameCheck);
-    (() @trusted => write(buildPath(dir, "ewallet.pem"),
-            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAA==\n-----END ENCRYPTED PRIVATE KEY-----\n"))();
+    write(buildPath(dir, "ewallet.pem"),
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAA==\n-----END ENCRYPTED PRIVATE KEY-----\n");
     o.walletPassword = "pw";
     t = o.effectiveTls();
     assert(t.certFile == buildPath(dir, "ewallet.pem") && t.keyPassword == "pw");

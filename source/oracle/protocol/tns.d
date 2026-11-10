@@ -12,6 +12,7 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.protocol.tns;
 
+import std.conv : to;
 import core.time : Duration;
 import dbwire.io.transport : Transport;
 import oracle.exception : ConnectionException, ProtocolException;
@@ -105,7 +106,7 @@ enum PacketFlags : ubyte
 Builds a CONNECT packet (and, if the connect data is long, the DATA packet that
 follows it). Native Network Encryption is declined (`NA_DISABLED`).
 +/
-ubyte[][] buildConnect(string connectData, uint sdu, ushort tnsVersion, ubyte flags = 0) @safe pure
+ubyte[][] buildConnect(string connectData, uint sdu, ushort tnsVersion, ubyte flags = 0) @safe pure nothrow
 {
     import std.algorithm.comparison : min;
 
@@ -188,7 +189,7 @@ for an unknown service), and the text.
 +/
 int parseRefuse(scope const(ubyte)[] p, out string text) @safe pure
 {
-    import std.conv : ConvException, to;
+    import std.conv : ConvException;
     import std.string : indexOf;
 
     if (p.length >= 12)
@@ -302,7 +303,7 @@ final class TnsStream : Transport
         const length = largeLengths ? (header[0] << 24) | (header[1] << 16) | (
                 header[2] << 8) | header[3] : (header[0] << 8) | header[1];
         if (length < packetHeaderSize || length > maxSdu + 64)
-            throw new ProtocolException("Invalid TNS packet length " ~ toText(length));
+            throw new ProtocolException("Invalid TNS packet length " ~ to!string(length));
         auto bytes = new ubyte[length];
         bytes[0 .. packetHeaderSize] = header[];
         readFully(bytes[packetHeaderSize .. $]);
@@ -442,7 +443,7 @@ final class TnsStream : Transport
                 control(p.bytes);
                 break;
             default:
-                throw new ProtocolException("Unexpected TNS packet type " ~ toText(p.type));
+                throw new ProtocolException("Unexpected TNS packet type " ~ to!string(p.type));
             }
         }
     }
@@ -474,7 +475,7 @@ final class TnsStream : Transport
         {
             const error = (p[14] << 24) | (p[15] << 16) | (p[16] << 8) | p[17];
             if (error == 12_572 || error == 2396)
-                throw new ConnectionException("The server ended the session (TNS-" ~ toText(error) ~ ")");
+                throw new ConnectionException("The server ended the session (TNS-" ~ to!string(error) ~ ")");
         }
     }
 
@@ -508,16 +509,11 @@ final class TnsStream : Transport
     }
 }
 
-private string toText(T)(T v) @safe pure
-{
-    import std.conv : to;
-
-    return v.to!string;
-}
-
 ///
 @safe unittest
 {
+    import std.array : replicate;
+
     const packets = buildConnect("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=X)))", 8192, 318);
     assert(packets.length == 1);
     const p = packets[0];
@@ -538,12 +534,4 @@ private string toText(T)(T v) @safe pure
     const ubyte[] head = [0, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 23];
     const refuse = head ~ cast(const(ubyte)[]) "(ERR=12514)(VSNNUM=0)x";
     assert(parseRefuse(refuse, text) == 12_514 && text == "(ERR=12514)(VSNNUM=0)x");
-}
-
-private string replicate(string s, size_t n) @safe pure
-{
-    string r;
-    foreach (_; 0 .. n)
-        r ~= s;
-    return r;
 }
