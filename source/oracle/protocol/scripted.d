@@ -9,17 +9,15 @@ License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
 +/
 module oracle.protocol.scripted;
 
-version (unittest)  : package(oracle):
-
-import oracle.protocol.negotiate : MessageType;
+version (unittest)  : import oracle.protocol.negotiate : MessageType;
 import oracle.protocol.ttc : TtcWriter;
 import oracle.types.typeinfo : OracleType;
 
 /// The field version of the scripted messages: 19c (no token numbers, no 20.1 ERROR fields).
-enum ubyte scriptedFieldVersion = 13;
+package(oracle) enum ubyte scriptedFieldVersion = 13;
 
 /// A DATA packet (4-byte length, large SDU) with `payload`.
-ubyte[] dataPacket(scope const(ubyte)[] payload) @safe pure nothrow
+package(oracle) ubyte[] dataPacket(scope const(ubyte)[] payload) @safe pure nothrow
 {
     auto p = new ubyte[10 + payload.length];
     const n = p.length;
@@ -33,7 +31,7 @@ ubyte[] dataPacket(scope const(ubyte)[] payload) @safe pure nothrow
 }
 
 /// `payload` in DATA packets of at most `size` bytes each.
-ubyte[] dataPackets(scope const(ubyte)[] payload, size_t size = 8000) @safe pure nothrow
+package(oracle) ubyte[] dataPackets(scope const(ubyte)[] payload, size_t size = 8000) @safe pure nothrow
 {
     ubyte[] all;
     while (payload.length)
@@ -49,7 +47,7 @@ ubyte[] dataPackets(scope const(ubyte)[] payload, size_t size = 8000) @safe pure
 An ERROR message ending a response: `number` 0 (more rows to fetch, or a
 call that succeeded), 1403 (no more rows) or an ORA error with `message`.
 +/
-void putError(ref TtcWriter w, uint number, uint cursorId, string message = null, ulong rowCount = 0) @safe pure
+package(oracle) void putError(ref TtcWriter w, uint number, uint cursorId, string message = null, ulong rowCount = 0) @safe pure
 {
     w.u8(MessageType.error);
     w.ub(0); // call status
@@ -83,7 +81,7 @@ void putError(ref TtcWriter w, uint number, uint cursorId, string message = null
 }
 
 /// A column of `putDescribe`.
-struct Col
+package(oracle) struct Col
 {
     OracleType type; ///
     uint bufferSize; ///
@@ -91,7 +89,7 @@ struct Col
 }
 
 /// A DESCRIBE_INFO message for `cols`.
-void putDescribe(ref TtcWriter w, scope const(Col)[] cols) @safe pure
+package(oracle) void putDescribe(ref TtcWriter w, scope const(Col)[] cols) @safe pure
 {
     w.u8(MessageType.describeInfo);
     w.clr(null); // the cursor's identity
@@ -131,7 +129,7 @@ void putDescribe(ref TtcWriter w, scope const(Col)[] cols) @safe pure
 }
 
 /// A ROW_DATA message with one NUMBER column (`value` from 0 to 99).
-void putNumberRow(ref TtcWriter w, ubyte value) @safe pure
+package(oracle) void putNumberRow(ref TtcWriter w, ubyte value) @safe pure
 {
     w.u8(MessageType.rowData);
     if (value == 0)
