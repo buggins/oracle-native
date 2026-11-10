@@ -47,7 +47,8 @@ package(oracle) ubyte[] dataPackets(scope const(ubyte)[] payload, size_t size = 
 An ERROR message ending a response: `number` 0 (more rows to fetch, or a
 call that succeeded), 1403 (no more rows) or an ORA error with `message`.
 +/
-package(oracle) void putError(ref TtcWriter w, uint number, uint cursorId, string message = null, ulong rowCount = 0) @safe pure
+package(oracle) void putError(ref TtcWriter w, uint number, uint cursorId, string message = null,
+        ulong rowCount = 0) @safe pure
 {
     w.u8(MessageType.error);
     w.ub(0); // call status
