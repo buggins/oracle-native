@@ -53,15 +53,15 @@ writes them.
 
 The digits are the fewest that, correctly rounded, read back (as C's
 `%.*g` with increasing precisions finds them, and as `JSON_SERIALIZE`
-writes them; see `floatDigits`), laid out as `%g` with as many significant
-digits: plain when the decimal exponent X (value = d.ddd × 10^X) is at least
+writes them; see `floatDigits`), laid out by dbwire's `formatDigits` as
+`%g` with as many significant digits: plain when the decimal exponent X (value = d.ddd × 10^X) is at least
 -4 and below the number of digits, else `d.ddde±XX` (at least two exponent
 digits). Independent of the C locale.
 +/
 string floatText(double v, bool single) @safe
 {
     import std.math : isInfinity, isNaN, signbit;
-    import dbwire.types.floattext : digits;
+    import dbwire.types.floattext : formatDigits;
 
     if (single)
         v = cast(float) v; // what is written: also infinity or zero for doubles out of float range
@@ -71,51 +71,7 @@ string floatText(double v, bool single) @safe
         return v < 0 ? "-Inf" : "Inf";
     if (v == 0)
         return signbit(v) ? "-0" : "0";
-    const d = nearestDigits(v, single);
-    const significant = d.digits;
-    const exponent = d.pointPos - 1; // value = d.ddd × 10^exponent
-    // at most a sign, 17 digits, a point and "e-324", or a sign, "0.000" and 17 digits
-    char[32] text = void;
-    size_t n;
-    void put(const(char)[] part...)
-    {
-        text[n .. n + part.length] = part[];
-        n += part.length;
-    }
-
-    if (signbit(v))
-        put('-');
-    if (exponent < -4 || exponent >= cast(int) significant.length)
-    {
-        put(significant[0]);
-        if (significant.length > 1)
-        {
-            put('.');
-            put(significant[1 .. $]);
-        }
-        const magnitude = exponent < 0 ? -exponent : exponent;
-        put('e', exponent < 0 ? '-' : '+');
-        if (magnitude >= 100)
-            put(cast(char)('0' + magnitude / 100));
-        put(cast(char)('0' + magnitude / 10 % 10), cast(char)('0' + magnitude % 10));
-    }
-    else if (exponent < 0)
-    {
-        put('0', '.');
-        foreach (i; 0 .. -exponent - 1)
-            put('0');
-        put(significant);
-    }
-    else
-    {
-        put(significant[0 .. exponent + 1]);
-        if (exponent + 1 < significant.length)
-        {
-            put('.');
-            put(significant[exponent + 1 .. $]);
-        }
-    }
-    return text[0 .. n].idup;
+    return formatDigits(nearestDigits(v, single), signbit(v) != 0); // the default layout is %g
 }
 
 /++

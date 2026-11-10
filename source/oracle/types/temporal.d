@@ -32,6 +32,7 @@ import std.datetime.date : Date, DateTime, DateTimeException;
 import std.datetime.systime : SysTime;
 import std.datetime.timezone : SimpleTimeZone, TimeZone, UTC;
 import dbwire.types.interval : MonthInterval;
+import dbwire.types.text : DbwireTextBuffer = TextBuffer;
 import oracle.exception : ClientException, ProtocolException;
 
 /// A DATE or TIMESTAMP value, as Oracle labels it.
@@ -82,7 +83,7 @@ struct OracleDateTime
         t.number(minute, 2);
         t.put(':');
         t.number(second, 2);
-        t.fraction(nanoseconds, fractionDigits);
+        t.putFraction(nanoseconds, fractionDigits);
         return t.text;
     }
 }
@@ -265,7 +266,7 @@ struct YearToMonth
     {
         TextBuffer t;
         t.put(years < 0 || months < 0 ? '-' : '+');
-        t.number(abs(years), yearDigits);
+        t.number(abs(years), padding(yearDigits));
         t.put('-');
         t.number(abs(months), 2);
         return t.text;
@@ -310,14 +311,14 @@ struct DayToSecond
         const negative = days < 0 || hours < 0 || minutes < 0 || seconds < 0 || nanoseconds < 0;
         TextBuffer t;
         t.put(negative ? '-' : '+');
-        t.number(abs(days), dayDigits);
+        t.number(abs(days), padding(dayDigits));
         t.put(' ');
         t.number(abs(hours), 2);
         t.put(':');
         t.number(abs(minutes), 2);
         t.put(':');
         t.number(abs(seconds), 2);
-        t.fraction(abs(nanoseconds), fractionDigits);
+        t.putFraction(abs(nanoseconds), fractionDigits);
         return t.text;
     }
 }
@@ -390,69 +391,26 @@ private int abs(int v) @safe pure nothrow @nogc
     assert(neg.text(3, 9) == "-003 04:05:06.789000000" && neg.duration < Duration.zero);
 }
 
-/// Text built in a stack buffer of `capacity` characters, copied once (`text`).
-package(oracle) struct TextBufferOf(size_t capacity)
+/// A buffer for the date, time and interval texts (they are short).
+package(oracle) alias TextBuffer = DbwireTextBuffer!96;
+
+/// Appends `.` and the first `count` (at most 9) digits of a 9-digit fraction of nanoseconds; nothing for 0 digits.
+package(oracle) void putFraction(Buffer)(ref Buffer t, uint nanoseconds, int count)
 {
-    char[capacity] buffer = void;
-    size_t length;
-
-    void put(char c) @safe pure nothrow @nogc
+    if (count <= 0)
+        return;
+    t.put('.');
+    char[9] digits = void;
+    foreach_reverse (ref d; digits)
     {
-        buffer[length++] = c;
+        d = cast(char)('0' + nanoseconds % 10);
+        nanoseconds /= 10;
     }
-
-    void put(scope const(char)[] s) @safe pure nothrow @nogc
-    {
-        buffer[length .. length + s.length] = s[];
-        length += s.length;
-    }
-
-    // `count` times `c`
-    void fill(char c, size_t count) @safe pure nothrow @nogc
-    {
-        buffer[length .. length + count] = c;
-        length += count;
-    }
-
-    // `v` in decimal, padded with zeros to `width` digits (at most 20)
-    void number(ulong v, int width) @safe pure nothrow @nogc
-    {
-        char[20] digits = void;
-        size_t n;
-        do
-        {
-            digits[$ - ++n] = cast(char)('0' + v % 10);
-            v /= 10;
-        }
-        while (v);
-        foreach (i; n .. (width > 20 ? 20 : width))
-            put('0');
-        buffer[length .. length + n] = digits[$ - n .. $];
-        length += n;
-    }
-
-    // `.` and the first `count` (at most 9) digits of a 9-digit fraction of nanoseconds; nothing for 0 digits
-    void fraction(uint nanoseconds, int count) @safe pure nothrow @nogc
-    {
-        if (count <= 0)
-            return;
-        put('.');
-        char[9] digits = void;
-        foreach_reverse (ref d; digits)
-        {
-            d = cast(char)('0' + nanoseconds % 10);
-            nanoseconds /= 10;
-        }
-        const k = count > 9 ? 9 : count;
-        buffer[length .. length + k] = digits[0 .. k];
-        length += k;
-    }
-
-    @property string text() const @safe pure nothrow
-    {
-        return buffer[0 .. length].idup;
-    }
+    t.put(digits[0 .. count > 9 ? 9 : count]);
 }
 
-/// A buffer for the date, time and interval texts (they are short).
-package(oracle) alias TextBuffer = TextBufferOf!96;
+// A padding width given by the caller: 0 to 20 digits
+private size_t padding(int digits) @safe pure nothrow @nogc
+{
+    return digits < 0 ? 0 : digits > 20 ? 20 : digits;
+}
