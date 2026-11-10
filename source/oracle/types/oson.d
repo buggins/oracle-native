@@ -323,14 +323,14 @@ private struct OsonDecoder
     /// BINARY_FLOAT and BINARY_DOUBLE: the shortest digits that read back exactly, written as NUMBERs are.
     void floating(scope const(ubyte)[] b, bool single) @safe
     {
-        import oracle.types.floats : decodeBinaryFloat, floatText;
+        import std.math : isFinite;
+        import oracle.types.floats : decodeBinaryFloat, floatDigits, floatText;
 
         const v = decodeBinaryFloat(b);
-        const s = floatText(v, single);
-        if (s == "Nan" || s == "Inf" || s == "-Inf")
-            return quoted(s);
-        const d = parseDecimal(s);
-        put(decimalText(d.negative, d.digits, d.point));
+        if (!isFinite(v))
+            return quoted(floatText(v, single)); // "Nan", "Inf", "-Inf"
+        const d = floatDigits(v, single);
+        put(decimalText(d.negative, d.digits, d.pointPosition));
     }
 
     void dateTime(scope const(ubyte)[] b, bool zoned) @safe

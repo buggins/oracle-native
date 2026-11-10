@@ -296,10 +296,14 @@ struct Value
                     cast(int) n.digits.length - n.pointPosition);
         case OracleType.binaryFloat:
         case OracleType.binaryDouble:
-            const s = getString();
-            if (s == "Nan" || s == "Inf" || s == "-Inf")
-                throw new ClientException(s ~ " is not a decimal (column " ~ column.name ~ ")");
-            return Decimal.fromString(plainFloatText(s));
+            import std.math : isFinite;
+            import oracle.types.floats : decodeBinaryFloat, floatDigits;
+
+            const v = decodeBinaryFloat(bytes);
+            if (!isFinite(v))
+                throw new ClientException(getString() ~ " is not a decimal (column " ~ column.name ~ ")");
+            // the shortest digits that read back, as plain text (`1e-7` is 0.0000001)
+            return Decimal.fromString(floatDigits(v, column.type == OracleType.binaryFloat).toString());
         case OracleType.varchar:
         case OracleType.char_:
             return Decimal.fromString(trimmed());
@@ -678,28 +682,6 @@ private immutable(TimeZone) zoneOrUtc(const Rebindable!(immutable TimeZone) zone
 Variant makeVariant(T)(T value) @trusted
 {
     return Variant(value); // Variant's constructor is @system; copying these value types is safe
-}
-
-/// `1.5e-07` as `0.00000015`, for `Decimal.fromString`.
-private string plainFloatText(string s) @safe
-{
-    import std.algorithm.searching : findSplit;
-    import std.conv : to;
-    import oracle.types.number : DecodedNumber;
-
-    auto parts = s.findSplit("e");
-    if (!parts[1].length)
-        return s;
-    const exponent = parts[2].to!int;
-    string mantissa = parts[0];
-    DecodedNumber n;
-    n.negative = mantissa.length && mantissa[0] == '-';
-    if (n.negative)
-        mantissa = mantissa[1 .. $];
-    const dot = mantissa.findSplit(".");
-    n.digits = dot[0] ~ dot[2];
-    n.pointPosition = cast(int) dot[0].length + exponent;
-    return n.toString();
 }
 
 private string toText(T)(T v) @safe pure

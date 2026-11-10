@@ -6,7 +6,23 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Performance
+
+- BINARY_FLOAT and BINARY_DOUBLE text (`getString`, `getDecimal`, JSON text
+  and JSON binds) from dbwire's `shortestDigits` instead of a loop of
+  `snprintf` and `strtod` calls (#46): 4 to 6 times faster, one allocation
+  (doubles like prices: 1.1 µs and 184 B per value before, 0.26 µs and 16 B
+  now). The text is the same as before (compared over 2.3 million values);
+  values below about 1e-20 or above 1e35 take dbwire's `BigInt` path and are
+  slower (about 9 µs; buggins/dbwire#65). dbwire `~>0.9.1` (which has
+  `shortestDigits`).
+
 ### Fixed
+
+- Float text and JSON binds no longer depend on the C locale (#46): after
+  `setlocale(LC_NUMERIC, "de_DE.UTF-8")` (GTK and Qt applications do that)
+  `getString` gave `1,5e-07`, `getDecimal` failed, and a JSON bind
+  `{"a":1.5}` was stored as `{"a":1}`. VECTOR text likewise.
 
 From the code review (#45):
 
