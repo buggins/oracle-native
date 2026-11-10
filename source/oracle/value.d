@@ -25,7 +25,11 @@ import oracle.types.typeinfo : CharsetForm, ColumnInfo, OracleType;
 import oracle.types.vector : Vector;
 import std.json : JSONValue;
 
+// The deepest JSON text `getJson` parses (std.json recurses); as deep as the OSON decoder goes.
+private enum maxJsonDepth = 1000;
+
 /// A column value: its metadata and its bytes in the wire form (`null` for NULL).
+
 struct Value
 {
     /// The column.
@@ -40,8 +44,10 @@ struct Value
     Rebindable!(immutable TimeZone) sessionZone;
     /// ditto
     Rebindable!(immutable TimeZone) databaseZone;
-    /// The connection, for reading LOBs fetched as locators.
+    /// The connection, for reading LOBs fetched as locators, and its lease then (pooled connections).
     package(oracle) Connection connection;
+    /// ditto
+    package(oracle) ulong lease;
 
     /// Whether the value is NULL (empty strings are NULL in Oracle).
     @property bool isNull() const @safe pure nothrow
@@ -335,7 +341,7 @@ struct Value
             throw new ClientException("No connection to read the LOB with");
         // CLOB and BLOB values are kept as u64be size, u32be chunk size, locator; BFILE values are the locator
         const locator = t == OracleType.bfile ? bytes : bytes.length >= 12 ? bytes[12 .. $] : null;
-        return new Lob((() @trusted => cast(Connection) connection)(), column.type, column.charsetForm, locator);
+        return new Lob((() @trusted => cast(Connection) connection)(), lease, column.type, column.charsetForm, locator);
     }
 
     /++
@@ -456,7 +462,7 @@ struct Value
     /++
     As a `Duration`, to 100 ns: INTERVAL DAY TO SECOND.
 
-    Throws: `ClientException` for other types.
+    Throws: `ClientException` for other types, or intervals beyond about 10.7 million days.
     +/
     Duration getDuration() const @safe
     {
@@ -466,7 +472,12 @@ struct Value
             return Duration.zero;
         if (column.type != OracleType.intervalDs)
             throw unsupported("Duration");
-        return decodeDayToSecond(bytes).duration;
+        const d = decodeDayToSecond(bytes);
+        // Duration counts 100 ns in a long: about 10.7 million days; INTERVAL DAY(9) goes to 999,999,999
+        enum maxDays = Duration.max.total!"days" - 1;
+        if (d.days > maxDays || d.days < -maxDays)
+            throw new ClientException("The interval in column " ~ column.name ~ " is too long for a Duration");
+        return d.duration;
     }
 
     /++
@@ -500,10 +511,14 @@ struct Value
             return JSONValue(null);
         if (column.type != OracleType.json && !column.isJson)
             throw unsupported("JSON");
+        import std.conv : ConvException;
+
         const text = getString();
         try
-            return parseJSON(text);
+            return parseJSON(text, maxJsonDepth); // a depth limit: the parser recurses
         catch (JSONException e)
+            throw new ClientException("Column " ~ column.name ~ " is not valid JSON: " ~ e.msg);
+        catch (ConvException e) // a number out of range, e.g. 1e400
             throw new ClientException("Column " ~ column.name ~ " is not valid JSON: " ~ e.msg);
     }
 
@@ -720,4 +735,40 @@ private string toText(T)(T v) @safe pure
     c.type = OracleType.binaryDouble;
     immutable ubyte[] small = [0xBE, 0x84, 0x21, 0xF5, 0xF4, 0x0D, 0x83, 0x76]; // 1.5e-7
     assert(Value(c, small).getDecimal().toString() == "0.00000015");
+}
+
+// getJson: nesting is limited (the parser recurses), out-of-range numbers are a ClientException;
+// getDuration: intervals beyond what a Duration holds are refused
+@safe unittest
+{
+    import core.time : days;
+    import std.array : replicate;
+    import std.exception : assertThrown, collectException;
+
+    ColumnInfo c;
+    c.name = "J";
+    c.type = OracleType.varchar;
+    c.isJson = true;
+    c.charsetId = 873;
+    assertThrown!ClientException(Value(c, cast(immutable(ubyte)[]) "[".replicate(100_000)).getJson());
+    // Phobos 2.106 throws ConvException for it, 2.097 gives infinity
+    auto e = collectException(Value(c, cast(immutable(ubyte)[]) `{"a":1e400}`).getJson());
+    assert(e is null || cast(ClientException) e !is null, e.msg);
+    assert(Value(c, cast(immutable(ubyte)[]) `{"a":[[1]]}`).getJson()["a"][0][0].integer == 1);
+
+    ColumnInfo d;
+    d.name = "D";
+    d.type = OracleType.intervalDs;
+    immutable(ubyte)[] interval(uint days) @safe
+    {
+        const biased = days + 0x8000_0000u;
+        return [
+            cast(ubyte)(biased >> 24), cast(ubyte)(biased >> 16), cast(ubyte)(biased >> 8),
+            cast(ubyte) biased, 60,
+            60, 60, 0x80, 0, 0, 0
+        ];
+    }
+
+    assert(Value(d, interval(10_000_000)).getDuration() == days(10_000_000));
+    assertThrown!ClientException(Value(d, interval(999_999_999)).getDuration());
 }

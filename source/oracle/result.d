@@ -33,6 +33,7 @@ results.
 final class QueryResult
 {
     private Connection conn;
+    private ulong lease; // the connection's lease (pooled connections), for the LOBs of the rows
     package ColumnInfo[] columnInfo;
     package uint cursorId;
     package immutable(ubyte)[][][] batch; // the rows of the last response
@@ -59,6 +60,7 @@ final class QueryResult
     package this(Connection conn) @safe pure nothrow
     {
         this.conn = conn;
+        lease = conn.lease;
     }
 
     /// The result columns (none for statements other than queries).
@@ -97,6 +99,7 @@ final class QueryResult
                 {
                     auto v = Value(column, bytes, conn.sessionZone, conn.databaseZone);
                     v.connection = conn;
+                    v.lease = lease;
                     o.values ~= v;
                 }
             if (i < outputCursors.length)
@@ -187,7 +190,7 @@ final class QueryResult
     {
         if (empty)
             throw new ClientException("No more rows");
-        return Row(batch[index], columnInfo, conn.sessionZone, conn.databaseZone, conn);
+        return Row(batch[index], columnInfo, conn.sessionZone, conn.databaseZone, conn, lease);
     }
 
     /// Moves to the next row.
@@ -300,6 +303,7 @@ struct Row
     private Rebindable!(immutable TimeZone) sessionZone;
     private Rebindable!(immutable TimeZone) databaseZone;
     private Connection connection;
+    private ulong lease;
 
     /// Number of columns.
     @property size_t length() const @safe pure nothrow
@@ -324,6 +328,7 @@ struct Row
             throw new ClientException("Column index " ~ toText(i) ~ " out of range");
         auto v = Value(columnInfo[i], values[i], sessionZone, databaseZone);
         v.connection = (() @trusted => cast(Connection) connection)(); // a reference kept for LOB reads
+        v.lease = lease;
         return v;
     }
 

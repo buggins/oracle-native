@@ -129,7 +129,7 @@ Phase2Keys deriveKeys(const KeyValue[] phase1, scope const(char)[] password,
     switch (verifierType)
     {
     case Verifier.v12c:
-        const iterations = toCount(get("AUTH_PBKDF2_VGEN_COUNT"));
+        const iterations = toCount("AUTH_PBKDF2_VGEN_COUNT", get("AUTH_PBKDF2_VGEN_COUNT"));
         passwordKey = (() @trusted => cast(immutable(ubyte)[]) pbkdf2!SHA512(pw, salt ~ cast(
                 const(ubyte)[]) "AUTH_PBKDF2_SPEEDY_KEY",
                 iterations, 64))();
@@ -168,7 +168,7 @@ Phase2Keys deriveKeys(const KeyValue[] phase1, scope const(char)[] password,
     {
         const text = hex(clientKey[0 .. 32] ~ serverKey[0 .. 32]);
         combo = pbkdf2!SHA512(cast(const(ubyte)[]) text, unhex(get("AUTH_PBKDF2_CSK_SALT")),
-                toCount(get("AUTH_PBKDF2_SDER_COUNT")), 32);
+                toCount("AUTH_PBKDF2_SDER_COUNT", get("AUTH_PBKDF2_SDER_COUNT")), 32);
     }
     else
         throw new ProtocolException("Invalid server session key length " ~ toText(serverKey.length));
@@ -232,7 +232,10 @@ void checkServerResponse(const KeyValue[] phase2, const Phase2Keys keys) @safe
         {
             const ubyte[aesBlockSize] zero = 0;
             const aes = Aes(keys.comboKey);
-            const plain = cbcDecrypt(aes, zero, unhex(kv.value));
+            const encrypted = unhex(kv.value);
+            if (encrypted.length == 0 || encrypted.length % aesBlockSize) // cbcDecrypt would throw ClientException
+                throw new ProtocolException("The server's authentication response is invalid");
+            const plain = cbcDecrypt(aes, zero, encrypted);
             if (plain.length >= 32 && cast(const(char)[]) plain[16 .. 32] == "SERVER_TO_CLIENT")
                 return;
             throw new ProtocolException("The server's authentication response is invalid");
@@ -275,14 +278,30 @@ ubyte[] unhex(scope const(char)[] s) @safe pure
     return b;
 }
 
-private uint toCount(string s) @safe pure
+/++
+The most PBKDF2 iterations the client does for the server: servers send 4096
+(`AUTH_PBKDF2_VGEN_COUNT`) and 3 (`AUTH_PBKDF2_SDER_COUNT`); a million
+SHA-512 rounds take about a second. More would let anyone who can answer in
+the server's place (before the server proved anything) keep the client busy.
++/
+enum uint maxPbkdf2Iterations = 1_000_000;
+
+// An iteration count from the server: 1 to maxPbkdf2Iterations.
+private uint toCount(string key, string s) @safe pure
 {
     import std.conv : ConvException, to;
 
+    uint n;
     try
-        return s.to!uint;
+        n = s.to!uint;
     catch (ConvException)
-        throw new ProtocolException("Invalid PBKDF2 iteration count '" ~ s ~ "'");
+        throw new ProtocolException("Invalid " ~ key ~ " '" ~ s ~ "'");
+    if (n == 0 || n > maxPbkdf2Iterations)
+        throw new ProtocolException(
+                "The server asked for " ~ s ~ " PBKDF2 iterations (" ~ key ~ "), not 1 to "
+                ~ toText(
+                    maxPbkdf2Iterations));
+    return n;
 }
 
 private string hexNumber(uint v) @safe pure
@@ -374,4 +393,26 @@ private string toText(T)(T v) @safe pure
         KeyValue("AUTH_SVR_RESPONSE", "00112233445566778899AABBCCDDEEFF")
     ],
     Phase2Keys("", "", "", new immutable(ubyte)[32])));
+}
+
+// PBKDF2 iteration counts from the server: 1 to maxPbkdf2Iterations (#42)
+@safe unittest
+{
+    import std.conv : to;
+    import std.exception : assertThrown;
+
+    ubyte[] none(size_t n) @safe
+    {
+        return new ubyte[n];
+    }
+
+    foreach (count; ["0", (maxPbkdf2Iterations + 1).to!string, "4294967295", "x"])
+        assertThrown!ProtocolException(deriveKeys([
+        KeyValue("AUTH_SESSKEY", "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"),
+        KeyValue("AUTH_VFR_DATA", "101112131415161718191A1B1C1D1E1F", Verifier.v12c),
+        KeyValue("AUTH_PBKDF2_VGEN_COUNT", count),
+    ], "x", &none));
+    // an authentication response that isn't whole AES blocks
+    assertThrown!ProtocolException(checkServerResponse([KeyValue("AUTH_SVR_RESPONSE", "0011")],
+            Phase2Keys("", "", "", new immutable(ubyte)[32])));
 }

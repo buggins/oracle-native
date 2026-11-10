@@ -6,7 +6,68 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+From the code review (#45):
+
+- A failed fetch in a pipeline (the second batch of rows hitting ORA-01476,
+  for example) left the connection busy for good; it is now that operation's
+  error (with `continueOnError` the later operations still run).
+- A cached query that failed when it ran again (a data error on its second
+  execution) stayed "in use" in the statement cache: it was parsed again on
+  every later run and its cursor never closed.
+- `query!T`: a value that didn't convert (NUMBER 300 into a `ubyte` field)
+  left the connection busy; the result is closed now.
+- `exec` of a query whose rows weren't all in the first response left the
+  connection busy.
+- `commit`, `rollback`, `ping` and `releaseSession` didn't mark the
+  connection busy while waiting for their answer, so another task could start
+  a call on it; a call while another one waits (a LOB read included) is now
+  refused.
+- `cancel()`: a marker that couldn't be sent left a cancel pending, so the
+  next call waited for an ORA-01013 that never came (the connection is closed
+  now: part of the marker may be out); a cancel racing with the end of a call
+  could interrupt the next one, a pipeline included. During a pipeline, and for a
+  fiber-mode connection called from another thread, `cancel()` does nothing.
+- A fiber-mode connection used from another thread is refused before anything
+  changes (it used to close the connection from that thread); `close()` from
+  another thread only marks it closed.
+- A query whose LOB define failed returned a result instead of the error.
+- The TLS options (wallet) are read once before connecting, and a socket whose
+  TLS handshake failed is closed.
+- `ConnectionPool`: a returned connection is rolled back right away (its
+  locks were held while it was idle) and its end-to-end attributes are
+  cleared (the next borrower inherited `CLIENT_IDENTIFIER`, `MODULE`,
+  `ACTION`); LOBs of an earlier borrower are refused.
+- DRCP: the end-to-end attributes are sent again with the call that attaches
+  a session (a session switch lost them), and a new connection clears those a
+  released session kept from its previous user.
+- `Vector.toString` read out of bounds (a crash in release builds) for NaN or
+  infinite elements; they print as `Nan`, `Inf`, `-Inf`.
+- Server data that could crash or exhaust the client: deeply nested REDIRECT
+  addresses and JSON text (`getJson`), OSON images whose containers share
+  children (exponential expansion), a response changing a result's number of
+  columns, unbounded metadata lengths (now 1 MiB), rows per response, LOB
+  data and listener RESEND packets.
+- PBKDF2 iteration counts from the server must be 1 to 1,000,000 (#42): 0
+  failed, and a huge count kept the client busy for hours. A malformed
+  authentication response is a `ProtocolException` (failover goes on).
+- Error messages about a connection string no longer show the password of
+  its `user:password@` part (passwords in query parameters: buggins/dbwire#65), and
+  `ConnectionOptions.toString` hides `password`, `walletPassword` and
+  `tls.keyPassword`.
+- `getJson` turns out-of-range numbers into a `ClientException`;
+  `getDuration` refuses intervals beyond what a `Duration` holds (about 10.7
+  million days) instead of overflowing.
+- `tnsnames.ora`: an `IFILE` cycle through a relative path (`../`) is found
+  (it recursed until the path was too long).
+
 ### Changed
+
+- `ssl_server_dn_match=off` (`tls.skipNameCheck`) without `SSL_SERVER_CERT_DN`
+  needs a wallet or `tls.caFile`: with the system's CAs, a certificate any
+  public CA issued for any domain passed (#45).
+- `Connection.clearEndToEnd()` clears the end-to-end attributes.
 
 - dbwire 0.9 (`~>0.9.0`, #43), like clickhoused and postgresql-native:
   the fixes from its code review (huge TZif counts rejected before

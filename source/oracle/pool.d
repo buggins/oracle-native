@@ -17,9 +17,11 @@ thread has its own set, because a vibe.d connection cannot move between event
 loops; the limits apply per thread. Which mode a call uses follows
 `ConnectionOptions.ioMode`, as for single connections.
 
-A connection handed out again has the previous user's open transaction rolled
-back first (uncommitted changes are not carried over). Other session state
-stays: `ALTER SESSION` settings, package variables, the statement cache (which
+A returned connection has its open transaction rolled back (uncommitted
+changes are not carried over, and their locks are not held while it is idle)
+and its end-to-end attributes cleared (`Connection.clientIdentifier` etc.);
+LOBs fetched or created while it was borrowed can't be used any more. Other
+session state stays: `ALTER SESSION` settings, package variables, the statement cache (which
 saves parsing). Idle connections are checked lazily, when connections are
 taken or returned, so the pool needs no background thread or timer.
 
@@ -154,8 +156,6 @@ struct PooledConnection
         // the pool's factory only creates Connections
         conn = cast(Connection) lease.connection();
         this.lease = move(lease);
-        if (conn.inTransaction)
-            conn.rollback(); // the previous user's uncommitted changes
     }
 
     /// The pooled connection. Null after `release`.
@@ -168,18 +168,28 @@ struct PooledConnection
     alias connection this;
 
     /++
-    Returns the connection to the pool now (DRCP: after releasing its
-    session; a connection whose release fails is closed). Calling it again
+    Returns the connection to the pool now, after rolling back its open
+    transaction and clearing its end-to-end attributes (DRCP: releasing its
+    session); a connection for which that fails is closed. Calling it again
     does nothing.
     +/
     void release() @safe
     {
-        if (conn !is null && conn.isOpen && !conn.isBusy)
+        if (conn !is null)
         {
-            try
-                conn.releaseSession();
-            catch (Exception)
-                conn.close();
+            conn.lease++; // the borrower's LOBs can't reach the next borrower's calls
+            if (conn.isOpen && !conn.isBusy)
+            {
+                conn.clearEndToEnd();
+                try
+                {
+                    if (conn.inTransaction && !conn.options.usesDrcp)
+                        conn.rollback();
+                    conn.releaseSession(); // DRCP: rolls back first
+                }
+                catch (Exception)
+                    conn.close();
+            }
         }
         conn = null;
         lease.release();

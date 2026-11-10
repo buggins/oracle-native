@@ -275,10 +275,16 @@ struct RowRange(T) if (is(T == struct))
         return result.empty;
     }
 
-    /// The current row.
+    /// The current row. A value that doesn't convert closes the result (a `foreach` has no other way to).
     @property T front()
     {
-        return readStruct!T(result, positions);
+        try
+            return readStruct!T(result, positions);
+        catch (Exception e)
+        {
+            result.close();
+            throw e;
+        }
     }
 
     /// Moves to the next row.

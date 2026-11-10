@@ -65,6 +65,17 @@ void testDrcp()
         checkSid(a, "a attached again"); // another session: its cached cursors are gone
         enforce(!a.isSessionReleased, "attached");
         checkSid(a, "a, cursor cached again");
+        // end-to-end attributes: a new connection that gets a's released session doesn't inherit them, and
+        // they go with the call that attaches a session to a again (another one: c holds a's)
+        enum cid = "SELECT SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER') FROM dual";
+        a.clientIdentifier = "itest-a";
+        enforce(scalar(a, cid) == "itest-a", "a's client identifier");
+        a.releaseSession();
+        auto c = connectToServer("server=pooled&pool_connection_class=itest&pool_purity=self");
+        scope (exit)
+            c.close();
+        enforce(scalar(c, cid).length == 0, "c doesn't get a's client identifier");
+        enforce(scalar(a, cid) == "itest-a", "a's client identifier in the session attached again");
         foreach (_; 0 .. 20)
         {
             a.releaseSession();
@@ -129,6 +140,16 @@ void testPool()
         enforce(!c.inTransaction && scalar(c, "SELECT COUNT(*) FROM itest_pooled") == "0",
                 "the previous user's changes rolled back");
         dropTable(c, "itest_pooled");
+        c.clientIdentifier = "itest-pool";
+        enforce(scalar(c, "SELECT SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER') FROM dual") == "itest-pool",
+                "client identifier");
+    }
+    {
+        auto c = pool.lockConnection();
+        enforce(c.clientIdentifier is null && scalar(c,
+                "SELECT SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER') FROM dual")
+                .length == 0,
+                "the previous user's client identifier cleared");
     }
 
     // a connection returned busy (an unread result) is closed, not reused
@@ -338,4 +359,13 @@ void testPipelines()
             "the later operations didn't run");
     conn.rollback();
     enforce(conn.pipeline().run().length == 0, "an empty pipeline");
+
+    // a query that fails in a later fetch (ORA-01476 in the second batch of rows): that operation's error
+    enum failsLater = "SELECT 1 / (LEVEL - 150) FROM dual CONNECT BY LEVEL <= 300";
+    auto f = conn.pipeline().query(failsLater).query("SELECT 7 FROM dual").run(true);
+    enforce(!f[0].ok && f[0].error.code == 1476 && f[0].result is null, "the failed fetch");
+    enforce(f[1].ok && f[1].result.front.getLong(0) == 7 && !conn.isBusy, "the later operation and a free connection");
+    e = collectException!ServerException(conn.pipeline().query(failsLater).query("SELECT 7 FROM dual").run());
+    enforce(e !is null && e.code == 1476 && !conn.isBusy, "a failed fetch stops the pipeline");
+    enforce(conn.queryValue!long("SELECT 8 FROM dual") == 8, "usable afterwards");
 }

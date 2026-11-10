@@ -14,7 +14,7 @@ module oracle.settings;
 
 public import dbwire.client.hosts : HostPort, HostSelection;
 import core.time : Duration, seconds;
-import dbwire.client.dsn : Dsn, parseEnumValue, parseFlag, parseQuery, parseSeconds;
+import dbwire.client.dsn : Dsn, parseEnumValue, parseFlag, parseQuery, parseSeconds, redactPassword;
 import dbwire.io.backend : IoMode;
 import dbwire.io.transport : TransportFactory;
 import dbwire.tls.transport : TlsOptions;
@@ -144,9 +144,24 @@ struct ConnectionOptions
     The TLS options of a connection: `tls` with the wallet applied, and with
     the host-name check left to the DN check when `serverCertDn` is set.
 
-    Throws: `ClientException` if the wallet directory has no `ewallet.pem`.
+    Without the host-name check (`ssl_server_dn_match=off`) and without
+    `serverCertDn`, the certificate must chain to a wallet or `tls.caFile`:
+    with the system's CAs, a certificate any public CA issued for any domain
+    would pass.
+
+    Throws: `ClientException` if the wallet directory has no `ewallet.pem`,
+    or the host-name check is off with the system's CAs.
     +/
     TlsOptions effectiveTls() const @safe
+    {
+        auto t = walletTls();
+        if (t.skipNameCheck && !t.skipVerify && serverCertDn.length == 0 && t.caFile.length == 0)
+            throw new ClientException("Without the host-name check (ssl_server_dn_match=off) the server"
+                    ~ " certificate must chain to a wallet or tls.caFile, not the system's CAs");
+        return t;
+    }
+
+    private TlsOptions walletTls() const @safe
     {
         import std.file : exists, readText;
         import std.path : buildPath;
@@ -241,6 +256,35 @@ struct ConnectionOptions
     IoMode ioMode = IoMode.auto_;
     /// Custom transport factory; overrides the backend's connect logic when set.
     TransportFactory transportFactory;
+
+    /// The options as text, with the passwords (`password`, `walletPassword`, `tls.keyPassword`) hidden.
+    string toString() const @safe
+    {
+        return "ConnectionOptions(" ~ fieldsText(this) ~ ")";
+    }
+
+    // `name: value` of each field of `value`, without the secrets.
+    private static string fieldsText(T)(const ref T value)
+    {
+        import std.conv : to;
+        import std.traits : isDelegate;
+
+        string s;
+        foreach (i, ref field; value.tupleof)
+        {
+            enum name = __traits(identifier, T.tupleof[i]);
+            s ~= (i ? ", " : "") ~ name ~ ": ";
+            static if (name == "password" || name == "walletPassword" || name == "keyPassword")
+                s ~= field.length ? "***" : `""`;
+            else static if (is(typeof(field) == const(TlsOptions)))
+                s ~= "TlsOptions(" ~ fieldsText(field) ~ ")";
+            else static if (isDelegate!(typeof(field)))
+                s ~= field is null ? "null" : "set";
+            else
+                s ~= field.to!string;
+        }
+        return s;
+    }
 
     /++
     Parses any of the connection string forms: a URL (`oracle://`), a
@@ -338,7 +382,7 @@ struct ConnectionOptions
         {
             const protocol = p[0].toLower;
             if (protocol != "tcp" && protocol != "tcps")
-                throw new ClientException("Unsupported protocol '" ~ p[0] ~ "' in '" ~ text ~ "'");
+                throw new ClientException("Unsupported protocol '" ~ p[0] ~ "' in '" ~ redactPassword(text) ~ "'");
             tcps = protocol == "tcps";
             s = p[2];
         }
@@ -359,7 +403,7 @@ struct ConnectionOptions
         }
         const address = s[0 .. slash];
         if (address.length == 0)
-            throw new ClientException("No host in '" ~ text ~ "'");
+            throw new ClientException("No host in '" ~ redactPassword(text) ~ "'");
         auto o = fromParams(params);
         if (tcps)
             o.secure = true;
@@ -714,15 +758,18 @@ final class DescriptorNode
     /// The entries of a list.
     DescriptorNode[] children;
 
+    /// The deepest nesting `parse` accepts (real descriptors have a few levels).
+    enum maxDepth = 64;
+
     /++
     Parses one entry (with its parentheses).
 
-    Throws: `ClientException` if the text is malformed.
+    Throws: `ClientException` if the text is malformed or nested deeper than `maxDepth`.
     +/
     static DescriptorNode parse(string s) @safe
     {
         size_t pos;
-        auto node = parseAt(s, pos);
+        auto node = parseAt(s, pos, 1);
         skipSpace(s, pos);
         if (pos != s.length)
             throw new ClientException("Unexpected text after the connect descriptor: '" ~ s[pos .. $] ~ "'");
@@ -753,10 +800,12 @@ final class DescriptorNode
             pos++;
     }
 
-    private static DescriptorNode parseAt(string s, ref size_t pos) @safe
+    private static DescriptorNode parseAt(string s, ref size_t pos, uint depth) @safe
     {
         import std.string : strip, toUpper;
 
+        if (depth > maxDepth)
+            throw new ClientException("The connect descriptor is nested too deeply");
         skipSpace(s, pos);
         if (pos >= s.length || s[pos] != '(')
             throw new ClientException("Expected '(' in the connect descriptor at position " ~ toText(pos));
@@ -776,7 +825,7 @@ final class DescriptorNode
             {
                 skipSpace(s, pos);
                 if (pos < s.length && s[pos] == '(')
-                    node.children ~= parseAt(s, pos);
+                    node.children ~= parseAt(s, pos, depth + 1);
                 else
                     break;
             }
@@ -868,6 +917,25 @@ private string toText(T)(T v) @safe pure
     import std.conv : to;
 
     return v.to!string;
+}
+
+// toString hides the passwords; errors about the connection string too
+@safe unittest
+{
+    import std.exception : collectException;
+    import std.string : indexOf;
+
+    auto o = ConnectionOptions.parse("oracle://scott:s3cret@db/S?wallet_password=w4llet");
+    o.tls.keyPassword = "k3y";
+    const text = o.toString();
+    assert(text.indexOf("s3cret") < 0 && text.indexOf("w4llet") < 0 && text.indexOf("k3y") < 0, text);
+    assert(text.indexOf("password: ***") >= 0 && text.indexOf("user: scott") >= 0, text);
+    assert(text.indexOf("transportFactory: null") >= 0, text);
+    foreach (bad; ["Oracle://scott:s3cret@db/S", "ftp://scott:s3cret@db/S"])
+    {
+        const e = collectException!ClientException(ConnectionOptions.parse(bad));
+        assert(e !is null && e.msg.indexOf("s3cret") < 0, e is null ? bad : e.msg);
+    }
 }
 
 ///
@@ -1118,7 +1186,14 @@ private string[2][] dnPairs(string dn) @safe pure
             ~ "(CONNECT_DATA=(SERVICE_NAME=S)))");
     assert(o.secure && o.serverCertDn == "CN=db,O=Example" && o.walletLocation == "/w");
     o = ConnectionOptions.parse("oracle://db/S?secure=true&ssl_server_dn_match=off&wallet_location=SYSTEM");
-    assert(o.tls.skipNameCheck && o.effectiveTls().caFile is null);
+    assert(o.tls.skipNameCheck);
+    assertThrown!ClientException(o.effectiveTls()); // the system's CAs and no name check: any certificate passes
+    o.tls.caFile = "ca.pem";
+    assert(o.effectiveTls().skipNameCheck);
+    o.tls.caFile = null;
+    o.serverCertDn = "CN=db";
+    assert(o.effectiveTls().caFile is null);
+    o.serverCertDn = null;
 
     const dir = buildPath(tempDir, "oracle-native-wallet-test");
     (() @trusted {
@@ -1137,4 +1212,16 @@ private string[2][] dnPairs(string dn) @safe pure
     assert(t.certFile == buildPath(dir, "ewallet.pem") && t.keyPassword == "pw");
     o.walletLocation = buildPath(dir, "none");
     assertThrown!ClientException(o.effectiveTls());
+}
+
+// Connect descriptors (also REDIRECT addresses from a listener) nested too deeply are refused
+@safe unittest
+{
+    import std.array : replicate;
+    import std.exception : assertThrown;
+
+    assertThrown!ClientException(DescriptorNode.parse("(A=".replicate(100_000)));
+    enum deep = DescriptorNode.maxDepth;
+    assert(DescriptorNode.parse("(A=".replicate(deep) ~ "x" ~ ")".replicate(deep)).key == "A");
+    assertThrown!ClientException(DescriptorNode.parse("(A=".replicate(deep + 1) ~ "x" ~ ")".replicate(deep + 1)));
 }
