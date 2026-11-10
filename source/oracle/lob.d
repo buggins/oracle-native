@@ -117,14 +117,17 @@ characters (UTF-16 code units), BLOB and BFILE ones bytes.
 final class Lob
 {
     private Connection conn;
+    private ulong lease; // the connection's lease it came with (pooled connections)
     private immutable(ubyte)[] locator_;
     private OracleType type_;
     private CharsetForm form;
     private bool freed;
 
-    package this(Connection conn, OracleType type, CharsetForm form, immutable(ubyte)[] locator) @safe pure nothrow
+    package this(Connection conn, ulong lease, OracleType type, CharsetForm form, immutable(ubyte)[] locator) @safe
+    pure nothrow
     {
         this.conn = conn;
+        this.lease = lease;
         this.type_ = type;
         this.form = form;
         this.locator_ = locator;
@@ -281,7 +284,7 @@ final class Lob
         if (freed)
             throw new ClientException("The temporary LOB was freed");
         q.locator = locator_;
-        auto r = conn.lobOperation(q);
+        auto r = conn.lobOperation(q, lease);
         if (r.locator.length == locator_.length)
             locator_ = r.locator;
         return r;

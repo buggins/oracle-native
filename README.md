@@ -77,7 +77,10 @@ Requires a D frontend 2.097 or newer (DMD 2.097+, LDC 1.27+).
 
 Without TLS, only the password exchange is encrypted: the rest of the session
 (statements and data) travels in clear. Use TLS (`tcps://` or `secure=true`)
-on untrusted networks.
+on untrusted networks. Turning the host name check off
+(`ssl_server_dn_match=off`) needs a wallet or `tls_ca_file` (or
+`SSL_SERVER_CERT_DN`): with the system's CAs alone, any certificate a public
+CA issued would pass.
 
 ## Tests
 
@@ -118,7 +121,8 @@ by the client: the server doesn't parse text) to JSON columns and PL/SQL
 before 21c get the text.
 Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
-another thread or task) stops a running call with ORA-01013.
+another thread or task; for a fiber-mode connection, a task of its own
+thread) stops a running call with ORA-01013.
 
 ## Pipelines
 
@@ -169,8 +173,9 @@ auto pool = new ConnectionPool("oracle://app:secret@db/FREEPDB1?pool_max=8");
 
 The same code runs in threads (blocking sockets) and in vibe.d tasks, where
 waiting for the server suspends only the task: the I/O mode follows the
-caller (`ConnectionOptions.ioMode`). A connection handed out again has the
-previous user's uncommitted changes rolled back. See `examples/` (`dub run
+caller (`ConnectionOptions.ioMode`). A returned connection has its
+uncommitted changes rolled back and its end-to-end attributes cleared, and
+the LOBs read through it can't be used any more. See `examples/` (`dub run
 :example-basic`, `dub run :example-vibe`).
 
 ### DRCP
@@ -254,7 +259,8 @@ as ISO 8601 strings. Column metadata (`ColumnInfo`) also has the 23ai SQL
 domain, annotations and VECTOR dimensions and format.
 
 Monitoring tools see the end-to-end attributes of a session (`V$SESSION`,
-`SYS_CONTEXT('USERENV', ...)`); they are sent with the next call:
+`SYS_CONTEXT('USERENV', ...)`); they are sent with the next call (with DRCP
+also after a session switch, so they follow the connection):
 
 ```d
 conn.moduleName = "billing";

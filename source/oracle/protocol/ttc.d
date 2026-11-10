@@ -120,6 +120,9 @@ struct TtcWriter
     }
 }
 
+/// The longest name, message, locator or other metadata a `TtcReader` reads by default (1 MiB).
+enum size_t metadataLimit = 1024 * 1024;
+
 /// Reads TTC primitives; malformed values throw `ProtocolException`.
 struct TtcReader
 {
@@ -211,11 +214,13 @@ struct TtcReader
     }
 
     /++
-    Reads a CLR; `null` for NULL. Values longer than `maxLength` bytes are refused.
+    Reads a CLR; `null` for NULL. Values longer than `maxLength` bytes are
+    refused; the default suits names, messages and locators (column values
+    pass `ConnectionOptions.maxValueLength`).
 
     Throws: `ProtocolException` for malformed or too long values.
     +/
-    immutable(ubyte)[] clr(size_t maxLength = size_t.max) @safe
+    immutable(ubyte)[] clr(size_t maxLength = metadataLimit) @safe
     {
         const n = u8();
         if (n == clrNull || n == clrNull2)
@@ -235,10 +240,10 @@ struct TtcReader
         return (() @trusted => cast(immutable(ubyte)[]) result)(); // unique: built here
     }
 
-    /// Reads a value with two lengths: `ub4` total length (0 = none), then a CLR.
-    immutable(ubyte)[] bytesWithLength() @safe
+    /// Reads a value with two lengths: `ub4` total length (0 = none), then a CLR (at most `maxLength` bytes).
+    immutable(ubyte)[] bytesWithLength(size_t maxLength = metadataLimit) @safe
     {
-        return ub4() == 0 ? null : clr();
+        return ub4() == 0 ? null : clr(maxLength);
     }
 
     /// ditto, as text
@@ -307,4 +312,16 @@ private string toText(T)(T v) @safe pure
     t.feed([3, 1, 2, 3]); // a 3-byte value for a ub2
     auto r = TtcReader(new BufferedReader(t));
     assertThrown!ProtocolException(r.ub2());
+}
+
+// A chunked CLR longer than the limit (by default metadataLimit) is refused before its data is read
+@safe unittest
+{
+    import std.exception : assertThrown;
+    import dbwire.io.mock : MockTransport;
+
+    auto t = new MockTransport;
+    t.feed([0xFE, 0x04, 0x00, 0x10, 0x00, 0x01]); // chunked: one chunk of 1 MiB + 1 bytes, none sent
+    auto r = TtcReader(new BufferedReader(t));
+    assertThrown!ProtocolException(r.clr());
 }

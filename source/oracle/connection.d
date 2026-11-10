@@ -24,7 +24,8 @@ import dbwire.client.pool : Poolable;
 import dbwire.io.backend : IoBackend, backendFor;
 import dbwire.io.buffer : BufferedReader;
 import dbwire.io.transport : Transport;
-import dbwire.tls.transport : TlsContext, TlsTransport;
+import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
+import core.thread : Thread;
 import oracle.exception;
 import oracle.protocol.auth;
 import oracle.protocol.execute;
@@ -84,6 +85,10 @@ final class Connection : Poolable
     private ulong useCounter; // for the least recently used statement
     private IoLock writeLock; // writes from cancel() and the calls
     private shared bool cancelPending; // an INTERRUPT was sent and its ORA-01013 not yet read
+    private bool inCall; // a request is sent or its response not yet read (`guarded` is running)
+    private Thread owner; // fiber mode: the thread the connection belongs to
+    package ulong lease; // counts the times a pool handed the connection out; LOBs of an earlier lease are refused
+    private TlsOptions tlsOptions; // options.effectiveTls(), read once when connecting
     private uint lastCallStatus;
     private bool sessionReleased; // DRCP: the session went back to the server's pool; the next call attaches one
     package Rebindable!(immutable TimeZone) sessionZone; // the session time zone, for WITH LOCAL TIME ZONE values
@@ -120,6 +125,37 @@ final class Connection : Poolable
         o.user = user;
         o.password = password;
         this(o);
+    }
+
+    version (unittest)
+    {
+        /++
+        A connection over `t` (a `MockTransport` with scripted responses, see
+        `oracle.protocol.scripted`), logged in already, in thread mode.
+        +/
+        package static Connection scripted(Transport t, ubyte fieldVersion = 13,
+                ConnectionOptions o = ConnectionOptions.init) @safe
+        {
+            return new Connection(t, fieldVersion, o);
+        }
+
+        private this(Transport t, ubyte fieldVersion, ConnectionOptions o) @safe
+        {
+            import dbwire.io.backend : IoMode;
+
+            options = o;
+            backend = backendFor(IoMode.phobos);
+            writeLock = backend.newLock();
+            transport = t;
+            tns = new TnsStream(t);
+            tns.largeLengths = true;
+            reader = TtcReader(new BufferedReader(tns));
+            negotiatedFieldVersion = serverFieldVersion = fieldVersion;
+            sessionZone = UTC();
+            databaseZone = UTC();
+            databaseZoneKnown = true;
+            state = State.ready;
+        }
     }
 
     /// Whether the connection is open (it may be busy).
@@ -288,6 +324,12 @@ final class Connection : Poolable
         setEndToEnd(EndToEndAttribute.dbOp, value);
     }
 
+    // All five end-to-end attributes go with the next call (null ones clear the attribute).
+    private void resendEndToEnd() @safe pure nothrow
+    {
+        endToEnd.changed = (1 << endToEnd.values.length) - 1;
+    }
+
     private void setEndToEnd(EndToEndAttribute a, string value) @safe pure nothrow
     {
         endToEnd.values[a] = value.length ? value : null;
@@ -305,13 +347,20 @@ final class Connection : Poolable
     +/
     ulong exec(string sql) @safe
     {
-        return run(sql, null).rowCount;
+        return execResult(run(sql, null));
     }
 
     /// ditto
     ulong exec(Args...)(string sql, Args args) if (Args.length > 0)
     {
-        return run(sql, parameters(args)).rowCount;
+        return execResult(run(sql, parameters(args)));
+    }
+
+    // The row count of a statement run by `exec`; a query's result is closed (its rows are dropped).
+    private static ulong execResult(QueryResult r) @safe
+    {
+        r.close();
+        return r.rowCount;
     }
 
     /++
@@ -479,25 +528,42 @@ final class Connection : Poolable
     Cancels the running call: a statement being executed or rows being
     fetched. The call then fails with ORA-01013 and the connection stays
     usable. This is the one method that may be called from another thread
-    (or task); it does nothing when the connection isn't busy.
+    (or task); it does nothing when the connection isn't busy, while a
+    pipeline runs, and for a fiber-mode connection called from another
+    thread than its own (its socket belongs to that thread's event loop).
+
+    Like every client's cancel, it races with the end of the call: a cancel
+    that arrives after the call ended interrupts nothing, and the next call
+    first reads the server's answer to it.
     +/
     void cancel() @safe nothrow
     {
         import core.atomic : atomicStore;
 
-        if (state != State.busy || writeLock is null)
+        if (writeLock is null || !onOwnerThread)
             return;
         try
         {
+            // under the lock that `call` takes to check for a pending cancel and send its request
             writeLock.lock();
             scope (exit)
                 writeLock.unlock();
+            if ((state != State.busy && !inCall) || tns.inPipeline)
+                return;
             atomicStore(cancelPending, true);
-            tns.sendMarker(MarkerType.interrupt);
+            try
+                tns.sendMarker(MarkerType.interrupt);
+            catch (Exception e)
+            {
+                // part of the marker may be out: close, so that the reading side sees a broken connection
+                // (not a stream the next call's packet would follow)
+                atomicStore(cancelPending, false);
+                transport.close();
+            }
         }
         catch (Exception)
         {
-            // the connection broke: the reading side sees it
+            // the lock failed: nothing was sent
         }
     }
 
@@ -535,6 +601,10 @@ final class Connection : Poolable
         if (!options.usesDrcp || sessionReleased)
             return;
         guarded({
+            state = State.busy;
+            scope (exit)
+                if (state == State.busy)
+                    state = State.ready;
             if (inTransaction)
             {
                 call(seq => buildBareCall(FunctionCode.rollback, seq, negotiatedFieldVersion));
@@ -543,7 +613,23 @@ final class Connection : Poolable
             call(seq => buildSessionRelease(SessionReleaseMode.keep, seq, negotiatedFieldVersion)); // no response
             sessionReleased = true;
             lastCallStatus = 0;
+            // the next session may be another one, with another client's attributes: all five go with the
+            // call that attaches it (null ones clear the attribute)
+            resendEndToEnd();
         });
+    }
+
+    /++
+    Clears the end-to-end attributes (`clientIdentifier`, `moduleName`,
+    `action`, `clientInfo`, `dbOp`); the change goes with the next call. A
+    `ConnectionPool` does this when a connection is returned, so the next
+    borrower doesn't inherit them.
+    +/
+    void clearEndToEnd() @safe pure nothrow
+    {
+        foreach (i, v; endToEnd.values)
+            if (v !is null)
+                setEndToEnd(cast(EndToEndAttribute) i, null);
     }
 
     /// DRCP: whether the session is released (`releaseSession`) and not attached again yet.
@@ -552,13 +638,20 @@ final class Connection : Poolable
         return sessionReleased;
     }
 
-    /// Logs off and closes the connection (DRCP: ends the session). Calling it again does nothing.
+    /++
+    Logs off and closes the connection (DRCP: ends the session). Calling it again does nothing.
+
+    A fiber-mode connection called from another thread than the one that opened it is only marked
+    closed: its socket belongs to the other thread's event loop.
+    +/
     void close() @safe nothrow
     {
         if (state == State.closed)
             return;
         const wasReady = state == State.ready;
         state = State.closed;
+        if (!onOwnerThread)
+            return; // the socket can't be touched from here
         try
         {
             if (wasReady)
@@ -585,6 +678,12 @@ final class Connection : Poolable
 
     /// ORA-01403: the end of a query's rows.
     package enum uint noMoreRows = 1403;
+
+    // The most rows a response may bring: far more than asked for (`fetchSize`)
+    private @property size_t maxRowsPerResponse() const @safe pure nothrow
+    {
+        return options.fetchSize < 1000 ? 10_000 : options.fetchSize * 10;
+    }
 
     /// ORA-01007 and ORA-00932 on a cached query: its tables changed, parse it again.
     private static bool needsReparse(uint number) @safe pure nothrow @nogc
@@ -750,6 +849,12 @@ final class Connection : Poolable
                 throwIfError(e);
             }
             finishExecution(result, e);
+            if (e.number != 0 && e.number != noMoreRows) // the define failed
+            {
+                if (!result.keepCursor)
+                    closeCursorLater(result.cursorId);
+                throwIfError(e);
+            }
         });
         if (result.allFetched)
             result.release(); // every row is here: the connection is free
@@ -784,6 +889,8 @@ final class Connection : Poolable
     /// Runs the operations of a pipeline; see `Pipeline.run`.
     package PipelineResult[] runPipeline(const(PipelineOp)[] ops, bool continueOnError) @safe
     {
+        import core.atomic : atomicLoad;
+
         checkReady();
         auto results = new PipelineResult[ops.length];
         if (ops.length == 0)
@@ -857,18 +964,28 @@ final class Connection : Poolable
                 requests[i] = w.data;
             }
             const end = buildEndPipeline(nextSequence(), negotiatedFieldVersion);
+            scope (exit)
+                tns.inPipeline = false;
+            for (;;)
             {
+                // as in `call`: a pending cancel is answered first, checked under cancel()'s lock; from the
+                // send on, cancel() does nothing (its answer would be taken for a request's)
                 writeLock.lock();
+                if (atomicLoad(cancelPending))
+                {
+                    writeLock.unlock();
+                    finishCancel();
+                    continue;
+                }
                 scope (exit)
                     writeLock.unlock();
+                tns.inPipeline = true;
                 foreach (i, request; requests)
                     tns.sendData(request, i == 0 ? DataFlags.beginPipeline : 0, DataFlags.endOfRequest);
                 tns.sendData(end);
+                break;
             }
             // the responses, one per request, then the end's
-            tns.inPipeline = true;
-            scope (exit)
-                tns.inPipeline = false;
             foreach (i, ref op; ops)
             {
                 auto result = prepared[i].result;
@@ -904,7 +1021,7 @@ final class Connection : Poolable
                         throwIfError(e);
                 }
         });
-        // the remaining rows of the queries, one after the other
+        // the remaining rows of the queries, one after the other; a fetch error is that operation's error
         foreach (ref r; results)
             if (r.result !is null)
             {
@@ -913,7 +1030,15 @@ final class Connection : Poolable
                     r.result.close();
                     continue;
                 }
-                readAllRows(r.result);
+                try
+                    readAllRows(r.result);
+                catch (ServerException e)
+                {
+                    r.error = e;
+                    r.result = null;
+                    if (firstError is null)
+                        firstError = e;
+                }
             }
         if (state == State.busy)
             state = State.ready;
@@ -932,6 +1057,8 @@ final class Connection : Poolable
         }
         state = State.busy;
         auto rows = r.batch;
+        scope (exit)
+            r.release(); // also after an error: a server error ends the rows, other errors closed the connection
         while (!r.allFetched)
         {
             r.batch = null;
@@ -939,7 +1066,6 @@ final class Connection : Poolable
             rows ~= r.batch;
         }
         r.batch = rows;
-        r.release();
     }
 
     /// A statement ready to run: its cache entry (or a new one), binds, and result.
@@ -1021,7 +1147,7 @@ final class Connection : Poolable
             {
                 result.keepCursor = true;
                 stmt.lastUse = ++useCounter;
-                stmt.inUse = kind == StatementKind.query && e.number != noMoreRows;
+                stmt.inUse = kind == StatementKind.query && e.number == 0; // rows remain (not after an error)
                 result.statement = stmt;
                 return e;
             }
@@ -1126,7 +1252,7 @@ final class Connection : Poolable
         if (result.statement !is null)
         {
             result.statement.columns = result.columnInfo.dup;
-            result.statement.inUse = e.number != noMoreRows;
+            result.statement.inUse = e.number == 0; // rows remain (not after an error)
         }
         return e;
     }
@@ -1135,10 +1261,12 @@ final class Connection : Poolable
     Runs a LOB operation (see `oracle.lob`). Allowed while a query result is
     open: LOBs are read while their rows are.
     +/
-    package LobResponse lobOperation(const ref LobRequest q) @safe
+    package LobResponse lobOperation(const ref LobRequest q, ulong lobLease) @safe
     {
         if (state == State.closed)
             throw new ClientException("The connection is closed");
+        if (lobLease != lease)
+            throw new ClientException("The LOB was fetched or created before the pooled connection was returned");
         LobResponse response;
         guarded({
             const wasReady = state == State.ready;
@@ -1153,7 +1281,12 @@ final class Connection : Poolable
                 switch (type)
                 {
                 case MessageType.lobData:
-                    response.data ~= reader.clr(options.maxValueLength);
+                    if (response.data.length >= options.maxValueLength)
+                        throw new ProtocolException(
+                            "A LOB value longer than " ~ toText(options.maxValueLength)
+                            ~ " bytes");
+                    const piece = reader.clr(options.maxValueLength - response.data.length);
+                    response.data = response.data.length ? response.data ~ piece : piece;
                     break;
                 case MessageType.parameter:
                     // the locator, then echoes of what was sent: the character set, the amount, the NULL-LOB flag
@@ -1210,8 +1343,8 @@ final class Connection : Poolable
         q.destinationOffset = type;
         q.charset = CharsetId.al32utf8;
         q.nullLobPointer = true;
-        const r = lobOperation(q);
-        return new Lob(this, type, form, r.locator);
+        const r = lobOperation(q, lease);
+        return new Lob(this, lease, type, form, r.locator);
     }
 
     /// Array DML; see `execMany`.
@@ -1392,6 +1525,10 @@ final class Connection : Poolable
     {
         checkReady();
         guarded({
+            state = State.busy;
+            scope (exit)
+                if (state == State.busy)
+                    state = State.ready;
             call(seq => buildBareCall(code, seq, negotiatedFieldVersion));
             throwIfError(readResponse(null));
         });
@@ -1408,8 +1545,6 @@ final class Connection : Poolable
     {
         import core.atomic : atomicLoad;
 
-        if (atomicLoad(cancelPending))
-            finishCancel(); // a cancel that came after the last call ended
         TtcWriter w;
         if (cursorsToClose.length && !sessionReleased) // released: the cursors may belong to another session
         {
@@ -1422,10 +1557,21 @@ final class Connection : Poolable
             endToEnd.changed = 0;
         }
         w.bytes(build(nextSequence()));
-        writeLock.lock();
-        scope (exit)
+        for (;;)
+        {
+            // a cancel sent between two calls is answered first; checked under the lock cancel() takes, so
+            // that one can't slip in after the check and interrupt this call instead
+            writeLock.lock();
+            if (!atomicLoad(cancelPending))
+            {
+                scope (exit)
+                    writeLock.unlock();
+                tns.sendData(w.data);
+                return;
+            }
             writeLock.unlock();
-        tns.sendData(w.data);
+            finishCancel();
+        }
     }
 
     /++
@@ -1485,7 +1631,10 @@ final class Connection : Poolable
             case MessageType.describeInfo:
                 if (result is null)
                     throw new ProtocolException("Unexpected column metadata in the server's response");
+                const before = result.columnInfo.length;
                 result.columnInfo = readDescribeInfo(reader, negotiatedFieldVersion);
+                if (result.lastRow !is null && result.columnInfo.length != before)
+                    throw new ProtocolException("The server changed the number of columns of a result");
                 break;
             case MessageType.rowHeader:
                 const bits = readRowHeader(reader);
@@ -1618,7 +1767,14 @@ final class Connection : Poolable
     private void readRow(QueryResult result, scope const(ubyte)[] bitVector) @safe
     {
         const columns = result.columnInfo;
+        // a response brings at most the rows asked for (the fetch size, or 1); this cap is far above that
+        // and bounds what a response of empty or repeated columns can make the client allocate
+        if (result.batch.length >= maxRowsPerResponse)
+            throw new ProtocolException("Too many rows in one response");
         const previous = result.batch.length ? result.batch[$ - 1] : null;
+        if ((previous !is null && previous.length != columns.length)
+                || (result.lastRow !is null && result.lastRow.length != columns.length))
+            throw new ProtocolException("A row with another number of columns than the result's");
         auto row = new immutable(ubyte)[][columns.length];
         foreach (i, ref c; columns)
         {
@@ -1669,25 +1825,53 @@ final class Connection : Poolable
     +/
     package void guarded(scope void delegate() @safe action) @safe
     {
+        // before anything changes: the socket of a fiber-mode connection belongs to its thread's event loop,
+        // and another task's call may be waiting for its response
+        checkThread();
+        if (inCall)
+            throw new ClientException("Another call is in progress on this connection");
+        inCall = true;
+        bool usable; // the response was read to its end (also a ServerException)
+        scope (exit)
+        {
+            inCall = false;
+            if (!usable) // any other exception, or an Error: the stream is in an unknown state
+            {
+                state = State.closed;
+                if (transport !is null)
+                    transport.close();
+            }
+        }
         try
             action();
         catch (ServerException e)
-            throw e;
-        catch (Exception e)
         {
-            state = State.closed;
-            if (transport !is null)
-                transport.close();
+            usable = true;
             throw e;
         }
+        usable = true;
     }
 
     package void checkReady() const @safe
     {
         if (state == State.closed)
             throw new ClientException("The connection is closed");
-        if (state == State.busy)
+        checkThread();
+        if (state == State.busy || inCall)
             throw new ClientException("The connection is busy: read or close the previous query result first");
+    }
+
+    // A fiber-mode connection is used from the thread that opened it; its socket belongs to that event loop.
+    private void checkThread() const @safe
+    {
+        if (!onOwnerThread)
+            throw new ClientException(
+                    "A fiber-mode connection was used from a thread other than the one that opened it");
+    }
+
+    private bool onOwnerThread() const @safe nothrow
+    {
+        return owner is null || Thread.getThis() is owner;
     }
 
     /++
@@ -1745,8 +1929,12 @@ final class Connection : Poolable
 
     private void connect() @safe
     {
+        if (options.secure)
+            tlsOptions = options.effectiveTls(); // configuration errors before any connection is made
         backend = backendFor(options.ioMode);
         writeLock = backend.newLock();
+        if (backend.name == "vibe")
+            owner = Thread.getThis();
 
         void tryHost(HostPort endpoint) @safe
         {
@@ -1763,9 +1951,15 @@ final class Connection : Poolable
         raw.setTimeouts(options.connectTimeout, options.connectTimeout);
         if (!options.secure)
             return raw;
-        const tls = options.effectiveTls();
-        auto secure = new TlsTransport(raw, backend, TlsContext.client(tls), endpoint.host, tls,
-                options.connectTimeout);
+        const tls = tlsOptions;
+        TlsTransport secure;
+        try
+            secure = new TlsTransport(raw, backend, TlsContext.client(tls), endpoint.host, tls, options.connectTimeout);
+        catch (Exception e)
+        {
+            raw.close();
+            throw e;
+        }
         if (options.serverCertDn.length && !tls.skipVerify)
         {
             const subject = secure.peerSubject;
@@ -1807,11 +2001,15 @@ final class Connection : Poolable
             tns = new TnsStream(transport);
             tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.endOfResponse, connectFlags));
             auto p = tns.readPacket();
-            while (p.type == PacketType.resend)
+            foreach (resend; 0 .. 10)
             {
+                if (p.type != PacketType.resend)
+                    break;
                 tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.endOfResponse, connectFlags));
                 p = tns.readPacket();
             }
+            if (p.type == PacketType.resend)
+                throw new ProtocolException("The listener keeps asking to resend the connect packet");
             if (p.type == PacketType.accept)
             {
                 const a = parseAccept(p.bytes);
@@ -1893,6 +2091,10 @@ final class Connection : Poolable
         checkServerResponse(sessionValues, keys);
 
         transport.setTimeouts(options.receiveTimeout, options.sendTimeout);
+        // DRCP: the session may be one another connection released, with its end-to-end attributes; the
+        // first call sets all five (null ones clear the attribute)
+        if (options.usesDrcp)
+            resendEndToEnd();
         sessionZone = zoneOf(options.sessionTimeZone);
         databaseZone = UTC();
         databaseZoneKnown = false;
@@ -1981,7 +2183,11 @@ private HostPort redirectEndpoint(string address, HostPort current) @safe
     import std.conv : ConvException, to;
     import oracle.settings : DescriptorNode;
 
-    const node = DescriptorNode.parse(address);
+    DescriptorNode node;
+    try
+        node = DescriptorNode.parse(address);
+    catch (ClientException e) // server data: a ProtocolException, so that the next host is tried
+        throw new ProtocolException("Invalid REDIRECT address: " ~ e.msg);
     const a = node.key == "ADDRESS" ? node : node.child("ADDRESS");
     if (a is null)
         throw new ProtocolException("Invalid REDIRECT address '" ~ address ~ "'");
@@ -2082,4 +2288,336 @@ private string toText(T)(T v) @safe pure
     import std.conv : to;
 
     return v.to!string;
+}
+
+// --- tests over a scripted transport (oracle.protocol.scripted) ---
+
+version (unittest)
+{
+    import dbwire.io.mock : MockTransport;
+    import oracle.protocol.scripted;
+
+    // A transport over a MockTransport that can refuse writes and run a hook before each read.
+    private final class HookTransport : Transport
+    {
+        import core.time : Duration;
+
+        MockTransport mock;
+        bool refuseWrites;
+        void delegate() @safe beforeRead;
+
+        this() @safe
+        {
+            mock = new MockTransport;
+        }
+
+        override size_t read(scope ubyte[] b) @safe
+        {
+            if (beforeRead !is null)
+            {
+                auto f = beforeRead;
+                beforeRead = null;
+                f();
+            }
+            return mock.read(b);
+        }
+
+        override void write(scope const(ubyte)[] data) @safe
+        {
+            if (refuseWrites)
+                throw new ConnectionException("write refused");
+            mock.write(data);
+        }
+
+        override bool dataAvailable() @safe
+        {
+            return mock.dataAvailable;
+        }
+
+        override void close() @safe nothrow
+        {
+            mock.close();
+        }
+
+        override bool connected() const @safe nothrow
+        {
+            return mock.connected;
+        }
+
+        override void setTimeouts(Duration receive, Duration send) @safe
+        {
+        }
+    }
+
+    // The first response of a one-column NUMBER query: its column, `rows` rows, and more to fetch (or not).
+    private ubyte[] queryResponse(size_t rows, bool more, uint cursorId = 1) @safe
+    {
+        TtcWriter w;
+        putDescribe(w, [Col(OracleType.number, 22, "N")]);
+        foreach (i; 0 .. rows)
+            putNumberRow(w, cast(ubyte)(i + 1));
+        putError(w, more ? 0 : Connection.noMoreRows, cursorId);
+        return dataPacket(w.data);
+    }
+
+    private ubyte[] errorResponse(uint number, uint cursorId = 1) @safe
+    {
+        TtcWriter w;
+        putError(w, number, cursorId, "ORA-" ~ toText(number) ~ ": scripted");
+        return dataPacket(w.data);
+    }
+}
+
+// query!T: a value that doesn't convert closes the result (a foreach has no handle to close it)
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    static struct S
+    {
+        ubyte n;
+    }
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    TtcWriter w;
+    putDescribe(w, [Col(OracleType.number, 22, "N")]);
+    w.u8(MessageType.rowData);
+    w.clr([0xC2, 0x04, 0x01]); // 300
+    putError(w, 0, 1);
+    t.feed(dataPacket(w.data));
+    assertThrown!ClientException({
+        foreach (s; conn.query!S("SELECT n FROM t"))
+        {
+        }
+    }());
+    assert(conn.isOpen && !conn.isBusy);
+}
+
+// A failed fetch in a pipeline (run one by one on servers before 23ai) frees the connection
+@safe unittest
+{
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    assert(!conn.supportsPipelining);
+    t.feed(queryResponse(1, true));
+    t.feed(errorResponse(1476));
+    t.feed(queryResponse(1, false, 2));
+    auto results = conn.pipeline().query("SELECT 1/(n-2) FROM t").query("SELECT 1 FROM dual").run(true);
+    assert(results[0].error !is null && results[0].error.code == 1476);
+    assert(results[1].error is null && results[1].result.front.getLong(0) == 1);
+    assert(conn.isOpen && !conn.isBusy);
+
+    // and without continueOnError, the error is thrown with the connection free
+    t.feed(queryResponse(1, true));
+    t.feed(errorResponse(1476));
+    bool thrown;
+    try
+        conn.pipeline().query("SELECT 1/(n-2) FROM t").run();
+    catch (ServerException e)
+        thrown = e.code == 1476;
+    assert(thrown && conn.isOpen && !conn.isBusy);
+}
+
+// A cached query that fails when executed again stays cached and usable
+@safe unittest
+{
+    import std.algorithm.searching : canFind;
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    enum sql = "SELECT 1/:1 FROM dual";
+    t.feed(queryResponse(1, false, 5));
+    assert(conn.queryValue!long(sql, 1) == 1);
+    assert(conn.statements[sql].cursorId == 5 && !conn.statements[sql].inUse);
+    t.feed(errorResponse(1476, 5)); // ORA-01476 on the re-execution
+    bool thrown;
+    try
+        conn.query(sql, 0);
+    catch (ServerException e)
+        thrown = e.code == 1476;
+    assert(thrown && !conn.isBusy && !conn.statements[sql].inUse);
+    // the third run re-executes the cached cursor (no SQL text sent), and no cursor is closed
+    t.feed(queryResponse(1, false, 5));
+    t.clearWritten();
+    assert(conn.queryValue!long(sql, 1) == 1);
+    assert(!(cast(const(char)[]) t.written).canFind(sql) && conn.cursorsToClose.length == 0);
+}
+
+// A response that changes the number of columns after rows is a protocol error (the connection is closed)
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    TtcWriter w;
+    putDescribe(w, [Col(OracleType.number, 22, "A")]);
+    putNumberRow(w, 1);
+    putDescribe(w, [Col(OracleType.number, 22, "A"), Col(OracleType.number, 22, "B")]);
+    putNumberRow(w, 2);
+    putError(w, 0, 1);
+    t.feed(dataPacket(w.data));
+    assertThrown!ProtocolException(conn.query("SELECT a FROM t"));
+    assert(!conn.isOpen);
+}
+
+// Rows per response are capped (empty columns cost a byte each on the wire, far more in memory)
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    TtcWriter w;
+    putDescribe(w, [Col(OracleType.varchar, 0, "C")]);
+    foreach (i; 0 .. conn.maxRowsPerResponse + 1)
+        w.u8(MessageType.rowData);
+    putError(w, 0, 1);
+    t.feed(dataPackets(w.data));
+    assertThrown!ProtocolException(conn.query("SELECT NULL FROM t"));
+    assert(!conn.isOpen);
+}
+
+// exec() of a query whose rows aren't all fetched leaves the connection free
+@safe unittest
+{
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    t.feed(queryResponse(1, true));
+    conn.exec("SELECT id FROM t FOR UPDATE");
+    assert(!conn.isBusy);
+}
+
+// commit (and the other calls without a result) mark the connection busy while they wait
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new HookTransport;
+    auto conn = Connection.scripted(t);
+    TtcWriter w;
+    putError(w, 0, 0);
+    t.mock.feed(dataPacket(w.data));
+    bool busy;
+    void whileWaiting() @safe
+    {
+        busy = conn.isBusy;
+        assertThrown!ClientException(conn.exec("SELECT 1 FROM dual")); // another task's call
+    }
+
+    t.beforeRead = &whileWaiting;
+    conn.commit();
+    assert(busy && conn.isOpen && !conn.isBusy);
+}
+
+// A cancel whose marker can't be sent leaves nothing pending, and closes the transport (part of the marker may
+// be out): the next call fails at once instead of waiting for an ORA-01013
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new HookTransport;
+    auto conn = Connection.scripted(t);
+    t.mock.feed(queryResponse(1, true));
+    auto r = conn.query("SELECT n FROM t");
+    r.popFront();
+    t.refuseWrites = true;
+    conn.cancel();
+    t.refuseWrites = false;
+    assert(!conn.cancelPending && !t.connected);
+    assertThrown!ConnectionException(r.empty);
+    assert(!conn.isOpen);
+}
+
+// A fiber-mode connection used from another thread is refused before anything changes
+@system unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    void nothing()
+    {
+    }
+
+    conn.owner = new Thread(&nothing); // as if another thread had opened it
+    assertThrown!ClientException(conn.exec("COMMIT"));
+    assertThrown!ClientException(conn.guarded(() {}));
+    conn.cancel(); // does nothing
+    assert(conn.isOpen && !conn.isBusy && t.written.length == 0);
+}
+
+// guarded: a call while another one waits for its response is refused (the connection stays open);
+// an Error inside closes the connection
+@system unittest
+{
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    conn.inCall = true;
+    assertThrown!ClientException(conn.guarded(() {}));
+    assert(conn.isOpen);
+    conn.inCall = false;
+    assertThrown!Error(conn.guarded(() { throw new Error("scripted"); }));
+    assert(!conn.isOpen && !conn.inCall);
+}
+
+// A LOB of an earlier lease (a pooled connection returned since) is refused
+@safe unittest
+{
+    import oracle.lob : Lob;
+    import oracle.types.typeinfo : CharsetForm;
+    import std.exception : assertThrown;
+
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    auto lob = new Lob(conn, conn.lease, OracleType.blob, CharsetForm.none, new immutable(ubyte)[40]);
+    conn.lease++;
+    assertThrown!ClientException(lob.length);
+    assert(conn.isOpen && t.written.length == 0);
+}
+
+// After a DRCP release the end-to-end attributes all go with the next call
+@safe unittest
+{
+    ConnectionOptions o;
+    o.serverType = "pooled";
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t, scriptedFieldVersion, o);
+    conn.clientIdentifier = "app-user";
+    conn.endToEnd.changed = 0; // as if sent
+    conn.releaseSession();
+    assert(conn.isSessionReleased && conn.endToEnd.changed == 0b11111);
+    conn.clearEndToEnd();
+    assert(conn.clientIdentifier is null);
+}
+
+// cancel() does nothing while a pipeline's requests are in flight (its answer would be taken for theirs)
+@system unittest
+{
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    conn.state = Connection.State.busy;
+    conn.tns.inPipeline = true;
+    conn.cancel();
+    assert(t.written.length == 0 && !conn.cancelPending);
+    conn.tns.inPipeline = false;
+    conn.cancel();
+    assert(t.written.length > 0 && conn.cancelPending);
+}
+
+// A fiber-mode connection closed from another thread is only marked closed (the socket is the other thread's)
+@system unittest
+{
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    void nothing()
+    {
+    }
+
+    conn.owner = new Thread(&nothing);
+    conn.close();
+    assert(!conn.isOpen && t.written.length == 0 && t.connected);
 }

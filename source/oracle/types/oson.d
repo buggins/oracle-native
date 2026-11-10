@@ -66,6 +66,7 @@ private struct OsonDecoder
     bool scalar;
     char[] output;
     uint depth;
+    size_t visits; // child nodes visited: each has its own offset in its parent, unless containers are shared
 
     this(immutable(ubyte)[] data) @safe pure nothrow
     {
@@ -264,6 +265,10 @@ private struct OsonDecoder
                 quoted(names[id - 1]);
                 put(":");
             }
+            // children may share nodes: a few nested containers listing the same child twice would expand
+            // exponentially; a tree without shared containers has fewer children than bytes
+            if (++visits > data.length)
+                throw new ProtocolException("OSON image with too many shared nodes");
             pos = offsets;
             size_t child = offset(type);
             if (relativeOffsets)
@@ -1363,4 +1368,29 @@ private string toText(T)(T v) @safe pure
         0xFF, 0x4A, 0x5A, 0x01, 0x00, 0x16, 0x00, 0x06, 0x3D, 0x80, 0x00, 0x00, 0x00, 0x39
     ];
     assert(osonToText(months) == `"-P3M"`);
+}
+
+// Containers that list the same child twice: an exponential expansion is refused
+@safe unittest
+{
+    import std.exception : assertThrown;
+
+    ubyte[] tree;
+    enum depth = 40;
+    foreach (i; 0 .. depth)
+    {
+        const next = (i + 1) * 6;
+        tree ~= [
+            cast(ubyte) 0xC0, 2, cast(ubyte)(next >> 8), cast(ubyte) next, cast(ubyte)(next >> 8),
+            cast(ubyte) next
+        ];
+    }
+    tree ~= 0x30; // the innermost node
+    ubyte[] image = [
+        0xFF, 0x4A, 0x5A, 1, 0x00, 0x00, 0, 0, 0, cast(ubyte)(tree.length >> 8),
+        cast(ubyte) tree.length,
+        0, 0
+    ];
+    image ~= tree;
+    assertThrown!ProtocolException(osonToText(image.idup));
 }

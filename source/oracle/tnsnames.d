@@ -89,13 +89,17 @@ private void readInto(ref TnsNames t, string file, ref string[] reading) @safe
 {
     import std.algorithm.searching : canFind;
     import std.file : FileException, readText;
-    import std.path : buildPath, dirName, isAbsolute;
+    import std.path : absolutePath, buildNormalizedPath, buildPath, dirName, isAbsolute;
     import std.string : split, splitLines, strip;
     import std.uni : toUpper;
 
-    if (reading.canFind(file))
+    // `sub/../tnsnames.ora` is `tnsnames.ora`: compare normalized absolute paths
+    const normalized = buildNormalizedPath(absolutePath(file));
+    if (reading.canFind(normalized))
         throw new ClientException("The file " ~ file ~ " includes itself (IFILE)");
-    reading ~= file;
+    if (reading.length >= 16)
+        throw new ClientException("The files included by " ~ reading[0] ~ " are nested too deeply (IFILE)");
+    reading ~= normalized;
     scope (exit)
         reading = reading[0 .. $ - 1];
     string text;
@@ -258,7 +262,8 @@ IFILE = "more.ora"
 {
     import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
     import std.path : buildPath;
-    import std.exception : assertThrown;
+    import std.exception : assertThrown, collectException;
+    import std.string : indexOf;
 
     const dir = buildPath(tempDir, "oracle-native-tnsnames-test");
     (() @trusted {
@@ -275,5 +280,6 @@ IFILE = "more.ora"
     assertThrown!ClientException(t.lookup("missing"));
     assert(findConfigDir(dir) == dir && findConfigDir(buildPath(dir, "sub")) is null);
     (() @trusted => write(buildPath(dir, "sub", "x.ora"), "IFILE=../tnsnames.ora\n"))();
-    assertThrown!ClientException(readTnsNames(dir)); // includes itself
+    auto e = collectException!ClientException(readTnsNames(dir)); // includes itself, through a relative path
+    assert(e !is null && e.msg.indexOf("includes itself") >= 0, e.msg);
 }

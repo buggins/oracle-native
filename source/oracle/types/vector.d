@@ -325,18 +325,32 @@ immutable(ubyte)[] encodeVector(const Vector v) @safe
     return (() @trusted => cast(immutable(ubyte)[]) b)();
 }
 
-/// An element as the server writes it: `1.5E+000`, `1.00000001E-001`, `0`.
-private string elementText(double x, int digits) @trusted
+/++
+An element as the server writes it: `1.5E+000`, `1.00000001E-001`, `0`.
+The server refuses NaN and infinities in vectors; a `Vector` made by the
+client may hold them: `Nan`, `Inf`, `-Inf` (as BINARY_DOUBLE text).
++/
+private string elementText(double x, int digits) @safe
 {
     import core.stdc.stdio : snprintf;
+    import std.math : isInfinity, isNaN;
     import std.string : indexOf;
 
+    if (isNaN(x))
+        return "Nan";
+    if (isInfinity(x))
+        return x < 0 ? "-Inf" : "Inf";
     if (x == 0)
         return "0";
     char[64] buffer;
-    const n = snprintf(buffer.ptr, buffer.length, "%.*E", digits - 1, x);
+    // at most 17 digits, a sign, a point and an exponent: fits; snprintf writes only into the buffer
+    const n = (() @trusted => snprintf(buffer.ptr, buffer.length, "%.*E", digits - 1, x))();
+    if (n <= 0 || n >= buffer.length)
+        throw new ClientException("Can't format a vector element");
     auto s = buffer[0 .. n].idup; // d.ddddE±xx
     const e = s.indexOf('E');
+    if (e < 0 || e + 2 >= s.length)
+        throw new ClientException("Can't format a vector element");
     auto mantissa = s[0 .. e];
     while (mantissa.length > 3 && mantissa[$ - 1] == '0' && mantissa[$ - 2] != '.')
         mantissa = mantissa[0 .. $ - 1];
@@ -386,4 +400,11 @@ private string toText(T)(T v) @safe pure
     ];
     const v = decodeVector(image);
     assert(v.float32s == [1.5f, 2, 3] && v.dimensions == 3 && !v.sparse);
+}
+
+// NaN and infinities (the server refuses them, a client-made vector may hold them)
+@safe unittest
+{
+    assert(Vector.of([float.nan, float.infinity, -float.infinity]).toString() == "[Nan,Inf,-Inf]");
+    assert(Vector.of([double.nan, 1.5]).toString() == "[Nan,1.5E+000]");
 }
