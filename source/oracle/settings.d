@@ -215,7 +215,12 @@ struct ConnectionOptions
 
     /// Session data unit: the largest packet the client asks for (512 to 2 MB; the server may lower it).
     uint sdu = 8192;
-    /// Maximum time to connect (TCP, TLS, the listener's answer, the login).
+    /++
+    Time limit for each step of connecting: the TCP connection, the TLS
+    handshake, and each wait for the listener's or the server's answer during
+    the login (not for the whole connect). `Duration.zero` (`connect_timeout=0`):
+    no limit.
+    +/
     Duration connectTimeout = 20.seconds;
     /// Maximum time a single socket write may block; `Duration.zero`: no limit.
     Duration sendTimeout = 300.seconds;
@@ -872,6 +877,7 @@ private string toText(T)(T v) @safe pure
     assert(o.user == "scott" && o.password == "ti@ger" && o.serviceName == "ORCLPDB");
     assert(o.endpoints == [HostPort("db1", 1522), HostPort("db2", 1521)]);
     assert(o.connectTimeout == 5.seconds && o.sessionTimeZone == "UTC");
+    assert(ConnectionOptions.parse("oracle://db/ORCL?connect_timeout=0").connectTimeout == Duration.zero);
 
     o = ConnectionOptions.parse("tcps://db.example.com/sales:dedicated/inst2?tls_ca_file=ca.pem");
     assert(o.secure && o.endpoints == [HostPort("db.example.com", 2484)] && o.serviceName == "sales");
