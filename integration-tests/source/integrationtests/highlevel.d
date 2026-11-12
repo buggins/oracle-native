@@ -121,6 +121,61 @@ void testDrcp()
     checkSid(plain, "dedicated server");
 }
 
+private shared int poolHoldersFinalized;
+
+private final class PoolHolder
+{
+    PooledConnection conn;
+
+    ~this()
+    {
+        import core.atomic : atomicOp;
+
+        atomicOp!"+="(poolHoldersFinalized, 1);
+    }
+}
+
+private string sessionOf(Connection c)
+{
+    return c.sessionId.to!string ~ "," ~ c.serialNumber.to!string;
+}
+
+// A borrowed connection held only by an object nobody references any more; returns its session.
+private string dropHolder(ConnectionPool pool)
+{
+    auto holder = new PoolHolder;
+    holder.conn = pool.lockConnection();
+    return sessionOf(holder.conn);
+}
+
+// Overwrites the stack below the caller, where a dropped object's address may linger for the GC to see.
+private void clearStack()
+{
+    ubyte[16_384] junk;
+    junk[] = 0;
+    if (junk[$ - 1] != 0) // keeps the array from being optimized away
+        throw new Exception("never");
+}
+
+// A PooledConnection collected by the GC touches neither the pool nor the connection (either may be finalized
+// already): the connection stays checked out, and the next borrower gets another one.
+private void testPoolFinalizer(ConnectionPool pool)
+{
+    import core.atomic : atomicLoad;
+    import core.memory : GC;
+
+    const activeBefore = pool.activeConnections;
+    const session = dropHolder(pool);
+    clearStack();
+    foreach (i; 0 .. 3)
+        GC.collect();
+    auto c = pool.lockConnection();
+    enforce(sessionOf(c) != session, "the next borrower gets another connection");
+    if (atomicLoad(poolHoldersFinalized) == 0)
+        return; // the GC still sees the holder (conservative stack scan): nothing more to check
+    enforce(pool.activeConnections == activeBefore + 2, "the collected connection stays checked out");
+}
+
 /// The pool: reuse, uncommitted changes rolled back, busy connections dropped, limits, closing.
 void testPool()
 {
@@ -151,6 +206,7 @@ void testPool()
                 .length == 0,
                 "the previous user's client identifier cleared");
     }
+    testPoolFinalizer(pool);
 
     // a connection returned busy (an unread result) is closed, not reused
     {
