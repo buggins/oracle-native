@@ -6,6 +6,15 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- A `PooledConnection` finalized by the GC (a field of an object nobody
+  references) no longer rolls back and releases its session from the
+  finalizer, which could crash (`InvalidMemoryOperationError`, or a segfault
+  when the pool was finalized first, at exit). It now touches neither the
+  pool nor the connection, which stays checked out: call `release` before
+  dropping an object that holds one (#57). Needs dbwire 0.9.6 (dbwire#79).
+
 ## 0.4.0 — 2026-11-10
 
 The fixes and improvements from a code review: robustness, security and
