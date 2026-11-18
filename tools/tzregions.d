@@ -1,3 +1,4 @@
+#!/usr/bin/env dub
 /+ dub.sdl:
     name "tzregions"
     dependency "oracle-native" path=".."
@@ -8,7 +9,9 @@ TIMESTAMP WITH TIME ZONE values carry, with their names. For each name in
 `V$TIMEZONE_NAMES` it reads `FROM_TZ(TIMESTAMP '2000-01-01 00:00:00', name)`
 and takes the ID from the value's last two bytes.
 
-    dub run --single tools/tzregions.d -- <connection string> <user> <password> > source/oracle/types/tzregions.d
+    tools/tzregions.d <connection string> <user> <password> > source/oracle/types/tzregions.d
+
+(or `dub run --single tools/tzregions.d -- ...` where scripts can't be run directly, e.g. on Windows).
 +/
 module tzregions;
 

@@ -6,6 +6,13 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- `TIMESTAMP WITH TIME ZONE` values in the region `America/Coyhaique` no
+  longer throw "Unknown time zone region ID 419": the region table is
+  regenerated from Oracle 23.26.4 (time zone file version 46, 601 regions;
+  #63).
+
 ## 0.4.1 — 2026-11-12
 
 A `PooledConnection` collected by the garbage collector no longer crashes;
