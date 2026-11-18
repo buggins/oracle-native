@@ -6,6 +6,12 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+## 0.4.2 — 2026-11-18
+
+The time zone region table from Oracle 23.26.4 (`America/Coyhaique` no longer
+throws); the I/O mode option is also accepted as `io`, and `io_mode=auto`
+works; dbwire 0.9.8.
+
 ### Added
 
 - The I/O mode option `io_mode` can also be given as `io` for short, as in all
