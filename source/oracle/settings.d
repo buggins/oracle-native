@@ -15,7 +15,7 @@ module oracle.settings;
 import std.conv : to;
 public import dbwire.client.hosts : HostPort, HostSelection;
 import core.time : Duration, seconds;
-import dbwire.client.dsn : Dsn, parseEnumValue, parseFlag, parseQuery, parseSeconds, redactPassword;
+import dbwire.client.dsn : Dsn, parseEnumValue, parseFlag, parseIoMode, parseQuery, parseSeconds, redactPassword;
 import dbwire.io.backend : IoMode;
 import dbwire.io.transport : TransportFactory;
 import dbwire.tls.transport : TlsOptions;
@@ -546,7 +546,7 @@ struct ConnectionOptions
     `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
-    `round_robin`), `load_balance` (flag), `io_mode` (`auto_`, `phobos`, `vibe`),
+    `round_robin`), `load_balance` (flag), `io_mode` or `io` (`auto`, `phobos`, `vibe`),
     `config_dir` (where `tnsnames.ora` is).
     Other `pool_*` keys are for the pool (`PoolOptions.fromParams`) and ignored here.
 
@@ -566,6 +566,7 @@ struct ConnectionOptions
         import std.string : toLower;
 
         alias o = this;
+        checkIoModeKeys(params);
         foreach (key, value; params)
         {
             import std.algorithm.searching : startsWith;
@@ -707,7 +708,8 @@ struct ConnectionOptions
                 o.hostSelection = parseFlag(key, value) ? HostSelection.random : HostSelection.inOrder;
                 break;
             case "io_mode":
-                o.ioMode = parseEnumValue!IoMode(key, value);
+            case "io":
+                o.ioMode = parseIoMode(key, value);
                 break;
             case "config_dir":
                 o.configDir = value;
@@ -1221,4 +1223,46 @@ private string[2][] dnPairs(string dn) @safe pure
     enum deep = DescriptorNode.maxDepth;
     assert(DescriptorNode.parse("(A=".replicate(deep) ~ "x" ~ ")".replicate(deep)).key == "A");
     assertThrown!ClientException(DescriptorNode.parse("(A=".replicate(deep + 1) ~ "x" ~ ")".replicate(deep + 1)));
+}
+
+// The I/O mode: `io_mode`, or `io` for short, as in every connector (buggins/dbwire#83)
+@safe unittest
+{
+    import std.exception : collectExceptionMsg;
+
+    assert(ConnectionOptions.parse("oracle://h/S?io_mode=vibe").ioMode == IoMode.vibe);
+    assert(ConnectionOptions.parse("oracle://h/S?io=vibe").ioMode == IoMode.vibe);
+    assert(ConnectionOptions.parse("oracle://h/S?io=phobos&io_mode=phobos").ioMode == IoMode.phobos);
+    assert(ConnectionOptions.parse("oracle://h/S?io_mode=auto").ioMode == IoMode.auto_); // rejected before
+    assert(ConnectionOptions.parse("oracle://h/S?IO=vibe").ioMode == IoMode.vibe); // keys ignore case
+    auto message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?io=vibe&io_mode=phobos"));
+    assert(message == "'io' and 'io_mode' give different I/O modes ('vibe' and 'phobos')", message);
+    message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?io=fibers"));
+    assert(message == "Invalid value 'fibers' for 'io' (auto, phobos or vibe expected)", message);
+}
+
+// `io` is the short form of `io_mode` (buggins/dbwire#83); different values for both are an error,
+// rather than the associative array's order deciding. Keys ignore case, as in applyParams.
+private void checkIoModeKeys(const string[string] params) @safe
+{
+    import std.string : toLower;
+
+    string io, ioMode;
+    bool hasIo, hasIoMode;
+    foreach (key, value; params)
+    {
+        const lower = key.toLower;
+        if (lower == "io")
+        {
+            io = value;
+            hasIo = true;
+        }
+        else if (lower == "io_mode")
+        {
+            ioMode = value;
+            hasIoMode = true;
+        }
+    }
+    if (hasIo && hasIoMode && io != ioMode)
+        throw new ClientException("'io' and 'io_mode' give different I/O modes ('" ~ io ~ "' and '" ~ ioMode ~ "')");
 }
