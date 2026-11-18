@@ -6,8 +6,15 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- The I/O mode option `io_mode` can also be given as `io` for short, as in all
+  connectors (buggins/dbwire#83, #61). Giving both with different values is an
+  error. Requires dbwire 0.9.8.
+
 ### Fixed
 
+- `io_mode=auto` is accepted; only `auto_` worked before (buggins/dbwire#83, #61).
 - `TIMESTAMP WITH TIME ZONE` values in the region `America/Coyhaique` no
   longer throw "Unknown time zone region ID 419": the region table is
   regenerated from Oracle 23.26.4 (time zone file version 46, 601 regions;
