@@ -15,7 +15,8 @@ module oracle.settings;
 import std.conv : to;
 public import dbwire.client.hosts : HostPort, HostSelection;
 import core.time : Duration, seconds;
-import dbwire.client.dsn : Dsn, parseEnumValue, parseFlag, parseIoMode, parseQuery, parseSeconds, redactPassword;
+import dbwire.client.dsn : checkIoModeKeys, Dsn, parseEnumValue, parseFlag, parseIoMode, parseQuery,
+    parseSeconds, redactPassword;
 import dbwire.io.backend : IoMode;
 import dbwire.io.transport : TransportFactory;
 import dbwire.tls.transport : TlsOptions;
@@ -304,8 +305,8 @@ struct ConnectionOptions
     `oracle.tnsnames` for where the file is looked for), or Easy Connect. A
     name is taken as a host name when no `tnsnames.ora` is found.
 
-    Throws: `ClientException` if the string is malformed, or if a
-    `tnsnames.ora` is found without the alias.
+    Throws: `ClientException` if the string is malformed, if a `tnsnames.ora`
+    is found without the alias, or as `fromParams` for the parameters.
     +/
     static ConnectionOptions parse(string text) @safe
     {
@@ -349,7 +350,8 @@ struct ConnectionOptions
     User, password and values may be percent-encoded; IPv6 addresses go in
     brackets. Parameters are those of `fromParams`.
 
-    Throws: `ClientException` if the string is malformed or a parameter is unknown or invalid.
+    Throws: `ClientException` if the string is malformed or a parameter is unknown or invalid,
+    or if the I/O mode keys give different modes.
     +/
     static ConnectionOptions fromDsn(string dsn) @safe
     {
@@ -372,7 +374,8 @@ struct ConnectionOptions
     /++
     Parses Easy Connect: `[tcp://|tcps://]host[:port][/service][:server][/instance][?param=value&...]`.
 
-    Throws: `ClientException` if the string is malformed or a parameter is unknown or invalid.
+    Throws: `ClientException` if the string is malformed or a parameter is unknown or invalid,
+    or if the I/O mode keys give different modes.
     +/
     static ConnectionOptions fromEasyConnect(string text) @safe
     {
@@ -546,11 +549,13 @@ struct ConnectionOptions
     `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
     `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
-    `round_robin`), `load_balance` (flag), `io_mode` or `io` (`auto`, `phobos`, `vibe`),
+    `round_robin`), `load_balance` (flag), `io_mode` or `io` (`auto`, `phobos`, `vibe`;
+    both keys, in any case, may be given only with the same mode),
     `config_dir` (where `tnsnames.ora` is).
     Other `pool_*` keys are for the pool (`PoolOptions.fromParams`) and ignored here.
 
-    Throws: `ClientException` for unknown keys or invalid values.
+    Throws: `ClientException` for unknown keys or invalid values, or if the I/O
+    mode keys give different modes.
     +/
     static ConnectionOptions fromParams(const string[string] params) @safe
     {
@@ -559,14 +564,18 @@ struct ConnectionOptions
         return o;
     }
 
-    /// Sets the options named in `params` (as `fromParams` reads them), keeping the others.
+    /++
+    Sets the options named in `params` (as `fromParams` reads them), keeping the others.
+
+    Throws: `ClientException` as `fromParams`.
+    +/
     void applyParams(const string[string] params) @safe
     {
         import std.conv : ConvException;
         import std.string : toLower;
 
         alias o = this;
-        checkIoModeKeys(params);
+        checkIoModeKeys(params, true); // keys ignore case
         foreach (key, value; params)
         {
             import std.algorithm.searching : startsWith;
@@ -1228,7 +1237,7 @@ private string[2][] dnPairs(string dn) @safe pure
 // The I/O mode: `io_mode`, or `io` for short, as in every connector (buggins/dbwire#83)
 @safe unittest
 {
-    import std.exception : collectExceptionMsg;
+    import std.exception : assertNotThrown, assertThrown, collectExceptionMsg;
 
     assert(ConnectionOptions.parse("oracle://h/S?io_mode=vibe").ioMode == IoMode.vibe);
     assert(ConnectionOptions.parse("oracle://h/S?io=vibe").ioMode == IoMode.vibe);
@@ -1239,30 +1248,22 @@ private string[2][] dnPairs(string dn) @safe pure
     assert(message == "'io' and 'io_mode' give different I/O modes ('vibe' and 'phobos')", message);
     message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?io=fibers"));
     assert(message == "Invalid value 'fibers' for 'io' (auto, phobos or vibe expected)", message);
-}
-
-// `io` is the short form of `io_mode` (buggins/dbwire#83); different values for both are an error,
-// rather than the associative array's order deciding. Keys ignore case, as in applyParams.
-private void checkIoModeKeys(const string[string] params) @safe
-{
-    import std.string : toLower;
-
-    string io, ioMode;
-    bool hasIo, hasIoMode;
-    foreach (key, value; params)
-    {
-        const lower = key.toLower;
-        if (lower == "io")
-        {
-            io = value;
-            hasIo = true;
-        }
-        else if (lower == "io_mode")
-        {
-            ioMode = value;
-            hasIoMode = true;
-        }
-    }
-    if (hasIo && hasIoMode && io != ioMode)
-        throw new ClientException("'io' and 'io_mode' give different I/O modes ('" ~ io ~ "' and '" ~ ioMode ~ "')");
+    // the modes are compared, not the text (#69): auto and auto_ are the same mode
+    assertNotThrown(ConnectionOptions.parse("oracle://h/S?io=auto&io_mode=auto_"));
+    assert(ConnectionOptions.parse("oracle://h/S?io=vibe&io_mode=vibe").ioMode == IoMode.vibe);
+    // an invalid value is reported as such, not as a conflict
+    message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?io=fibers&io_mode=phobos"));
+    assert(message == "Invalid value 'fibers' for 'io' (auto, phobos or vibe expected)", message);
+    message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?io=vibe&io_mode=threads"));
+    assert(message == "Invalid value 'threads' for 'io_mode' (auto, phobos or vibe expected)", message);
+    // keys in any case, also two spellings of one key
+    message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?IO=vibe&Io_Mode=phobos"));
+    assert(message == "'IO' and 'Io_Mode' give different I/O modes ('vibe' and 'phobos')", message);
+    message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?io=vibe&IO=phobos"));
+    assert(message == "'IO' and 'io' give different I/O modes ('phobos' and 'vibe')", message);
+    message = collectExceptionMsg(ConnectionOptions.parse("oracle://h/S?IO_MODE=fibers"));
+    assert(message == "Invalid value 'fibers' for 'IO_MODE' (auto, phobos or vibe expected)", message);
+    // Easy Connect too
+    assert(ConnectionOptions.parse("h/S?IO=vibe").ioMode == IoMode.vibe);
+    assertThrown!ClientException(ConnectionOptions.parse("h/S?io=vibe&IO=phobos"));
 }

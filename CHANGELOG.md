@@ -6,6 +6,15 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- `io` and `io_mode` given together: the modes are compared, not the text, so
+  `io=auto&io_mode=auto_` is accepted, and an invalid value is reported as such
+  (`io=fibers&io_mode=phobos`: "Invalid value 'fibers' for 'io'"), not as a
+  conflict. Two spellings of one key (`io=vibe&IO=phobos`) are a conflict too;
+  before, one of them was ignored. The check is dbwire's `checkIoModeKeys`
+  (buggins/dbwire#95), shared by all connectors (#69). Requires dbwire 0.9.9.
+
 ## 0.4.2 — 2026-11-18
 
 The time zone region table from Oracle 23.26.4 (`America/Coyhaique` no longer
