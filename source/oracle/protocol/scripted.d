@@ -30,6 +30,14 @@ package(oracle) ubyte[] dataPacket(scope const(ubyte)[] payload) @safe pure noth
     return p;
 }
 
+/// A DATA packet with `payload` that ends a response (23ai: the END_OF_RESPONSE flag, as in pipelines).
+package(oracle) ubyte[] endOfResponsePacket(scope const(ubyte)[] payload) @safe pure nothrow
+{
+    auto p = dataPacket(payload);
+    p[8] = 0x20; // DataFlags.endOfResponse (0x2000), big-endian
+    return p;
+}
+
 /// `payload` in DATA packets of at most `size` bytes each.
 package(oracle) ubyte[] dataPackets(scope const(ubyte)[] payload, size_t size = 8000) @safe pure nothrow
 {
@@ -48,10 +56,10 @@ An ERROR message ending a response: `number` 0 (more rows to fetch, or a
 call that succeeded), 1403 (no more rows) or an ORA error with `message`.
 +/
 package(oracle) void putError(ref TtcWriter w, uint number, uint cursorId, string message = null,
-        ulong rowCount = 0) @safe pure
+        ulong rowCount = 0, uint callStatus = 0) @safe pure
 {
     w.u8(MessageType.error);
-    w.ub(0); // call status
+    w.ub(callStatus); // call status (0x02: in a transaction)
     w.ub(0); // end-to-end sequence number
     w.ub(0); // current row
     w.ub(0); // short error number

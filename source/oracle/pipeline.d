@@ -20,7 +20,10 @@ before `run` returns (statements whose rows don't fit in the first batch, or
 with LOB, JSON or VECTOR columns, take extra round trips after the pipeline).
 By default the first failed statement makes the server skip the later ones
 and `run` throws its error; with `continueOnError` every statement runs and
-the errors are in the results.
+the errors are in the results. An error that ends the session
+(`ServerException.sessionLost`, e.g. ORA-00028) ends the pipeline in both
+modes, like a lost connection: `run` throws it, the connection is closed, and
+the operations before it may have run.
 
 Copyright: Copyright © 2026, Vadim Lopatin
 License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
@@ -116,8 +119,10 @@ final class Pipeline
     one by one otherwise. Returns their results, in order.
 
     Throws: the first operation's `ServerException` unless `continueOnError`
-    (then the later operations don't run); `ClientException` for invalid
-    arguments; `ConnectionException` if the connection breaks.
+    (then the later operations don't run); a session-fatal `ServerException`
+    (`sessionLost`) also with `continueOnError`, the connection then closed;
+    `ClientException` for invalid arguments; `ConnectionException` if the
+    connection breaks.
     +/
     PipelineResult[] run(bool continueOnError = false) @safe
     {

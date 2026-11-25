@@ -109,6 +109,10 @@ jobs:
         run: |
           docker exec ${{ job.services.oracle.id }} bash -c \
             "printf \"create user itest_proxied identified by \\\"Proxied_pw123\\\";\\ngrant create session to itest_proxied;\\nalter user itest_proxied grant connect through testuser;\\n\" | sqlplus -s system/Oracle_test123@${{ matrix.service }}"
+      - name: Killed-session test privileges (ALTER SYSTEM KILL SESSION, V$SESSION)
+        run: |
+          docker exec ${{ job.services.oracle.id }} bash -c \
+            "printf 'alter session set container = ${{ matrix.service }};\\ngrant alter system to testuser;\\ngrant select on sys.v_\$session to testuser;\\n' | sqlplus -s / as sysdba"
       - name: DRCP (the database's connection pool)
         run: |
           docker exec ${{ job.services.oracle.id }} bash -c \
