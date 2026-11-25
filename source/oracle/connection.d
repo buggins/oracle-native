@@ -667,6 +667,9 @@ final class Connection : Poolable
     /++
     Logs off and closes the connection (DRCP: ends the session). Calling it again does nothing.
 
+    An open transaction is rolled back first: the server's logoff would commit it (#74). If the rollback fails,
+    the connection is closed without logging off, and the server rolls the abandoned transaction back.
+
     A fiber-mode connection called from another thread than the one that opened it is only marked
     closed: its socket belongs to the other thread's event loop.
     +/
@@ -682,6 +685,11 @@ final class Connection : Poolable
         {
             if (wasReady)
             {
+                if (inTransaction)
+                {
+                    call(seq => buildBareCall(FunctionCode.rollback, seq, negotiatedFieldVersion));
+                    throwIfError(readResponse(null)); // on failure no logoff (below): just the socket closed
+                }
                 if (!options.usesDrcp)
                 {
                     call(seq => buildBareCall(FunctionCode.logoff, seq, negotiatedFieldVersion));
@@ -963,6 +971,8 @@ final class Connection : Poolable
                 {
                     if (!continueOnError)
                         throw e;
+                    if (e.sessionLost)
+                        throw e; // the session is gone and the connection closed: it ends the pipeline (#75)
                     results[i].error = e;
                 }
             }
@@ -974,6 +984,7 @@ final class Connection : Poolable
             if (op.kind != PipelineOpKind.commit)
                 prepared[i] = prepare(op.sql, op.params, true);
         ServerException firstError;
+        ServerException sessionError; // an error that ended the session: it ends the pipeline (#75)
         guarded({
             state = State.busy;
             scope (failure)
@@ -1039,11 +1050,16 @@ final class Connection : Poolable
                 const e = readResponse(result);
                 if (e.number != 0 && e.number != noMoreRows)
                 {
-                    closeCursorLater(e.cursorId);
                     auto error = new ServerException(e.number, e.message, e.position);
                     results[i].error = error;
                     if (firstError is null)
                         firstError = error;
+                    if (error.sessionLost)
+                    {
+                        sessionError = error;
+                        return; // the server answers no more; no end answer, no follow-up calls
+                    }
+                    closeCursorLater(e.cursorId);
                     continue;
                 }
                 if (result is null)
@@ -1054,20 +1070,38 @@ final class Connection : Poolable
                 results[i].rowCount = result.rowCount;
                 results[i].result = result;
             }
-            throwIfError(readResponse(null));
-            tns.inPipeline = false;
-            // what the pipeline couldn't do: LOB defines, the database time zone
-            foreach (ref r; results)
-                if (r.result !is null)
-                {
-                    ErrorInfo e;
-                    e.number = r.result.allFetched && r.result.isQuery ? noMoreRows : 0;
-                    e.rowCount = r.rowCount;
-                    finishExecution(r.result, e);
-                    if (e.number != 0 && e.number != noMoreRows)
-                        throwIfError(e);
-                }
+            try
+            {
+                throwIfError(readResponse(null));
+                tns.inPipeline = false;
+                // what the pipeline couldn't do: LOB defines, the database time zone
+                foreach (ref r; results)
+                    if (r.result !is null)
+                    {
+                        ErrorInfo e;
+                        e.number = r.result.allFetched && r.result.isQuery ? noMoreRows : 0;
+                        e.rowCount = r.rowCount;
+                        finishExecution(r.result, e);
+                        if (e.number != 0 && e.number != noMoreRows)
+                            throwIfError(e);
+                    }
+            }
+            catch (ServerException e)
+            {
+                if (!e.sessionLost)
+                    throw e;
+                sessionError = e; // after all the operations' answers
+            }
         });
+        if (sessionError !is null)
+        {
+            // close, as guarded() does for its own errors, and end the pipeline with the error: as when the
+            // connection is lost, operations before it may have run
+            state = State.closed;
+            if (transport !is null)
+                transport.close();
+            throw sessionError;
+        }
         // the remaining rows of the queries, one after the other; a fetch error is that operation's error
         foreach (ref r; results)
             if (r.result !is null)
@@ -1081,6 +1115,8 @@ final class Connection : Poolable
                     readAllRows(r.result);
                 catch (ServerException e)
                 {
+                    if (e.sessionLost)
+                        throw e; // guarded closed the connection; it ends the pipeline (#75)
                     r.error = e;
                     r.result = null;
                     if (firstError is null)
@@ -1101,6 +1137,11 @@ final class Connection : Poolable
         {
             r.release();
             return;
+        }
+        if (state == State.closed) // not State.busy for a closed connection; the rows are missing
+        {
+            r.release();
+            throw new ClientException("The connection is closed");
         }
         state = State.busy;
         auto rows = r.batch;
@@ -1915,8 +1956,9 @@ final class Connection : Poolable
 
     /++
     Runs `action`. A `ServerException` leaves the connection usable (the
-    response was read to its end); any other exception means the stream is in
-    an unknown state, so the connection is closed.
+    response was read to its end), unless it ends the session (`sessionLost`,
+    e.g. ORA-00028); any other exception means the stream is in an unknown
+    state. In both cases the connection is closed.
     +/
     package void guarded(scope void delegate() @safe action) @safe
     {
@@ -1941,7 +1983,7 @@ final class Connection : Poolable
             action();
         catch (ServerException e)
         {
-            usable = true;
+            usable = !e.sessionLost; // e.g. ORA-00028: the session is gone, so close the connection (#75)
             throw e;
         }
         usable = true;
@@ -2478,6 +2520,106 @@ version (unittest)
         }
     }());
     assert(conn.isOpen && !conn.isBusy);
+}
+
+// close() with an open transaction rolls it back before the logoff, which would commit it; if the rollback fails,
+// it closes the socket without the logoff, and the server rolls back (#74)
+@safe unittest
+{
+    import std.algorithm.searching : canFind;
+
+    foreach (rollbackFails; [false, true])
+    {
+        auto t = new MockTransport;
+        auto conn = Connection.scripted(t);
+        TtcWriter w;
+        putError(w, 0, 1, null, 1, 0x02); // an INSERT: one row, in a transaction
+        t.feed(dataPacket(w.data));
+        conn.exec("INSERT INTO t VALUES (1)");
+        assert(conn.inTransaction);
+        TtcWriter r;
+        putError(r, rollbackFails ? 1013 : 0, 0);
+        t.feed(dataPacket(r.data)); // the rollback's answer
+        TtcWriter l;
+        putError(l, 0, 0);
+        t.feed(dataPacket(l.data)); // the logoff's answer, if it is sent
+        t.clearWritten();
+        conn.close();
+        const sent = cast(const(ubyte)[]) t.written;
+        assert(sent.canFind([cast(ubyte) MessageType.function_, cast(ubyte) FunctionCode.rollback]));
+        const logoff = sent.canFind([
+            cast(ubyte) MessageType.function_, cast(ubyte) FunctionCode.logoff
+        ]);
+        assert(logoff == !rollbackFails, rollbackFails ? "logoff after a failed rollback" : "no logoff");
+        assert(!conn.isOpen);
+    }
+}
+
+// A session-fatal error (ORA-00028) closes the connection; other server errors leave it usable (#75)
+@safe unittest
+{
+    auto t = new MockTransport;
+    auto conn = Connection.scripted(t);
+    t.feed(errorResponse(942));
+    bool thrown;
+    try
+        conn.exec("DELETE FROM missing");
+    catch (ServerException e)
+        thrown = !e.sessionLost;
+    assert(thrown && conn.isOpen);
+    t.feed(errorResponse(28));
+    thrown = false;
+    try
+        conn.exec("DELETE FROM t");
+    catch (ServerException e)
+        thrown = e.sessionLost;
+    assert(thrown && !conn.isOpen);
+}
+
+// A session-fatal error in a pipeline run one by one (servers before 23ai) ends it too, also with continueOnError
+// (#75)
+@safe unittest
+{
+    foreach (continueOnError; [true, false])
+    {
+        auto t = new MockTransport;
+        auto conn = Connection.scripted(t);
+        t.feed(errorResponse(28));
+        bool thrown;
+        try
+            conn.pipeline().exec("UPDATE t SET a = 1").exec("UPDATE t SET a = 2").run(continueOnError);
+        catch (ServerException e)
+            thrown = e.code == 28;
+        assert(thrown && !conn.isOpen);
+    }
+}
+
+// A session-fatal answer in a pipeline (23ai) ends the pipeline: run() throws it (also with continueOnError) and
+// the connection is closed (#75)
+@safe unittest
+{
+    foreach (continueOnError; [true, false])
+    {
+        auto t = new MockTransport;
+        auto conn = Connection.scripted(t);
+        conn.tns.endOfResponse = true; // pipelining
+        assert(conn.supportsPipelining);
+        TtcWriter ok;
+        putError(ok, 0, 1, null, 1);
+        ok.u8(MessageType.endOfResponse);
+        t.feed(endOfResponsePacket(ok.data)); // the INSERT: one row
+        TtcWriter killed;
+        putError(killed, 28, 2, "ORA-00028: your session has been killed");
+        killed.u8(MessageType.endOfResponse);
+        t.feed(endOfResponsePacket(killed.data)); // then the server closes
+        auto p = conn.pipeline().exec("INSERT INTO t VALUES (1)").exec("UPDATE t SET a = 2").exec("DELETE FROM t");
+        bool thrown;
+        try
+            p.run(continueOnError);
+        catch (ServerException e)
+            thrown = e.code == 28;
+        assert(thrown && !conn.isOpen);
+    }
 }
 
 // A failed fetch in a pipeline (run one by one on servers before 23ai) frees the connection

@@ -6,6 +6,22 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- `close()` rolls back an open transaction before logging off: the logoff
+  committed it, so abandoning a transaction after an error (a deadlock, say)
+  by closing the connection committed its earlier statements (#74). If the
+  rollback fails, the socket is closed without a logoff.
+- A session-fatal error (`ServerException.sessionLost`: ORA-00028 killed,
+  ORA-01012 not logged on, ORA-03113 end of file, instance shutdown, ...)
+  closes the connection, so the pool no longer hands it out again; every later
+  call failed (#75). In a pipeline such an error ends the pipeline, also with
+  `continueOnError`, and `run()` throws it.
+
+### Added
+
+- `ServerException.sessionLost`: whether the error means the session is gone.
+
 ## 0.4.3 — 2026-11-23
 
 `io` and `io_mode` given together (keys in any case): the modes are compared,

@@ -139,6 +139,97 @@ void testTransactions()
     dropTable(conn, "itest_tx");
 }
 
+/// close() rolls an open transaction back: the server's logoff would commit it (#74).
+void testCloseRollsBack()
+{
+    auto other = connectToServer();
+    scope (exit)
+        other.close();
+    dropTable(other, "itest_close");
+    other.exec("CREATE TABLE itest_close (id NUMBER)");
+    scope (exit)
+        dropTable(other, "itest_close");
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close(); // after a failure: a lock left would hide it (closing again does nothing)
+    conn.exec("INSERT INTO itest_close VALUES (1)"); // not committed
+    enforce(conn.inTransaction, "in a transaction");
+    conn.close();
+    enforce(scalar(other, "SELECT COUNT(*) FROM itest_close") == "0", "close() committed the open transaction");
+}
+
+/// A session killed without IMMEDIATE: the next call gets ORA-00028 and the connection is closed, also in a
+/// pool, which then opens a new one (#75). Needs ALTER SYSTEM and SELECT on V$SESSION (granted in CI); skipped
+/// without them.
+void testKilledSession()
+{
+    import std.stdio : writeln;
+
+    auto killer = connectToServer();
+    scope (exit)
+        killer.close();
+    // the victim's SID and SERIAL#: needs SELECT on V$SESSION
+    string sessionOf(Connection conn)
+    {
+        return scalar(conn, "SELECT SID || ',' || SERIAL# FROM v$session "
+                ~ "WHERE sid = SYS_CONTEXT('USERENV', 'SID')");
+    }
+
+    bool kill(string session)
+    {
+        auto e = collectException!ServerException(killer.exec("ALTER SYSTEM KILL SESSION '" ~ session ~ "'"));
+        if (e is null || e.code == 31) // ORA-00031: marked for kill, killed at its next call
+            return true;
+        enforce(e.code == 1031, e.msg); // insufficient privileges: skip
+        return false;
+    }
+
+    auto victim = connectToServer();
+    scope (exit)
+        victim.close();
+    string session;
+    if (auto e = collectException!ServerException(session = sessionOf(victim)))
+    {
+        writeln("  (skipped: no SELECT on V$SESSION: ", e.msg, ")");
+        return;
+    }
+    if (!kill(session))
+    {
+        writeln("  (skipped: no ALTER SYSTEM privilege)");
+        return;
+    }
+    // a plain call gets ORA-00028 (also on 23ai, which closes a pipelined connection without an answer, below)
+    auto e = collectException!ServerException(scalar(victim, "SELECT 1 FROM dual"));
+    enforce(e !is null && e.sessionLost, e is null ? "no error after the kill" : e.msg);
+    enforce(!victim.isOpen, "the connection stays open after its session was killed");
+
+    // the same in a pipeline, which it ends also with continueOnError: 23ai closes the connection without an
+    // answer (ConnectionException), servers that answer with ORA-00028 throw that (sessionLost)
+    auto piped = connectToServer();
+    scope (exit)
+        piped.close();
+    enforce(kill(sessionOf(piped)), "killing the pipeline's session");
+    auto ended = collectException!DbException(piped.pipeline().exec("BEGIN NULL; END;")
+            .query("SELECT 1 FROM dual").run(true));
+    auto asServer = cast(ServerException) ended;
+    enforce(ended !is null && (asServer is null || asServer.sessionLost), ended is null ? "no error" : ended.msg);
+    enforce(!piped.isOpen, "the pipeline's connection stays open after its session was killed");
+
+    auto pool = new ConnectionPool(serverDsn("pool_max=1"));
+    scope (exit)
+        pool.close();
+    {
+        auto c = pool.lockConnection();
+        enforce(kill(sessionOf(c)), "killing the pooled session");
+        enforce(collectException!ServerException(scalar(c, "SELECT 1 FROM dual")) !is null, "error after the kill");
+    }
+    enforce(pool.idleConnections == 0, "the pool kept the connection of a killed session");
+    {
+        auto c = pool.lockConnection();
+        enforce(scalar(c, "SELECT 1 FROM dual") == "1", "a new connection works");
+    }
+}
+
 /// With `auto_commit`, every statement is committed at once.
 void testAutoCommit()
 {
