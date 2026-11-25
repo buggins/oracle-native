@@ -4,7 +4,12 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.5.0 — 2026-11-25
+
+Ending a session safely: `close()` rolls back an open transaction instead of
+committing it at logoff (#74), and a session-fatal error closes the connection,
+so the pool drops it (#75). New `ServerException.sessionLost`; a pipeline now
+stops at such an error also with `continueOnError`, hence a minor release.
 
 ### Fixed
 
