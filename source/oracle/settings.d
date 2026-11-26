@@ -257,6 +257,23 @@ struct ConnectionOptions
     so this limits the statement time.
     +/
     Duration receiveTimeout;
+    /++
+    Maximum time a call (one round trip: an execution, a fetch, a commit) may
+    wait for the server's response, summed over its reads, so the transfer of
+    a large response counts too (like OCI's call timeout); in seconds (`1.5`),
+    while python-oracledb's `call_timeout` is in milliseconds. `Duration.zero`
+    (the default): no limit. The login and pipelines aren't covered. When it
+    runs out, the call is cancelled (as
+    `Connection.cancel` does) and the server's ORA-01013 is thrown as a
+    `StatementTimeoutException`; the connection stays usable, and an open
+    transaction stays open. A call that ended before the server saw the cancel
+    keeps its result. If the server doesn't answer the cancel within 5 seconds
+    (the cancel can't interrupt some waits, e.g. for a row lock), the
+    connection is closed (`ConnectionException`) and the server rolls back the
+    open transaction. Unlike `receiveTimeout`, which closes the connection at
+    once, this keeps the connection where the server can stop the call (#76).
+    +/
+    Duration callTimeout;
 
     /++
     The directory with `tnsnames.ora`, for connect aliases (`parse("SALES")`);
@@ -548,7 +565,7 @@ struct ConnectionOptions
     `program`, `machine`, `osuser`, `terminal`, `time_zone`, `sdu`,
     `auto_commit` (flag), `fetch_size`, `statement_cache_size`, `lob_locators` (flag),
     `connect_timeout`, `transport_connect_timeout`, `send_timeout`,
-    `receive_timeout` (seconds), `host_selection` (`in_order`, `random`,
+    `receive_timeout`, `call_timeout` (seconds), `host_selection` (`in_order`, `random`,
     `round_robin`), `load_balance` (flag), `io_mode` or `io` (`auto`, `phobos`, `vibe`;
     both keys, in any case, may be given only with the same mode),
     `config_dir` (where `tnsnames.ora` is).
@@ -709,6 +726,9 @@ struct ConnectionOptions
                 break;
             case "receive_timeout":
                 o.receiveTimeout = parseSeconds(key, value);
+                break;
+            case "call_timeout":
+                o.callTimeout = parseSeconds(key, value);
                 break;
             case "host_selection":
                 o.hostSelection = parseEnumValue!HostSelection(key, value);
@@ -953,11 +973,14 @@ private string quoteValue(string v) @safe pure
 ///
 @safe unittest
 {
+    import core.time : msecs;
+
     auto o = ConnectionOptions.parse("oracle://scott:ti%40ger@db1:1522,db2/ORCLPDB?connect_timeout=5&time_zone=UTC");
     assert(o.user == "scott" && o.password == "ti@ger" && o.serviceName == "ORCLPDB");
     assert(o.endpoints == [HostPort("db1", 1522), HostPort("db2", 1521)]);
     assert(o.connectTimeout == 5.seconds && o.sessionTimeZone == "UTC");
     assert(ConnectionOptions.parse("oracle://db/ORCL?connect_timeout=0").connectTimeout == Duration.zero);
+    assert(ConnectionOptions.parse("oracle://db/ORCL?call_timeout=1.5").callTimeout == 1500.msecs);
 
     o = ConnectionOptions.parse("tcps://db.example.com/sales:dedicated/inst2?tls_ca_file=ca.pem");
     assert(o.secure && o.endpoints == [HostPort("db.example.com", 2484)] && o.serviceName == "sales");

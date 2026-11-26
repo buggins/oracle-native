@@ -51,7 +51,8 @@ Features:
   older servers);
 - bind variables (`:1`, `:name`, or `?`), a statement cache, array DML with
   batch errors, `RETURNING INTO`, PL/SQL with OUT parameters, REF cursors,
-  implicit results, cancellation, transactions (explicit, or auto-commit);
+  implicit results, cancellation, a call timeout that keeps the connection
+  (`call_timeout`), transactions (explicit, or auto-commit);
 - the common types, read and sent exactly: `NUMBER` (as exact decimals),
   `BINARY_FLOAT`/`BINARY_DOUBLE`, `VARCHAR2`/`CHAR`/`NVARCHAR2`/`NCHAR`,
   `RAW`, `DATE`, `TIMESTAMP` (with its nanoseconds, time zone offsets and
@@ -122,7 +123,13 @@ before 21c get the text.
 Statements are kept parsed per connection (option `statement_cache_size`,
 default 20) and run again with new values only. `Connection.cancel` (from
 another thread or task; for a fiber-mode connection, a task of its own
-thread) stops a running call with ORA-01013.
+thread) stops a running call with ORA-01013. The server checks for it while
+it works, not while it waits for a lock or in `DBMS_SESSION.SLEEP`; a call that
+ends before the server sees the cancel keeps its result. The option
+`call_timeout` (seconds) cancels a call (one round trip, its transfer
+included) that waits longer for the server, and
+throws `StatementTimeoutException` (ORA-01013); if the server can't stop the
+call within 5 more seconds, the connection is closed.
 
 ## Pipelines
 

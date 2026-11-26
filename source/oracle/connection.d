@@ -27,6 +27,7 @@ import dbwire.io.buffer : BufferedReader, StringArena;
 import dbwire.io.transport : Transport;
 import dbwire.tls.transport : TlsContext, TlsOptions, TlsTransport;
 import core.thread : Thread;
+import core.time : Duration, MonoTime;
 import oracle.exception;
 import oracle.protocol.auth;
 import oracle.protocol.execute;
@@ -88,6 +89,11 @@ final class Connection : Poolable
     private IoLock writeLock; // writes from cancel() and the calls
     private shared bool cancelPending; // an INTERRUPT was sent and its ORA-01013 not yet read
     private bool inCall; // a request is sent or its response not yet read (`guarded` is running)
+    private bool callRunning; // a call (after the login) is sent and its response being read: the call timeout applies
+    private bool timedOut; // the call timeout sent the INTERRUPT of the current call
+    private bool awaitingAck; // the call timeout ran out with an INTERRUPT pending: the server's answer is due
+    private Duration timeoutLeft; // what is left of the call timeout for the current call
+    private Duration ackLeft; // after the call timeout: what is left of the 5 seconds for the server's answer
     private Thread owner; // fiber mode: the thread the connection belongs to
     package ulong lease; // counts the times a pool handed the connection out; LOBs of an earlier lease are refused
     private TlsOptions tlsOptions; // options.effectiveTls(), read once when connecting
@@ -150,6 +156,7 @@ final class Connection : Poolable
             writeLock = backend.newLock();
             transport = t;
             tns = new TnsStream(t);
+            tns.beforeRead = &awaitResponseData;
             tns.largeLengths = true;
             reader = TtcReader(new BufferedReader(tns), new StringArena);
             negotiatedFieldVersion = serverFieldVersion = fieldVersion;
@@ -559,23 +566,32 @@ final class Connection : Poolable
     thread than its own (its socket belongs to that thread's event loop).
 
     Like every client's cancel, it races with the end of the call: a cancel
-    that arrives after the call ended interrupts nothing, and the next call
-    first reads the server's answer to it.
+    that arrives after the call ended interrupts nothing, the call returns its
+    result, and the server's answer to the cancel is dropped (#76). It does
+    nothing either while an earlier cancel is not yet answered. The server
+    checks for a cancel while it works, not while it waits for a lock or in
+    `DBMS_SESSION.SLEEP`: such a call goes on until the wait ends.
     +/
     void cancel() @safe nothrow
     {
-        import core.atomic : atomicStore;
+        sendInterrupt();
+    }
+
+    /// Sends an INTERRUPT; returns whether this call sent it (not: nothing to cancel, or it couldn't be sent).
+    private bool sendInterrupt() @safe nothrow
+    {
+        import core.atomic : atomicLoad, atomicStore;
 
         if (writeLock is null || !onOwnerThread)
-            return;
+            return false;
         try
         {
             // under the lock that `call` takes to check for a pending cancel and send its request
             writeLock.lock();
             scope (exit)
                 writeLock.unlock();
-            if ((state != State.busy && !inCall) || tns.inPipeline)
-                return;
+            if ((state != State.busy && !inCall) || tns.inPipeline || atomicLoad(cancelPending))
+                return false; // nothing running, or already cancelled (a second INTERRUPT would get a second answer)
             atomicStore(cancelPending, true);
             try
                 tns.sendMarker(MarkerType.interrupt);
@@ -585,12 +601,63 @@ final class Connection : Poolable
                 // (not a stream the next call's packet would follow)
                 atomicStore(cancelPending, false);
                 transport.close();
+                return false;
             }
+            return true;
         }
         catch (Exception)
         {
-            // the lock failed: nothing was sent
+            return false; // the lock failed: nothing was sent
         }
+    }
+
+    /++
+    Before each read of the server's data during a call: with a call timeout,
+    waits for data within what is left of it (the waits of one call are
+    summed). When it runs out, sends an INTERRUPT (ORA-01013 is then thrown as
+    a `StatementTimeoutException`, unless the call had ended already) and gives
+    the server's answer 5 seconds of waits; if it doesn't come, the connection
+    is lost. A cancel already sent through `cancel()` keeps its own handling
+    (its ORA-01013 stays a `ServerException`), but its answer gets the same 5
+    seconds (#76).
+    +/
+    private void awaitResponseData() @safe
+    {
+        import core.atomic : atomicLoad;
+        import core.time : seconds;
+
+        if (options.callTimeout <= Duration.zero || !callRunning || tns.inPipeline)
+            return;
+        if (!awaitingAck)
+        {
+            if (waitWithin(timeoutLeft))
+                return;
+            if (sendInterrupt())
+                timedOut = true;
+            else if (!atomicLoad(cancelPending)) // (a cancel already pending: its answer gets the 5 seconds)
+                throw new ConnectionException("The call ran into the call timeout, and the cancel couldn't be sent");
+            awaitingAck = true;
+            ackLeft = 5.seconds;
+        }
+        if (!waitWithin(ackLeft))
+        {
+            enum noAnswer = "the server didn't answer the cancel within 5 seconds";
+            throw new ConnectionException(timedOut ? "The call ran into the call timeout, and " ~ noAnswer
+                    : "The call timeout ran out after a cancel, and " ~ noAnswer);
+        }
+    }
+
+    /// Waits for the server's data within `budget`; subtracts the time waited from it.
+    private bool waitWithin(ref Duration budget) @safe
+    {
+        import dbwire.io.backend : waitForData;
+
+        if (budget <= Duration.zero)
+            return tns.transport.dataAvailable();
+        const start = MonoTime.currTime;
+        scope (exit)
+            budget -= MonoTime.currTime - start;
+        return waitForData(tns.transport, budget, backend);
     }
 
     /// Commits the transaction.
@@ -1662,6 +1729,7 @@ final class Connection : Poolable
     {
         import core.atomic : atomicLoad;
 
+        callRunning = false; // (a pending cancel's answer, read below, isn't this call's)
         const closeCursors = cursorsToClose.length && !sessionReleased; // released: they may be another session's
         ubyte[] request;
         if (closeCursors || endToEnd.changed)
@@ -1693,6 +1761,10 @@ final class Connection : Poolable
                 scope (exit)
                     writeLock.unlock();
                 tns.sendData(request);
+                callRunning = inCall; // not the login's calls (`connectTo` runs outside `guarded`)
+                timedOut = false;
+                awaitingAck = false;
+                timeoutLeft = options.callTimeout;
                 return;
             }
             writeLock.unlock();
@@ -1703,9 +1775,15 @@ final class Connection : Poolable
     /++
     After a cancel: the server answers every INTERRUPT with a reset and an
     ORA-01013 error, which may come after the response of the call it
-    interrupted. Reads it, unless the response just read was it.
+    interrupted. Reads it, unless the response just read was it. With
+    `inResponse`, `response` is the call's response: one that ended without
+    the reset is complete (the call ran to its end before the server saw the
+    cancel). With `keepResponse` it is returned and the ORA-01013 that follows
+    is dropped (#76); otherwise (a user's cancel of a query with rows left)
+    the ORA-01013 is returned, so the query stops.
     +/
-    private ErrorInfo finishCancel(ErrorInfo response = ErrorInfo.init, bool inResponse = false) @safe
+    private ErrorInfo finishCancel(ErrorInfo response = ErrorInfo.init, bool inResponse = false,
+            bool keepResponse = false) @safe
     {
         import core.atomic : atomicStore;
 
@@ -1720,6 +1798,11 @@ final class Connection : Poolable
                 auto e = readErrorInfo(reader, serverFieldVersion);
                 checkResponseEnd();
                 tns.takeBreak();
+                if (inResponse && keepResponse)
+                {
+                    timedOut = false; // the call's result counts: no timeout either
+                    return response;
+                }
                 return e;
             }
             if (type == MessageType.status)
@@ -1814,16 +1897,27 @@ final class Connection : Poolable
                 reader.ub2(); // end-to-end sequence number
                 lastCallStatus = e.callStatus;
                 checkResponseEnd();
-                return atomicLoad(cancelPending) ? finishCancel(e, true) : e;
+                return atomicLoad(cancelPending) ? finishCancel(e, true, keepAfterCancel(result, e)) : e;
             case MessageType.error:
                 auto e = readErrorInfo(reader, serverFieldVersion);
                 lastCallStatus = e.callStatus;
                 checkResponseEnd();
-                return atomicLoad(cancelPending) ? finishCancel(e, true) : e;
+                return atomicLoad(cancelPending) ? finishCancel(e, true, keepAfterCancel(result, e)) : e;
             default:
                 throw new ProtocolException("Unexpected message type " ~ to!string(type) ~ " in the server's response");
             }
         }
+    }
+
+    /++
+    Whether a call's complete response counts although a cancel followed it:
+    always for the call timeout's cancel (the round trip ended in time), and
+    for a user's cancel unless the response leaves rows of a query to fetch
+    (the cancel then stops the query, as it would have a moment earlier).
+    +/
+    private bool keepAfterCancel(const QueryResult result, const ref ErrorInfo e) const @safe pure nothrow @nogc
+    {
+        return timedOut || result is null || !result.isQuery || e.number != 0;
     }
 
     /// A result for a child cursor (implicit result, REF cursor).
@@ -1929,6 +2023,11 @@ final class Connection : Poolable
 
     private void throwIfError(const ErrorInfo e) @safe
     {
+        if (e.number == 1013 && timedOut)
+        {
+            timedOut = false;
+            throw new StatementTimeoutException(e.message, options.callTimeout.toString());
+        }
         if (e.number != 0)
             throw new ServerException(e.number, e.message, e.position);
     }
@@ -1972,6 +2071,7 @@ final class Connection : Poolable
         scope (exit)
         {
             inCall = false;
+            callRunning = false;
             if (!usable) // any other exception, or an Error: the stream is in an unknown state
             {
                 state = State.closed;
@@ -2134,6 +2234,7 @@ final class Connection : Poolable
         {
             transport = open(endpoint);
             tns = new TnsStream(transport);
+            tns.beforeRead = &awaitResponseData;
             tns.writePackets(buildConnect(connectData, options.sdu, TnsVersion.endOfResponse, connectFlags));
             auto p = tns.readPacket();
             foreach (resend; 0 .. 10)
@@ -2423,6 +2524,7 @@ private uint processId() @safe nothrow
 version (unittest)
 {
     import dbwire.io.mock : MockTransport;
+    import dbwire.io.transport : WaitableTransport;
     import oracle.protocol.scripted;
 
     // A transport over a MockTransport that can refuse writes and run a hook before each read.
@@ -2820,6 +2922,211 @@ version (unittest)
     assert(conn.isSessionReleased && conn.endToEnd.changed == 0b11111);
     conn.clearEndToEnd();
     assert(conn.clientIdentifier is null);
+}
+
+version (unittest)
+{
+    // A MARKER packet (4-byte length) of `type`.
+    private ubyte[] markerPacket(MarkerType type) @safe pure nothrow
+    {
+        auto p = new ubyte[11];
+        p[3] = 11;
+        p[4] = PacketType.marker;
+        p[8] = 1;
+        p[10] = type;
+        return p;
+    }
+
+    private enum TimeoutMode
+    {
+        answers, // the INTERRUPT stops the call: reset, then ORA-01013
+        silent, // never answers
+        finishedFirst, // the call's complete response, then the reset and ORA-01013
+        userCancel, // the user cancels before the call timeout runs out
+    }
+
+    // A server silent until it gets an INTERRUPT, which it answers as `mode` says; waits return at once
+    private final class TimeoutServer : Transport, WaitableTransport
+    {
+        import core.time : Duration;
+
+        MockTransport mock;
+        TimeoutMode mode;
+        void delegate() @safe userCancel; // TimeoutMode.userCancel: called on the first wait
+
+        this() @safe
+        {
+            mock = new MockTransport;
+        }
+
+        override size_t read(scope ubyte[] b) @safe
+        {
+            return mock.read(b);
+        }
+
+        override void write(scope const(ubyte)[] data) @safe
+        {
+            mock.write(data);
+            if (data.length < 11 || data[4] != PacketType.marker || data[10] != MarkerType.interrupt)
+                return;
+            final switch (mode)
+            {
+            case TimeoutMode.answers:
+            case TimeoutMode.userCancel:
+                mock.feed(markerPacket(MarkerType.reset));
+                mock.feed(errorResponse(1013));
+                break;
+            case TimeoutMode.silent:
+                break;
+            case TimeoutMode.finishedFirst:
+                TtcWriter w;
+                putError(w, 0, 1, null, 1, 0x02); // an UPDATE: one row, in a transaction
+                mock.feed(dataPacket(w.data));
+                mock.feed(markerPacket(MarkerType.reset));
+                mock.feed(errorResponse(1013));
+                break;
+            }
+        }
+
+        override bool dataAvailable() @safe
+        {
+            return mock.dataAvailable;
+        }
+
+        override void close() @safe nothrow
+        {
+            mock.close();
+        }
+
+        override bool connected() const @safe nothrow
+        {
+            return mock.connected;
+        }
+
+        override void setTimeouts(Duration receive, Duration send) @safe
+        {
+        }
+
+        @property bool canWaitForData() @safe
+        {
+            return true;
+        }
+
+        bool waitForData(Duration timeout) @safe
+        {
+            cast(void) timeout; // nothing arrives while waiting
+            if (userCancel !is null)
+            {
+                auto cancel = userCancel;
+                userCancel = null;
+                cancel(); // answered at once; this wait still runs out
+                return false;
+            }
+            return mock.dataAvailable;
+        }
+    }
+}
+
+// The call timeout cancels the call: ORA-01013 becomes StatementTimeoutException and the connection stays usable;
+// a call that ended first keeps its result; a user's cancel stays a plain ORA-01013; no answer closes (#76)
+@safe unittest
+{
+    import core.time : msecs;
+    import std.exception : collectException;
+    import std.traits : EnumMembers;
+
+    foreach (mode; [EnumMembers!TimeoutMode])
+    {
+        auto t = new TimeoutServer;
+        t.mode = mode;
+        ConnectionOptions o;
+        o.callTimeout = 1.msecs;
+        auto conn = Connection.scripted(t, scriptedFieldVersion, o);
+        if (mode == TimeoutMode.userCancel)
+            t.userCancel = &conn.cancel;
+        final switch (mode)
+        {
+        case TimeoutMode.answers:
+            const e = collectException!StatementTimeoutException(conn.exec("UPDATE t SET n = 1"));
+            assert(e !is null && e.code == 1013);
+            break;
+        case TimeoutMode.silent:
+            assert(collectException!ConnectionException(conn.exec("UPDATE t SET n = 1")) !is null);
+            assert(!conn.isOpen);
+            continue;
+        case TimeoutMode.finishedFirst:
+            assert(conn.exec("UPDATE t SET n = 1") == 1); // the update ran: no timeout
+            assert(conn.inTransaction);
+            break;
+        case TimeoutMode.userCancel:
+            const e = collectException!ServerException(conn.exec("UPDATE t SET n = 1"));
+            assert(e !is null && e.code == 1013 && cast(const(StatementTimeoutException)) e is null);
+            break;
+        }
+        assert(conn.isOpen && !conn.isBusy && !conn.cancelPending);
+        t.mock.feed(errorResponse(0));
+        conn.exec("UPDATE t SET n = 2");
+    }
+}
+
+// A cancel that reaches the server after the call's response: the response counts, its ORA-01013 is dropped (#76)
+@safe unittest
+{
+    auto t = new HookTransport;
+    auto conn = Connection.scripted(t);
+    TtcWriter w;
+    putError(w, 0, 1, null, 1, 0x02); // an UPDATE: one row, in a transaction
+    t.mock.feed(dataPacket(w.data));
+    t.mock.feed(markerPacket(MarkerType.reset));
+    t.mock.feed(errorResponse(1013));
+    t.beforeRead = &conn.cancel; // sent while the response is on its way
+    assert(conn.exec("UPDATE t SET n = 1") == 1);
+    assert(conn.inTransaction && conn.isOpen && !conn.cancelPending);
+    t.mock.feed(errorResponse(0));
+    conn.exec("COMMIT");
+}
+
+// A user's cancel after a query's first batch: with rows left the query stops (ORA-01013); with all rows read,
+// the rows count (#76)
+@safe unittest
+{
+    import std.exception : collectException;
+
+    foreach (more; [true, false])
+    {
+        auto t = new HookTransport;
+        auto conn = Connection.scripted(t);
+        t.mock.feed(queryResponse(2, more));
+        t.mock.feed(markerPacket(MarkerType.reset));
+        t.mock.feed(errorResponse(1013));
+        t.beforeRead = &conn.cancel;
+        size_t rows;
+        const e = collectException!ServerException({
+            foreach (row; conn.query("SELECT n FROM t"))
+                rows++;
+        }());
+        if (more)
+            assert(e !is null && e.code == 1013 && rows == 0);
+        else
+            assert(e is null && rows == 2);
+        assert(conn.isOpen && !conn.isBusy && !conn.cancelPending);
+    }
+}
+
+// The call timeout doesn't apply outside `guarded` (the login's calls in `connectTo`) (#76)
+@system unittest
+{
+    import core.time : msecs;
+
+    auto t = new TimeoutServer;
+    t.mode = TimeoutMode.silent;
+    ConnectionOptions o;
+    o.callTimeout = 1.msecs;
+    auto conn = Connection.scripted(t, scriptedFieldVersion, o);
+    conn.call(seq => buildBareCall(FunctionCode.ping, seq, conn.negotiatedFieldVersion));
+    assert(!conn.callRunning);
+    conn.awaitResponseData(); // no wait, no INTERRUPT
+    assert(!conn.cancelPending && conn.isOpen);
 }
 
 // cancel() does nothing while a pipeline's requests are in flight (its answer would be taken for theirs)

@@ -4,6 +4,34 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `call_timeout` (`ConnectionOptions.callTimeout`, in seconds): how long a
+  call (one round trip) may wait for the server, summed over its reads (the
+  transfer of a large response counts too); not for the login and pipelines.
+  When it runs
+  out, the call is cancelled and the server's ORA-01013 is thrown as a
+  `StatementTimeoutException` (a `ServerException`, `code` 1013); the
+  connection stays usable, and an open transaction stays open. A call that
+  ended before the server saw the cancel keeps its result. The server can't
+  interrupt some waits (a row lock, `DBMS_SESSION.SLEEP`): if it doesn't
+  answer within 5 seconds, the connection is closed and the server rolls back
+  the open transaction (#76).
+
+### Fixed
+
+- A cancel that reached the server after the call had ended turned the
+  call's result into ORA-01013: an UPDATE waiting for a row lock, cancelled,
+  then run when the lock was released (and committed with `auto_commit`)
+  threw ORA-01013 and lost its row count. The call's complete response is
+  returned now, and the ORA-01013 that follows is dropped; only a query with
+  rows left to fetch still stops with ORA-01013 (#76).
+- `cancel()` called again before the server answered sent a second
+  interrupt, whose answer the next call could take for its own; it does
+  nothing now while a cancel is pending (#76).
+
 ## 0.5.0 — 2026-11-25
 
 Ending a session safely: `close()` rolls back an open transaction instead of

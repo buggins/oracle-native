@@ -13,6 +13,7 @@ import oracle : ConnectionPool, PoolOptions, ServerException;
 immutable TestCase[] threadTests = [
     TestCase("thread: one connection per thread", &testThreads, true),
     TestCase("thread: cancel from another thread", &testCancelFromThread, true),
+    TestCase("thread: a cancel during a lock wait doesn't hide the result", &testCancelLockWait, true),
     TestCase("thread: a pool shared by threads", &testPoolThreads, true),
 ];
 
@@ -90,6 +91,46 @@ void testCancelFromThread()
         racer.join();
         enforce(scalar(conn, "SELECT 'ok' FROM dual") == "ok", "in step after a racing cancel");
     }
+}
+
+/++
+A cancel during a row-lock wait: the server can't interrupt the wait, the
+lock holder commits, and the UPDATE runs. Its row count comes back, and the
+ORA-01013 that follows is dropped (#76).
++/
+void testCancelLockWait()
+{
+    import core.time : msecs;
+    import std.exception : collectException;
+    import integrationtests.server : dropTable;
+
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    dropTable(conn, "itest_cancel_lock");
+    conn.exec("CREATE TABLE itest_cancel_lock (id NUMBER)");
+    scope (exit)
+        dropTable(conn, "itest_cancel_lock");
+    conn.exec("INSERT INTO itest_cancel_lock VALUES (1)");
+    conn.commit();
+    auto holder = connectToServer();
+    scope (exit)
+        holder.close();
+    holder.exec("UPDATE itest_cancel_lock SET id = 2");
+    auto helper = new Thread({
+        Thread.sleep(500.msecs);
+        conn.cancel(); // the UPDATE waits for the lock
+        Thread.sleep(1000.msecs);
+        holder.commit(); // the lock goes: the UPDATE runs
+    });
+    helper.start();
+    ulong rows;
+    auto e = collectException!ServerException(rows = conn.exec("UPDATE itest_cancel_lock SET id = 3"));
+    helper.join();
+    enforce(e is null, e is null ? "" : "the UPDATE ran, yet: " ~ e.msg);
+    enforce(rows == 1, "row count lost");
+    conn.commit();
+    enforce(scalar(conn, "SELECT id FROM itest_cancel_lock") == "3", "the UPDATE didn't run");
 }
 
 /// Four threads, each with its own connection, run queries at the same time.

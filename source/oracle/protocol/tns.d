@@ -285,6 +285,8 @@ final class TnsStream : Transport
     bool endOfResponse;
     /// Whether a pipeline's responses are read: MARKER packets are skipped (no reset handshake).
     bool inPipeline;
+    /// Called before each read from `transport` (the connection's call timeout waits there), if set.
+    void delegate() @safe beforeRead;
 
     private size_t payloadLeft; // bytes of the current DATA packet not read yet (they are still in the transport)
     private ubyte[] packetBuffer; // DATA packets are built here (the transport doesn't keep them)
@@ -403,6 +405,8 @@ final class TnsStream : Transport
         while (payloadLeft == 0)
             nextDataPacket();
         const want = buffer.length < payloadLeft ? buffer.length : payloadLeft;
+        if (beforeRead !is null)
+            beforeRead();
         const n = transport.read(buffer[0 .. want]);
         if (n == 0)
             throw new ConnectionException("Connection closed by the server");
@@ -523,6 +527,8 @@ final class TnsStream : Transport
         size_t got;
         while (got < dst.length)
         {
+            if (beforeRead !is null)
+                beforeRead();
             const n = transport.read(dst[got .. $]);
             if (n == 0)
                 throw new ConnectionException("Connection closed by the server");

@@ -158,6 +158,49 @@ void testCloseRollsBack()
     enforce(scalar(other, "SELECT COUNT(*) FROM itest_close") == "0", "close() committed the open transaction");
 }
 
+/// The call timeout: a busy call gets ORA-01013 as `StatementTimeoutException`, the connection and its
+/// transaction stay; a lock wait can't be interrupted, so the connection is closed and the server rolls back (#76).
+void testCallTimeout()
+{
+    import core.time : MonoTime, seconds;
+
+    enum busyQuery = "SELECT COUNT(*) FROM all_objects a, all_objects b WHERE ROWNUM < 100000000";
+    auto conn = connectToServer("call_timeout=1");
+    scope (exit)
+        conn.close();
+    enforce(scalar(conn, "SELECT 'quick' FROM dual") == "quick", "a quick call");
+    auto start = MonoTime.currTime;
+    auto e = collectException!StatementTimeoutException(scalar(conn, busyQuery));
+    enforce(e !is null && e.code == 1013, "no timeout");
+    enforce(MonoTime.currTime - start < 5.seconds, "the timeout took too long");
+    enforce(conn.isOpen && scalar(conn, "SELECT 'after' FROM dual") == "after", "unusable after the timeout");
+
+    dropTable(conn, "itest_call_timeout");
+    conn.exec("CREATE TABLE itest_call_timeout (id NUMBER)");
+    scope (exit)
+        dropTable(connectToServer(), "itest_call_timeout");
+    conn.exec("INSERT INTO itest_call_timeout VALUES (1)");
+    enforce(collectException!StatementTimeoutException(scalar(conn, busyQuery)) !is null,
+            "no timeout in the transaction");
+    enforce(conn.inTransaction && scalar(conn, "SELECT COUNT(*) FROM itest_call_timeout") == "1",
+            "the timeout ended the transaction");
+    conn.rollback();
+    enforce(scalar(conn, "SELECT COUNT(*) FROM itest_call_timeout") == "0", "rollback after the timeout");
+
+    // a row lock: the cancel can't interrupt the wait, so the connection is closed after the 5 seconds' grace
+    conn.exec("INSERT INTO itest_call_timeout VALUES (2)");
+    conn.commit();
+    auto holder = connectToServer();
+    scope (exit)
+        holder.close();
+    holder.exec("UPDATE itest_call_timeout SET id = 3");
+    start = MonoTime.currTime;
+    auto lost = collectException!ConnectionException(conn.exec("UPDATE itest_call_timeout SET id = 4"));
+    enforce(lost !is null && !conn.isOpen, "a lock wait didn't close the connection");
+    enforce(MonoTime.currTime - start < 10.seconds, "closing took too long");
+    holder.rollback();
+}
+
 /// A session killed without IMMEDIATE: the next call gets ORA-00028 and the connection is closed, also in a
 /// pool, which then opens a new one (#75). Needs ALTER SYSTEM and SELECT on V$SESSION (granted in CI); skipped
 /// without them.
