@@ -4,22 +4,30 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.6.0 — 2026-11-26
+
+A call timeout that cancels the call and keeps the connection, and a cancel
+that arrives after the call ended no longer hides the call's result (#76);
+dbwire 0.9.10. A minor release: new API.
 
 ### Added
 
 - `call_timeout` (`ConnectionOptions.callTimeout`, in seconds): how long a
   call (one round trip) may wait for the server, summed over its reads (the
   transfer of a large response counts too); not for the login and pipelines.
-  When it runs
-  out, the call is cancelled and the server's ORA-01013 is thrown as a
-  `StatementTimeoutException` (a `ServerException`, `code` 1013); the
-  connection stays usable, and an open transaction stays open. A call that
+  When it runs out, the call is cancelled and the server's ORA-01013 is
+  thrown as a `StatementTimeoutException` (a `ServerException`, `code` 1013);
+  the connection stays usable, and an open transaction stays open. A call that
   ended before the server saw the cancel keeps its result. The server can't
   interrupt some waits: `DBMS_SESSION.SLEEP`, and a row-lock wait on some
   versions (21c and 23ai; 18c interrupts it; 19c not checked). If it doesn't
   answer within 5 seconds, the connection is closed and the server rolls back
   the open transaction (#76).
+
+### Changed
+
+- Requires dbwire `~>0.9.10` (buggins/dbwire#103), so that over TCPS the
+  call timeout sees a response that has already arrived.
 
 ### Fixed
 
