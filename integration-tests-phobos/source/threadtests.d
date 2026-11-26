@@ -13,6 +13,7 @@ import oracle : ConnectionPool, PoolOptions, ServerException;
 immutable TestCase[] threadTests = [
     TestCase("thread: one connection per thread", &testThreads, true),
     TestCase("thread: cancel from another thread", &testCancelFromThread, true),
+    TestCase("thread: a cancel during a lock wait doesn't hide the result", &testCancelLockWait, true),
     TestCase("thread: a pool shared by threads", &testPoolThreads, true),
 ];
 
@@ -89,6 +90,56 @@ void testCancelFromThread()
             enforce(x.code == 1013, x.msg);
         racer.join();
         enforce(scalar(conn, "SELECT 'ok' FROM dual") == "ok", "in step after a racing cancel");
+    }
+}
+
+/++
+A cancel during a row-lock wait. Oracle 21c and 23ai can't interrupt the
+wait (19c not checked): the lock holder commits, and the UPDATE runs. Its row count comes back,
+and the ORA-01013 that follows is dropped (#76). Oracle 18c interrupts the
+wait: ORA-01013, and the UPDATE didn't run. Either way the result matches the
+table.
++/
+void testCancelLockWait()
+{
+    import core.time : msecs;
+    import std.exception : collectException;
+    import integrationtests.server : dropTable;
+
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    dropTable(conn, "itest_cancel_lock");
+    conn.exec("CREATE TABLE itest_cancel_lock (id NUMBER)");
+    scope (exit)
+        dropTable(conn, "itest_cancel_lock");
+    conn.exec("INSERT INTO itest_cancel_lock VALUES (1)");
+    conn.commit();
+    auto holder = connectToServer();
+    scope (exit)
+        holder.close();
+    holder.exec("UPDATE itest_cancel_lock SET id = 2");
+    auto helper = new Thread({
+        Thread.sleep(500.msecs);
+        conn.cancel(); // the UPDATE waits for the lock
+        Thread.sleep(1000.msecs);
+        holder.commit(); // the lock goes: the UPDATE runs
+    });
+    helper.start();
+    ulong rows;
+    auto e = collectException!ServerException(rows = conn.exec("UPDATE itest_cancel_lock SET id = 3"));
+    helper.join();
+    if (e is null)
+    {
+        enforce(rows == 1, "row count lost");
+        conn.commit();
+        enforce(scalar(conn, "SELECT id FROM itest_cancel_lock") == "3", "the UPDATE didn't run");
+    }
+    else
+    {
+        enforce(e.code == 1013, "the UPDATE failed: " ~ e.msg);
+        // tells an interrupted wait from an UPDATE that ran and then got the cancel's late ORA-01013
+        enforce(scalar(conn, "SELECT id FROM itest_cancel_lock") == "2", "the UPDATE ran, yet: " ~ e.msg);
     }
 }
 

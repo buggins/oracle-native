@@ -1,5 +1,6 @@
 /++
-Exceptions: `ServerException` for errors reported by Oracle (`ORA-nnnnn`), and
+Exceptions: `ServerException` for errors reported by Oracle (`ORA-nnnnn`),
+`StatementTimeoutException` for calls stopped by the call timeout, and
 dbwire's `ClientException`, `ConnectionException` and `ProtocolException`.
 
 Copyright: Copyright © 2026, Vadim Lopatin
@@ -59,6 +60,32 @@ class ServerException : DbException
     assert(!new ServerException(60, "ORA-00060: deadlock detected while waiting for resource").sessionLost);
     assert(!new ServerException(942, "").sessionLost);
     assert(!new ServerException(31, "ORA-00031: session marked for kill").sessionLost); // the killer's answer
+}
+
+/++
+A call ran into `ConnectionOptions.callTimeout`: the client cancelled it, and
+the server stopped it with ORA-01013 (`code` 1013). The connection stays
+usable, and an open transaction stays open with the work done before the call
+(#76).
++/
+class StatementTimeoutException : ServerException
+{
+    /// Creates the exception from the server's ORA-01013 text and the timeout.
+    this(string message, string timeout, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+    {
+        import std.string : stripRight;
+
+        super(1013, (message.length ? message.stripRight
+                : "ORA-01013") ~ " (the call timeout of " ~ timeout
+                ~ " ran out)", -1, file, line);
+    }
+}
+
+@safe pure nothrow unittest
+{
+    const e = new StatementTimeoutException("ORA-01013: user requested cancel of current operation\n", "2 secs");
+    assert(e.code == 1013 && !e.sessionLost);
+    assert(e.msg == "ORA-01013: user requested cancel of current operation (the call timeout of 2 secs ran out)");
 }
 
 private string codeText(int code) @safe pure nothrow
