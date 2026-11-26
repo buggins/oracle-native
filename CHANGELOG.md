@@ -16,7 +16,8 @@ All notable changes to oracle-native are documented here. The format follows
   `StatementTimeoutException` (a `ServerException`, `code` 1013); the
   connection stays usable, and an open transaction stays open. A call that
   ended before the server saw the cancel keeps its result. The server can't
-  interrupt some waits (a row lock, `DBMS_SESSION.SLEEP`): if it doesn't
+  interrupt some waits: `DBMS_SESSION.SLEEP`, and a row-lock wait on some
+  versions (21c and 23ai; 18c interrupts it; 19c not checked). If it doesn't
   answer within 5 seconds, the connection is closed and the server rolls back
   the open transaction (#76).
 

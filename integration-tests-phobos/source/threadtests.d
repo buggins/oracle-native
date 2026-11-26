@@ -94,9 +94,11 @@ void testCancelFromThread()
 }
 
 /++
-A cancel during a row-lock wait: the server can't interrupt the wait, the
-lock holder commits, and the UPDATE runs. Its row count comes back, and the
-ORA-01013 that follows is dropped (#76).
+A cancel during a row-lock wait. Oracle 21c and 23ai can't interrupt the
+wait (19c not checked): the lock holder commits, and the UPDATE runs. Its row count comes back,
+and the ORA-01013 that follows is dropped (#76). Oracle 18c interrupts the
+wait: ORA-01013, and the UPDATE didn't run. Either way the result matches the
+table.
 +/
 void testCancelLockWait()
 {
@@ -127,10 +129,18 @@ void testCancelLockWait()
     ulong rows;
     auto e = collectException!ServerException(rows = conn.exec("UPDATE itest_cancel_lock SET id = 3"));
     helper.join();
-    enforce(e is null, e is null ? "" : "the UPDATE ran, yet: " ~ e.msg);
-    enforce(rows == 1, "row count lost");
-    conn.commit();
-    enforce(scalar(conn, "SELECT id FROM itest_cancel_lock") == "3", "the UPDATE didn't run");
+    if (e is null)
+    {
+        enforce(rows == 1, "row count lost");
+        conn.commit();
+        enforce(scalar(conn, "SELECT id FROM itest_cancel_lock") == "3", "the UPDATE didn't run");
+    }
+    else
+    {
+        enforce(e.code == 1013, "the UPDATE failed: " ~ e.msg);
+        // tells an interrupted wait from an UPDATE that ran and then got the cancel's late ORA-01013
+        enforce(scalar(conn, "SELECT id FROM itest_cancel_lock") == "2", "the UPDATE ran, yet: " ~ e.msg);
+    }
 }
 
 /// Four threads, each with its own connection, run queries at the same time.

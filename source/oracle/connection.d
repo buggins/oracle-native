@@ -569,8 +569,9 @@ final class Connection : Poolable
     that arrives after the call ended interrupts nothing, the call returns its
     result, and the server's answer to the cancel is dropped (#76). It does
     nothing either while an earlier cancel is not yet answered. The server
-    checks for a cancel while it works, not while it waits for a lock or in
-    `DBMS_SESSION.SLEEP`: such a call goes on until the wait ends.
+    checks for a cancel while it works, not in `DBMS_SESSION.SLEEP`, and on
+    some versions (21c and 23ai, not 18c; 19c not checked) not while it waits
+    for a row lock: such a call goes on until the wait ends.
     +/
     void cancel() @safe nothrow
     {

@@ -268,9 +268,10 @@ struct ConnectionOptions
     `StatementTimeoutException`; the connection stays usable, and an open
     transaction stays open. A call that ended before the server saw the cancel
     keeps its result. If the server doesn't answer the cancel within 5 seconds
-    (the cancel can't interrupt some waits, e.g. for a row lock), the
-    connection is closed (`ConnectionException`) and the server rolls back the
-    open transaction. Unlike `receiveTimeout`, which closes the connection at
+    (the cancel can't interrupt some waits: `DBMS_SESSION.SLEEP`, and a
+    row-lock wait on some versions: 21c and 23ai, not 18c; 19c not checked),
+    the connection is closed (`ConnectionException`) and the server rolls back
+    the open transaction. Unlike `receiveTimeout`, which closes the connection at
     once, this keeps the connection where the server can stop the call (#76).
     +/
     Duration callTimeout;
