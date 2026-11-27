@@ -225,7 +225,10 @@ void testCallTimeout()
     enforce(scalar(conn, "SELECT COUNT(*) FROM itest_call_timeout") == "0", "rollback after the timeout");
 
     // a row lock: Oracle 21c and 23ai don't interrupt the wait, so the connection is closed after the 5 seconds'
-    // grace; 18c does, and the call ends with the timeout (19c not checked)
+    // grace; 18c does, and the call ends with the timeout (19c not checked). 18c notices the INTERRUPT only every
+    // 3 seconds of the wait and sends nothing before its answer (checked): the answer comes about 3 or 6 seconds
+    // after the call started, and at about 6 it races the end of the grace (the INTERRUPT at 1 s + 5 s), so
+    // either outcome may come then. The INTERRUPT's own timing is checked by the unit tests (#88).
     conn.exec("INSERT INTO itest_call_timeout VALUES (2)");
     conn.commit();
     auto holder = connectToServer();
@@ -239,7 +242,7 @@ void testCallTimeout()
     holder.rollback();
     if (cast(StatementTimeoutException) waitError)
     {
-        enforce(waited < 5.seconds, "the interrupted lock wait took too long");
+        enforce(waited < 7.seconds, "the interrupted lock wait took too long: " ~ waited.toString());
         enforce(conn.isOpen && scalar(conn, "SELECT id FROM itest_call_timeout") == "2",
                 "an interrupted lock wait: the connection is unusable or the UPDATE ran");
     }
