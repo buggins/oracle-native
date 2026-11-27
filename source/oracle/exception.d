@@ -63,8 +63,9 @@ class ServerException : DbException
 }
 
 /++
-A call ran into `ConnectionOptions.callTimeout`: the client cancelled it, and
-the server stopped it with ORA-01013 (`code` 1013). The connection stays
+A call ran into the call timeout it started with (`Connection.callTimeout`,
+initially `ConnectionOptions.callTimeout`): the client cancelled it, and the
+server stopped it with ORA-01013 (`code` 1013). The connection stays
 usable, and an open transaction stays open with the work done before the call
 (#76).
 +/

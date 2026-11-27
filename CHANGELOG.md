@@ -4,6 +4,17 @@ All notable changes to oracle-native are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `Connection.callTimeout`: the call timeout can be changed on an open
+  connection; the new value applies from the next call, and a running call
+  keeps the timeout it started with (each fetch of more rows of a
+  `QueryResult` is a call of its own). A `ConnectionPool` restores the value of
+  `ConnectionOptions` when a connection is returned. For ddbc's
+  `Statement.setQueryTimeout` (#84).
+
 ## 0.6.0 — 2026-11-26
 
 A call timeout that cancels the call and keeps the connection, and a cancel

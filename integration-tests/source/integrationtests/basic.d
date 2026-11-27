@@ -158,6 +158,37 @@ void testCloseRollsBack()
     enforce(scalar(other, "SELECT COUNT(*) FROM itest_close") == "0", "close() committed the open transaction");
 }
 
+/// The call timeout set on the connection applies from the next call; a pool restores the options' value (#84).
+void testCallTimeoutProperty()
+{
+    import core.time : Duration, MonoTime, msecs, seconds;
+    import std.algorithm.searching : canFind;
+
+    enum busyQuery = "SELECT COUNT(*) FROM all_objects a, all_objects b WHERE ROWNUM < 100000000";
+    auto conn = connectToServer();
+    scope (exit)
+        conn.close();
+    enforce(conn.callTimeout == Duration.zero, "a timeout without the option");
+    conn.callTimeout = 300.msecs; // (the busy query takes about 2 seconds on 23ai)
+    const start = MonoTime.currTime;
+    auto e = collectException!StatementTimeoutException(scalar(conn, busyQuery));
+    enforce(e !is null && MonoTime.currTime - start < 5.seconds, "no timeout from the property");
+    enforce(e.msg.canFind("300 ms"), e.msg);
+    conn.callTimeout = Duration.zero;
+    enforce(scalar(conn, "SELECT 'after' FROM dual") == "after", "unusable after the timeout");
+
+    auto pool = new ConnectionPool(serverDsn("pool_max=1"));
+    scope (exit)
+        pool.close();
+    {
+        auto c = pool.lockConnection();
+        c.callTimeout = 3.seconds;
+    }
+    enforce(pool.idleConnections == 1, "the connection wasn't returned for reuse");
+    auto c = pool.lockConnection();
+    enforce(c.callTimeout == Duration.zero, "the pool kept the borrower's timeout");
+}
+
 /// The call timeout: a busy call gets ORA-01013 as `StatementTimeoutException`, the connection and its
 /// transaction stay. A row-lock wait: Oracle 18c interrupts it the same way; 21c and 23ai can't, so the
 /// connection is closed and the server rolls back (#76).

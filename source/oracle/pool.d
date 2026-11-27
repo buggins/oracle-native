@@ -180,8 +180,9 @@ struct PooledConnection
 
     /++
     Returns the connection to the pool now, after rolling back its open
-    transaction and clearing its end-to-end attributes (DRCP: releasing its
-    session); a connection for which that fails is closed. Calling it again
+    transaction, clearing its end-to-end attributes and restoring its
+    `callTimeout` (DRCP: releasing its session); a connection for which that
+    fails is closed. Calling it again
     does nothing.
     +/
     void release() @safe
@@ -189,6 +190,7 @@ struct PooledConnection
         if (conn !is null)
         {
             conn.lease++; // the borrower's LOBs can't reach the next borrower's calls
+            conn.callTimeout = conn.options.callTimeout; // not the borrower's (#84)
             if (conn.isOpen && !conn.isBusy)
             {
                 conn.clearEndToEnd();
