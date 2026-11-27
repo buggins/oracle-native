@@ -128,8 +128,9 @@ it works, not while it waits for a lock or in `DBMS_SESSION.SLEEP`; a call that
 ends before the server sees the cancel keeps its result. The option
 `call_timeout` (seconds) cancels a call (one round trip, its transfer
 included) that waits longer for the server, and
-throws `StatementTimeoutException` (ORA-01013); if the server can't stop the
-call within 5 more seconds, the connection is closed. `Connection.callTimeout`
+throws `StatementTimeoutException` (ORA-01013); if the server then sends
+nothing for 5 seconds, or the cancel can't be sent, the connection is closed.
+`Connection.callTimeout`
 changes it on an open connection, from the next call (each fetch of more rows
 is a call).
 

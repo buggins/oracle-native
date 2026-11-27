@@ -95,7 +95,7 @@ final class Connection : Poolable
     private Duration callTimeoutValue; // `callTimeout`: for the calls that start from now on
     private Duration currentCallTimeout; // the call timeout of the current call, taken when it started
     private Duration timeoutLeft; // what is left of the call timeout for the current call
-    private Duration ackLeft; // after the call timeout: what is left of the 5 seconds for the server's answer
+    private Duration ackLeft; // after the call timeout: what is left of the 5 seconds without data (restarted by data)
     private Thread owner; // fiber mode: the thread the connection belongs to
     package ulong lease; // counts the times a pool handed the connection out; LOBs of an earlier lease are refused
     private TlsOptions tlsOptions; // options.effectiveTls(), read once when connecting
@@ -600,11 +600,13 @@ final class Connection : Poolable
     +/
     void cancel() @safe nothrow
     {
-        sendInterrupt();
+        Exception ignored;
+        sendInterrupt(ignored);
     }
 
-    /// Sends an INTERRUPT; returns whether this call sent it (not: nothing to cancel, or it couldn't be sent).
-    private bool sendInterrupt() @safe nothrow
+    /// Sends an INTERRUPT; returns whether this call sent it (not: nothing to cancel, or it couldn't be sent: then
+    /// `error` is why).
+    private bool sendInterrupt(out Exception error) @safe nothrow
     {
         import core.atomic : atomicLoad, atomicStore;
 
@@ -625,14 +627,16 @@ final class Connection : Poolable
             {
                 // part of the marker may be out: close, so that the reading side sees a broken connection
                 // (not a stream the next call's packet would follow)
+                error = e;
                 atomicStore(cancelPending, false);
                 transport.close();
                 return false;
             }
             return true;
         }
-        catch (Exception)
+        catch (Exception e)
         {
+            error = e;
             return false; // the lock failed: nothing was sent
         }
     }
@@ -641,11 +645,11 @@ final class Connection : Poolable
     Before each read of the server's data during a call: with a call timeout,
     waits for data within what is left of it (the waits of one call are
     summed). When it runs out, sends an INTERRUPT (ORA-01013 is then thrown as
-    a `StatementTimeoutException`, unless the call had ended already) and gives
-    the server's answer 5 seconds of waits; if it doesn't come, the connection
-    is lost. A cancel already sent through `cancel()` keeps its own handling
-    (its ORA-01013 stays a `ServerException`), but its answer gets the same 5
-    seconds (#76).
+    a `StatementTimeoutException`, unless the call had ended already); from
+    then on the connection is lost when 5 seconds pass without data, or when
+    the INTERRUPT can't be sent. A cancel already sent through `cancel()` keeps
+    its own handling (its ORA-01013 stays a `ServerException`), but its answer
+    gets the same rule (#76, #88).
     +/
     private void awaitResponseData() @safe
     {
@@ -658,19 +662,22 @@ final class Connection : Poolable
         {
             if (waitWithin(timeoutLeft))
                 return;
-            if (sendInterrupt())
+            Exception error;
+            if (sendInterrupt(error))
                 timedOut = true;
             else if (!atomicLoad(cancelPending)) // (a cancel already pending: its answer gets the 5 seconds)
-                throw new ConnectionException("The call ran into the call timeout, and the cancel couldn't be sent");
+                throw new ConnectionException("The call ran into the call timeout (" ~ currentCallTimeout.toString()
+                        ~ "), and the cancel couldn't be sent" ~ (error is null ? "" : ": " ~ error.msg), error);
             awaitingAck = true;
             ackLeft = 5.seconds;
         }
         if (!waitWithin(ackLeft))
         {
-            enum noAnswer = "the server didn't answer the cancel within 5 seconds";
+            enum noAnswer = "the server sent nothing for 5 seconds after the cancel";
             throw new ConnectionException(timedOut ? "The call ran into the call timeout, and " ~ noAnswer
                     : "The call timeout ran out after a cancel, and " ~ noAnswer);
         }
+        ackLeft = 5.seconds; // data came: the rest of a large response may still be on its way (#88)
     }
 
     /// Waits for the server's data within `budget`; subtracts the time waited from it.
@@ -2970,6 +2977,8 @@ version (unittest)
         silent, // never answers
         finishedFirst, // the call's complete response, then the reset and ORA-01013
         userCancel, // the user cancels before the call timeout runs out
+        interruptFails, // the INTERRUPT can't be written (#88)
+        trickles, // answers the INTERRUPT in pieces, a wait apart (#88)
     }
 
     // A server silent until it gets an INTERRUPT, which it answers as `mode` says; waits return at once
@@ -2980,6 +2989,9 @@ version (unittest)
         MockTransport mock;
         TimeoutMode mode;
         void delegate() @safe userCancel; // TimeoutMode.userCancel: called on the first wait
+        const(ubyte)[][] pieces; // TimeoutMode.trickles: the answer, one piece per wait
+        bool interruptSeen;
+        Duration[] ackWaits; // TimeoutMode.trickles: the time each wait after the INTERRUPT was given
 
         this() @safe
         {
@@ -2993,8 +3005,14 @@ version (unittest)
 
         override void write(scope const(ubyte)[] data) @safe
         {
+            const interrupt = data.length >= 11 && data[4] == PacketType.marker && data[10] == MarkerType.interrupt;
+            if (interrupt && mode == TimeoutMode.interruptFails)
+            {
+                mock.write(data[0 .. 5]); // part of the marker goes out
+                throw new ConnectionException("Connection reset by peer");
+            }
             mock.write(data);
-            if (data.length < 11 || data[4] != PacketType.marker || data[10] != MarkerType.interrupt)
+            if (!interrupt)
                 return;
             final switch (mode)
             {
@@ -3011,6 +3029,14 @@ version (unittest)
                 mock.feed(dataPacket(w.data));
                 mock.feed(markerPacket(MarkerType.reset));
                 mock.feed(errorResponse(1013));
+                break;
+            case TimeoutMode.interruptFails:
+                break; // (thrown above)
+            case TimeoutMode.trickles:
+                const answer = markerPacket(MarkerType.reset) ~ errorResponse(1013);
+                foreach (i; 0 .. 4)
+                    pieces ~= answer[i * answer.length / 4 .. (i + 1) * answer.length / 4];
+                interruptSeen = true;
                 break;
             }
         }
@@ -3041,6 +3067,27 @@ version (unittest)
 
         bool waitForData(Duration timeout) @safe
         {
+            import core.time : MonoTime, msecs;
+
+            static void pause() @safe // until the clock moves on (no sleep: blocking calls go through dbwire)
+            {
+                const start = MonoTime.currTime;
+                while (MonoTime.currTime - start < 1.msecs)
+                {
+                }
+            }
+
+            if (interruptSeen)
+            {
+                ackWaits ~= timeout;
+                pause(); // time passes before the next piece
+                if (pieces.length)
+                {
+                    mock.feed(pieces[0]);
+                    pieces = pieces[1 .. $];
+                }
+                return mock.dataAvailable;
+            }
             cast(void) timeout; // nothing arrives while waiting
             if (userCancel !is null)
             {
@@ -3093,6 +3140,22 @@ version (unittest)
         case TimeoutMode.userCancel:
             const e = collectException!ServerException(conn.exec("UPDATE t SET n = 1"));
             assert(e !is null && e.code == 1013 && cast(const(StatementTimeoutException)) e is null);
+            break;
+        case TimeoutMode.interruptFails: // the error names the timeout and the cause; the connection is closed (#88)
+            const e = collectException!ConnectionException(conn.exec("UPDATE t SET n = 1"));
+            assert(e !is null && e.msg == "The call ran into the call timeout (1 ms), and the cancel couldn't be "
+                    ~ "sent: Connection reset by peer", e is null ? "no exception" : e.msg);
+            assert(e.next !is null && e.next.msg == "Connection reset by peer");
+            assert(!conn.isOpen);
+            continue;
+        case TimeoutMode.trickles: // each wait after data gets the whole 5 seconds again (#88)
+            import core.time : seconds;
+
+            const e = collectException!StatementTimeoutException(conn.exec("UPDATE t SET n = 1"));
+            assert(e !is null && e.code == 1013);
+            assert(t.pieces.length == 0 && t.ackWaits.length >= 2); // the whole answer, over several waits
+            foreach (w; t.ackWaits)
+                assert(w == 5.seconds, w.toString());
             break;
         }
         assert(conn.isOpen && !conn.isBusy && !conn.cancelPending);
