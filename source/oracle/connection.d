@@ -92,6 +92,8 @@ final class Connection : Poolable
     private bool callRunning; // a call (after the login) is sent and its response being read: the call timeout applies
     private bool timedOut; // the call timeout sent the INTERRUPT of the current call
     private bool awaitingAck; // the call timeout ran out with an INTERRUPT pending: the server's answer is due
+    private Duration callTimeoutValue; // `callTimeout`: for the calls that start from now on
+    private Duration currentCallTimeout; // the call timeout of the current call, taken when it started
     private Duration timeoutLeft; // what is left of the call timeout for the current call
     private Duration ackLeft; // after the call timeout: what is left of the 5 seconds for the server's answer
     private Thread owner; // fiber mode: the thread the connection belongs to
@@ -113,6 +115,7 @@ final class Connection : Poolable
     this(ConnectionOptions options) @safe
     {
         this.options = options;
+        callTimeoutValue = options.callTimeout;
         connect();
     }
 
@@ -152,6 +155,7 @@ final class Connection : Poolable
             import dbwire.io.backend : IoMode;
 
             options = o;
+            callTimeoutValue = o.callTimeout;
             backend = backendFor(IoMode.phobos);
             writeLock = backend.newLock();
             transport = t;
@@ -165,6 +169,27 @@ final class Connection : Poolable
             databaseZoneKnown = true;
             state = State.ready;
         }
+    }
+
+    /++
+    The call timeout of the calls that start from now on
+    (`ConnectionOptions.callTimeout` until changed); `Duration.zero` or less:
+    no limit. A call that is running keeps the timeout it started with; each
+    fetch of more rows of a `QueryResult` is a call of its own, so it takes the
+    value current when it starts. A `ConnectionPool` restores the value of the options when a connection is
+    returned, so one borrower's setting doesn't carry over to the next (#84).
+    Like every call except `cancel()`, use it from the thread or task that uses
+    the connection.
+    +/
+    @property Duration callTimeout() const @safe pure nothrow @nogc
+    {
+        return callTimeoutValue;
+    }
+
+    /// ditto
+    @property void callTimeout(Duration timeout) @safe pure nothrow @nogc
+    {
+        callTimeoutValue = timeout;
     }
 
     /// Whether the connection is open (it may be busy).
@@ -627,7 +652,7 @@ final class Connection : Poolable
         import core.atomic : atomicLoad;
         import core.time : seconds;
 
-        if (options.callTimeout <= Duration.zero || !callRunning || tns.inPipeline)
+        if (currentCallTimeout <= Duration.zero || !callRunning || tns.inPipeline)
             return;
         if (!awaitingAck)
         {
@@ -1765,7 +1790,8 @@ final class Connection : Poolable
                 callRunning = inCall; // not the login's calls (`connectTo` runs outside `guarded`)
                 timedOut = false;
                 awaitingAck = false;
-                timeoutLeft = options.callTimeout;
+                currentCallTimeout = callTimeoutValue;
+                timeoutLeft = currentCallTimeout;
                 return;
             }
             writeLock.unlock();
@@ -2027,7 +2053,7 @@ final class Connection : Poolable
         if (e.number == 1013 && timedOut)
         {
             timedOut = false;
-            throw new StatementTimeoutException(e.message, options.callTimeout.toString());
+            throw new StatementTimeoutException(e.message, currentCallTimeout.toString());
         }
         if (e.number != 0)
             throw new ServerException(e.number, e.message, e.position);
@@ -3041,8 +3067,13 @@ version (unittest)
         auto t = new TimeoutServer;
         t.mode = mode;
         ConnectionOptions o;
-        o.callTimeout = 1.msecs;
+        o.callTimeout = mode == TimeoutMode.answers ? Duration.zero : 1.msecs;
         auto conn = Connection.scripted(t, scriptedFieldVersion, o);
+        if (mode == TimeoutMode.answers) // set on the connection (#84)
+        {
+            assert(conn.callTimeout == Duration.zero);
+            conn.callTimeout = 1.msecs;
+        }
         if (mode == TimeoutMode.userCancel)
             t.userCancel = &conn.cancel;
         final switch (mode)
@@ -3068,6 +3099,30 @@ version (unittest)
         t.mock.feed(errorResponse(0));
         conn.exec("UPDATE t SET n = 2");
     }
+}
+
+// A call keeps the call timeout it started with: a change while it runs applies from the next call (#84)
+@safe unittest
+{
+    import core.time : msecs;
+    import std.algorithm.searching : canFind;
+    import std.exception : collectException;
+
+    auto t = new TimeoutServer;
+    t.mode = TimeoutMode.answers;
+    auto conn = Connection.scripted(t);
+    conn.callTimeout = 1.msecs;
+    void change() @safe
+    {
+        conn.callTimeout = Duration.zero;
+    }
+
+    t.userCancel = &change; // called while the call waits
+    const e = collectException!StatementTimeoutException(conn.exec("UPDATE t SET n = 1"));
+    assert(e !is null && e.msg.canFind("1 ms"));
+    assert(conn.callTimeout == Duration.zero && conn.isOpen && !conn.isBusy);
+    t.mock.feed(errorResponse(0));
+    conn.exec("UPDATE t SET n = 2");
 }
 
 // A cancel that reaches the server after the call's response: the response counts, its ORA-01013 is dropped (#76)

@@ -273,6 +273,8 @@ struct ConnectionOptions
     the connection is closed (`ConnectionException`) and the server rolls back
     the open transaction. Unlike `receiveTimeout`, which closes the connection at
     once, this keeps the connection where the server can stop the call (#76).
+    This is the connection's initial value: `Connection.callTimeout` changes it
+    for an open connection, and a `ConnectionPool` restores it (#84).
     +/
     Duration callTimeout;
 

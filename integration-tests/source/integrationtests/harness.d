@@ -51,6 +51,7 @@ immutable TestCase[] allTests = [
     TestCase("close() rolls an open transaction back", &testCloseRollsBack, true),
     TestCase("a killed session closes the connection", &testKilledSession, true),
     TestCase("call timeout", &testCallTimeout, true),
+    TestCase("call timeout property", &testCallTimeoutProperty, true),
     TestCase("server errors keep the connection", &testServerErrors, true),
     TestCase("fetching in batches, repeated column values", &testFetchBatches, true),
     TestCase("closed results and many cursors", &integrationtests.basic.testCursors, true),
