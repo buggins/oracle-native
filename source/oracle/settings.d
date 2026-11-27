@@ -267,12 +267,15 @@ struct ConnectionOptions
     `Connection.cancel` does) and the server's ORA-01013 is thrown as a
     `StatementTimeoutException`; the connection stays usable, and an open
     transaction stays open. A call that ended before the server saw the cancel
-    keeps its result. If the server doesn't answer the cancel within 5 seconds
-    (the cancel can't interrupt some waits: `DBMS_SESSION.SLEEP`, and a
-    row-lock wait on some versions: 21c and 23ai, not 18c; 19c not checked),
-    the connection is closed (`ConnectionException`) and the server rolls back
-    the open transaction. Unlike `receiveTimeout`, which closes the connection at
-    once, this keeps the connection where the server can stop the call (#76).
+    keeps its result. If the server then sends nothing for 5 seconds (the
+    cancel can't interrupt some waits: `DBMS_SESSION.SLEEP`, and a row-lock
+    wait on some versions: 21c and 23ai, not 18c; 19c not checked), or the
+    cancel can't be sent, the connection is closed (`ConnectionException`) and
+    the server rolls back the open transaction. While the server goes on
+    sending the rest of its response after the cancel, the call can last
+    longer than the timeout (#88). Unlike `receiveTimeout`, which closes the
+    connection at once, this keeps the connection where the server can stop
+    the call (#76).
     This is the connection's initial value: `Connection.callTimeout` changes it
     for an open connection, and a `ConnectionPool` restores it (#84).
     +/

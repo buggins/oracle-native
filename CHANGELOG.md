@@ -6,6 +6,15 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- Call timeout: after the cancel, the connection is closed when 5 seconds
+  pass without data, as in postgresql-native and mssql-native. Before, the
+  server's answer got 5 seconds in total, so a large response still on its
+  way could get a working connection closed (#88).
+- Call timeout: when the INTERRUPT can't be sent, the `ConnectionException`
+  names the timeout and the cause (also chained as `next`) (#88).
+
 ## 0.6.1 — 2026-11-27
 
 The call timeout can be changed on an open connection (#84).
