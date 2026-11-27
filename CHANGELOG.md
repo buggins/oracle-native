@@ -6,6 +6,10 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+## 0.6.1 — 2026-11-27
+
+The call timeout can be changed on an open connection (#84).
+
 ### Added
 
 - `Connection.callTimeout`: the call timeout can be changed on an open
