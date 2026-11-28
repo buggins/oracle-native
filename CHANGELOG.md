@@ -6,6 +6,12 @@ All notable changes to oracle-native are documented here. The format follows
 
 ## Unreleased
 
+## 0.6.2 — 2026-11-27
+
+The wait for the server's answer after a call timeout allows 5 seconds
+without data, and the call timeout's cancel, when it can't be sent, names
+its cause (#88).
+
 ### Fixed
 
 - Call timeout: after the cancel, the connection is closed when 5 seconds
